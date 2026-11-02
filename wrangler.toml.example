@@ -1,0 +1,29 @@
+# 可选：用命令行部署时才需要这个文件。
+# 直接在 Cloudflare 网页控制台粘贴 worker.js 的话，不需要 wrangler，也不需要本文件。
+# 用法：复制成 wrangler.toml，把尖括号里的值换成你自己的，然后 npx wrangler deploy
+
+name = "signin-all"
+main = "worker.js"
+compatibility_date = "2026-01-01"
+
+# 先在 Cloudflare 后台新建一个 KV 命名空间，把它的 id 填进来。
+# 也可以只填 id；preview_id 用于 `wrangler dev` 的本地/预览环境。
+kv_namespaces = [
+  { binding = "KV", id = "<KV_NAMESPACE_ID>", preview_id = "<KV_NAMESPACE_ID>" },
+]
+
+# 定时任务（UTC）。"10 0 * * *" = 北京时间 08:10。
+# 部署后 Worker 会在每次触发时记下真实表达式，控制台自动显示下次签到时间。
+[triggers]
+crons = ["10 0 * * *"]
+
+# 非密钥的普通变量（可选）。
+# CHECKIN_CRON 只是首次 Cron 触发前的展示占位，触发后会被真实表达式取代。
+[vars]
+CHECKIN_CRON = "08:10"
+
+# 下面这些是密钥，不要写进本文件，用命令行写入：
+#   npx wrangler secret put MASTER_KEY          # 必填：32 字节随机值的 base64（44 字符，以 = 结尾）
+#   npx wrangler secret put ADMIN_TOKEN         # 必填：控制台登录密码
+#   npx wrangler secret put CRON_SECRET         # 可选：/cron 的独立口令，不填则回落到 ADMIN_TOKEN
+#   npx wrangler secret put CHATGLM_SIGN_SECRET # 可选：覆盖内置的智谱签名盐
