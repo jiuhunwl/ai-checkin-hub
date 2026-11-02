@@ -2905,12 +2905,23 @@ async function ensureToken(acct) {
 /* ------------------------------------------------------------------ */
 
 function campaignRows(payload) {
-  const rows = (payload && (payload.campaigns ?? payload.data?.campaigns)) || [];
-  return Array.isArray(rows) ? rows : [];
+  if (!payload || typeof payload !== 'object') return [];
+  const candidates = [
+    payload.campaigns,
+    payload.data?.campaigns,
+    payload.data?.list,
+    payload.data?.items,
+    payload.data?.records,
+    payload.list,
+    payload.items,
+    Array.isArray(payload.data) ? payload.data : null,
+  ];
+  for (const c of candidates) if (Array.isArray(c)) return c;
+  return [];
 }
 
-const statusOf = (row) => String(row.status ?? row.state ?? '');
-const actionOf = (row) => String(row.action ?? row.actionType ?? row.type ?? '');
+const statusOf = (row) => String(row.status ?? row.state ?? row.claimStatus ?? row.campaignStatus ?? '');
+const actionOf = (row) => String(row.action ?? row.actionType ?? row.campaignType ?? row.type ?? '');
 
 function idOf(row) {
   for (const k of ['campaignId', 'campaignKey', 'key', 'id']) {
@@ -2942,7 +2953,9 @@ function amountOf(obj) {
  * 枚举服务端会改，认不出的动作也照样试一遍，别用白名单把自己锁死。
  */
 function pickCampaign(rows) {
-  const claimable = rows.filter((r) => CLAIMABLE_RE.test(statusOf(r)) && idOf(r));
+  const claimable = rows.filter(
+    (r) => (CLAIMABLE_RE.test(statusOf(r)) || r.claimable === true || r.canClaim === true) && idOf(r)
+  );
   claimable.sort((a, b) => {
     const ia = ACTION_PRIORITY.indexOf(actionOf(a).toUpperCase());
     const ib = ACTION_PRIORITY.indexOf(actionOf(b).toUpperCase());
@@ -2967,6 +2980,64 @@ async function claimCampaign(acct, campaignId) {
     headers: authHeaders(at, acct, { 'content-type': 'application/json', origin: API }),
     body: {},
   });
+}
+
+/** 只读诊断：把活动列表原始返回倒出来，确认「无活动」是真的没有还是没解析到 */
+async function inspectCampaigns(env, id) {
+  const metas = id ? [{ id }] : await listRaw(env);
+  const out = [];
+  for (const meta of metas) {
+    const acct = await getAccount(env, meta.id);
+    if (!acct) continue;
+
+    let at = String(acct.accessToken || '');
+    let tokenError = '';
+    try {
+      const exp = SH.jwtExp(at);
+      if (!(at && exp && exp * 1000 - Date.now() > 120000)) {
+        at = await refreshTokens(acct);
+        await putAccount(env, acct);
+      }
+    } catch (e) {
+      tokenError = e.message;
+    }
+
+    const calls = [];
+    if (at) {
+      for (const [name, qs] of [['campaigns+force', '?forceRefresh=true'], ['campaigns', '']]) {
+        try {
+          const r = await qFetch(EP.campaigns + qs, { headers: authHeaders(at, acct) });
+          const rows = campaignRows(r.json);
+          const picked = pickCampaign(rows);
+          calls.push({
+            name,
+            status: r.status,
+            code: r.json?.code ?? null,
+            msg: r.json?.msg ?? r.json?.message ?? '',
+            rows: rows.length,
+            picked: {
+              target: picked.target ? { id: idOf(picked.target), status: statusOf(picked.target), action: actionOf(picked.target) } : null,
+              claimedBenefit: picked.claimedBenefit,
+              onlyMarketing: picked.onlyMarketing,
+              total: picked.total,
+            },
+            sample: rows.slice(0, 6).map((x) => ({
+              id: idOf(x),
+              status: statusOf(x),
+              action: actionOf(x),
+              title: x.title ?? x.name ?? x.campaignName ?? '',
+              keys: Object.keys(x).slice(0, 16),
+            })),
+            raw: JSON.stringify(r.json ?? null).slice(0, 5000),
+          });
+        } catch (e) {
+          calls.push({ name, error: e.message });
+        }
+      }
+    }
+    out.push({ id: acct.id, label: acct.label, uid: acct.uid || '', tokenError, calls });
+  }
+  return { ok: true, at: SH.fmtBj(Date.now()), accounts: out };
 }
 
 /* ------------------------------------------------------------------ */
@@ -3251,6 +3322,14 @@ const __mod = {
         const body = await readBody(request);
         const force = url.searchParams.get('force') === '1' || body.force === true;
         return json(await run(env, { force, id: String(body.id || '').trim() }));
+      }
+      if (path === '/api/inspect' && method === 'GET') {
+        const id = String(url.searchParams.get('id') || '').trim();
+        try {
+          return json(await inspectCampaigns(env, id));
+        } catch (e) {
+          return json({ error: e.message }, 502);
+        }
       }
       if (path === '/api/login/start' && method === 'POST') {
         const s = await loginStart();
