@@ -2128,6 +2128,59 @@ async function doCheckin(at) {
   return { state: 'error', code: json?.code, msg: json?.msg };
 }
 
+/**
+ * 只读诊断：用账号自己的令牌把候选余额接口的原始返回倒出来。
+ * 不返回任何令牌，只给状态码和字段，用来确认真实余额落在哪个字段上。
+ */
+async function inspectBalance(env, id) {
+  const metas = id ? [{ id }] : await listAccounts(env);
+  const out = [];
+  for (const meta of metas) {
+    const acct = await getAccount(env, meta.id);
+    if (!acct) continue;
+
+    let at = String(acct.accessToken || '');
+    let tokenError = '';
+    try {
+      const t = await refreshTokens(acct.refreshToken);
+      at = t.accessToken;
+      acct.refreshToken = t.refreshToken;
+      acct.accessToken = at;
+      acct.accessExp = jwtExp(at);
+      if (t.refreshExpiresIn) acct.refreshExp = Date.now() + t.refreshExpiresIn * 1000;
+      acct.tokenRefreshedAt = Date.now();
+      await putAccount(env, acct);
+    } catch (e) {
+      tokenError = e.message;
+    }
+
+    const calls = [];
+    if (at) {
+      const probes = [
+        ['get-user-resource', '/v2/billing/meter/get-user-resource', '{}'],
+        ['get-user-resource+usage', '/v2/billing/meter/get-user-resource', '{"require_usage":true}'],
+        ['checkin-status', '/v2/billing/meter/checkin-status', '{}'],
+      ];
+      for (const [name, path, body] of probes) {
+        try {
+          const r = await wbFetch(path, { headers: authHeader(at), body });
+          calls.push({
+            name,
+            status: r.status,
+            code: r.json?.code ?? null,
+            msg: r.json?.msg ?? r.json?.message ?? '',
+            data: JSON.stringify(r.json?.data ?? r.json ?? null).slice(0, 4000),
+          });
+        } catch (e) {
+          calls.push({ name, error: e.message });
+        }
+      }
+    }
+    out.push({ id: acct.id, label: acct.label, streak: acct.streak, total: acct.total, tokenError, calls });
+  }
+  return { ok: true, at: SH.fmtBj(Date.now()), accounts: out };
+}
+
 /* ------------------------------------------------------------------ */
 /* 单个账号的完整签到流程                                               */
 /* ------------------------------------------------------------------ */
@@ -2494,6 +2547,14 @@ const __mod = {
       if (!a.ok) return a.res;
 
       if (path === '/api/list' && method === 'GET') return handleList(request, env);
+      if (path === '/api/inspect' && method === 'GET') {
+        const id = String(url.searchParams.get('id') || '').trim();
+        try {
+          return json(await inspectBalance(env, id));
+        } catch (e) {
+          return json({ error: e.message }, 502);
+        }
+      }
       if (path === '/api/login/start' && method === 'POST') return handleLoginStart(request, env);
       if (path === '/api/login/poll' && method === 'GET') return handleLoginPoll(request, env);
       if (path === '/api/remove' && method === 'POST') return handleRemove(request, env);
