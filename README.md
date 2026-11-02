@@ -98,17 +98,19 @@ btoa(String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))))
 
 ### 让 Cloudflare 跟着 GitHub 仓库自动部署（可选）
 
-仓库里只有模板 `wrangler.toml.example`，没有 `wrangler.toml`。这种情况下直接跑 `npx wrangler deploy`，wrangler 找不到配置会退化成静态站点检测，报 `Could not detect a directory containing static files`。所以 Workers Builds 的 **Build command** 里要先由模板生成配置，把 KV id 从环境变量注进去：
+仓库里只有模板 `wrangler.toml.example`，没有 `wrangler.toml`。这种情况下直接跑 `npx wrangler deploy`，wrangler 找不到配置会退化成静态站点检测，报 `Could not detect a directory containing static files`。所以让部署命令自己先把配置生成出来，KV id 从环境变量注入：
 
 | 设置项 | 值 |
 | --- | --- |
-| Build command | `test -n "$KV_NAMESPACE_ID" && cp wrangler.toml.example wrangler.toml && sed -i "s/__KV_NAMESPACE_ID__/$KV_NAMESPACE_ID/g" wrangler.toml` |
-| Deploy command | `npx wrangler deploy` |
+| Build command | 留空即可 |
+| Deploy command | `test -n "$KV_NAMESPACE_ID" && cp wrangler.toml.example wrangler.toml && sed -i "s/__KV_NAMESPACE_ID__/$KV_NAMESPACE_ID/g" wrangler.toml && npx wrangler deploy` |
 | Environment variables | `KV_NAMESPACE_ID`（勾选加密）＝ 你的 KV 命名空间 id |
+
+生成配置写在 **Deploy command** 而不是 Build command，是因为 Workers Builds 在 Direct Deploy 模式下不跑构建命令，日志里只有 `Executing user deploy command`，配置根本不会被生成；写在部署命令里两种模式都能用。开头的 `test -n` 保证忘配环境变量时立刻失败，而不是留下一个空 id 的配置让 wrangler 报半句看不明白的话。
 
 三个坑：
 
-- 模板里的 `name = "signin-all"` 必须等于这个 Builds 项目对应的 Worker 名，否则部署会被拒或者多建一个 Worker。
+- 模板里的 `name = "signin-all"` 必须等于这个 Builds 项目对应的 Worker 名，否则部署会被拒或者多建一个 Worker。名字不一样就在 `sed` 后面再接一条：`&& sed -i 's/^name = .*/name = "你的名字"/' wrangler.toml`。
 - `wrangler deploy` 每次都拿配置文件覆盖远程绑定，网页后台手加的 KV 绑定会被冲掉——KV id 只能写在配置里。
 - Secret 不在配置文件里，`MASTER_KEY` / `ADMIN_TOKEN` 第一次仍要单独写入（`npx wrangler secret put` 或后台 Settings → Secrets），之后的部署不会动它们。
 

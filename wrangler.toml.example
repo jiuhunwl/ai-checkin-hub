@@ -5,12 +5,12 @@
 #           然后 npx wrangler deploy
 #
 # Cloudflare Workers Builds（连着 GitHub 仓库自动部署）用法：
-#   Build command:
-#     test -n "$KV_NAMESPACE_ID" && cp wrangler.toml.example wrangler.toml && sed -i "s/__KV_NAMESPACE_ID__/$KV_NAMESPACE_ID/g" wrangler.toml
-#   Deploy command:
-#     npx wrangler deploy
+#   Build command 留空，Deploy command 填：
+#     test -n "$KV_NAMESPACE_ID" && cp wrangler.toml.example wrangler.toml && sed -i "s/__KV_NAMESPACE_ID__/$KV_NAMESPACE_ID/g" wrangler.toml && npx wrangler deploy
 #   Environment variables 里加一条（加密）：KV_NAMESPACE_ID = 你的 KV 命名空间 id
-#   注意 name 必须等于这个 Builds 项目对应的 Worker 名字，否则部署会失败或建出第二个 Worker。
+#   生成配置这一步放在部署命令里，是因为 Direct Deploy 模式下构建命令根本不执行。
+#   name 必须等于这个 Builds 项目对应的 Worker 名字，不一样就再补一条：
+#     && sed -i 's/^name = .*/name = "你的名字"/' wrangler.toml
 #   wrangler 每次部署都会用本文件覆盖后台绑定，所以 KV id 只能通过这里给，网页后台手加的会被冲掉。
 
 name = "signin-all"
