@@ -2115,6 +2115,31 @@ async function checkinStatus(at) {
   return { ok: true, data: json.data };
 }
 
+/**
+ * 真实剩余积分：把资源包里没花完的额度加起来。
+ * 每次签到/活动发的是一个独立资源包，包到期没用完就归零，
+ * 所以剩余只能按包汇总，不能用「签到累计 − 已用」倒推。
+ */
+async function fetchBalance(at) {
+  const { json } = await wbFetch('/v2/billing/meter/get-user-resource', { headers: authHeader(at) });
+  if (json?.code !== 0 || !json?.data) return null;
+  const d = json.data.Response?.Data || json.data;
+  const rows = Array.isArray(d?.Accounts) ? d.Accounts : [];
+  if (!rows.length) return null;
+  const num = (v) => (typeof v === 'number' ? v : Number(v) || 0);
+  let remain = 0;
+  for (const a of rows) {
+    remain += num(
+      a.CapacityRemainPrecise ?? a.CycleCapacityRemainPrecise ?? a.CapacityRemain ?? a.CycleCapacityRemain
+    );
+  }
+  return {
+    credits: Math.round(remain * 100) / 100,
+    dosage: num(d.TotalDosage),
+    packages: rows.length,
+  };
+}
+
 async function doCheckin(at) {
   const { json } = await wbFetch('/v2/billing/meter/daily-checkin', {
     headers: authHeader(at),
@@ -2295,6 +2320,11 @@ async function signinOne(env, acct, { force = false } = {}) {
   acct.lastRun = now;
   acct.streak = streak;
   acct.total = total;
+  const bal = await fetchBalance(tokens.accessToken).catch(() => null);
+  if (bal) {
+    acct.credits = bal.credits;
+    acct.dosage = bal.dosage;
+  }
 
   if (result.state === 'error') {
     acct.lastState = 'error';
@@ -2508,6 +2538,11 @@ async function refreshOne(env, id) {
         acct.lastMsg = '服务端显示今日已签';
       }
     }
+  }
+  const bal = await fetchBalance(tokens.accessToken).catch(() => null);
+  if (bal) {
+    acct.credits = bal.credits;
+    acct.dosage = bal.dosage;
   }
   await putAccount(env, acct);
   return publicView(acct, now, today);
@@ -4795,7 +4830,8 @@ const WB_META = {
   fields: [],
   hint: '点「添加账号」打开官方登录页，用微信扫码。',
   note: '二维码由官方页面渲染，本服务不接触你的微信信息。',
-  creditHint: '本期签到累计获得，不是官网剩余积分',
+  creditHint: '当前剩余积分（未用完的资源包合计）',
+  totalHint: '本期签到累计获得，不是余额',
 };
 
 const QODER_META = {
@@ -4865,6 +4901,7 @@ function metaOf(entry, env) {
     hint: m.hint || '',
     note: m.note || '',
     creditHint: m.creditHint || '',
+    totalHint: m.totalHint || '',
     available: true,
     unavailableReason: '',
   };
@@ -6147,19 +6184,18 @@ body::after{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opac
     return k || '';
   }
 
-  function platCreditHint(key){
+  function platHint(key, field){
     var aliases = { wb: 'workbuddy', wbi: 'workbuddy_intl' };
     var k = aliases[key] || key;
     for (var i = 0; i < META.platforms.length; i++){
-      if (META.platforms[i].key === k) return META.platforms[i].creditHint || '';
+      if (META.platforms[i].key === k) return META.platforms[i][field] || '';
     }
     return '';
   }
   /** 积分列：有真余额显示余额，否则退回本期累计并说明口径 */
   function balanceCell(a){
-    var hint = platCreditHint(a.platform);
-    if (typeof a.credits === 'number') return { text: fmtNum(a.credits), tip: hint || '当前余额' };
-    if (typeof a.total === 'number') return { text: fmtNum(a.total), tip: hint || '本期累计，不是余额' };
+    if (typeof a.credits === 'number') return { text: fmtNum(a.credits), tip: platHint(a.platform, 'creditHint') || '当前余额' };
+    if (typeof a.total === 'number') return { text: fmtNum(a.total), tip: platHint(a.platform, 'totalHint') || '本期累计，不是余额' };
     return { text: '—', tip: '该平台不返回余额，只看今日一列' };
   }
 
