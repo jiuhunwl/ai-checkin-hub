@@ -7381,6 +7381,7 @@ body{font-size:13.5px;letter-spacing:.005em}
   window.claimTrae = claimTrae;
   window.startWb = startWb;
   window.startIntl = startIntl;
+  window.startQoder = startQoder;
   window.astudioMode = astudioMode;
   window.astudioPassword = astudioPassword;
   window.submitAdd = submitAdd;
