@@ -2128,6 +2128,50 @@ async function doCheckin(at) {
   return { state: 'error', code: json?.code, msg: json?.msg };
 }
 
+/** 资源包列表按口径汇总：剩余到底该取哪一列，先让这些数字互相对上 */
+function summarizeResource(json) {
+  const d = json?.data?.Response?.Data || json?.data || {};
+  const rows = Array.isArray(d.Accounts) ? d.Accounts : [];
+  const num = (v) => (typeof v === 'number' ? v : Number(v) || 0);
+  const sum = (f) => rows.reduce((s, a) => s + num(a?.[f]), 0);
+  const grantOf = (a) => ((a.AccountAttributes || []).find((x) => x.Key === 'grantSource') || {}).Value || 'unknown';
+  const byGrant = {};
+  for (const a of rows) {
+    const src = grantOf(a);
+    const rec = byGrant[src] || (byGrant[src] = { packages: 0, size: 0, used: 0, remain: 0 });
+    rec.packages += 1;
+    rec.size += num(a.CapacitySize);
+    rec.used += num(a.CapacityUsed);
+    rec.remain += num(a.CapacityRemainPrecise ?? a.CapacityRemain);
+  }
+  const newest = rows.slice(-2).map((a) => ({
+    grant: grantOf(a),
+    size: num(a.CapacitySize),
+    used: num(a.CapacityUsed),
+    remain: num(a.CapacityRemain),
+    cycleSize: num(a.CycleCapacitySize),
+    cycleUsed: num(a.CycleCapacityUsed),
+    cycleRemain: num(a.CycleCapacityRemain),
+    expired: a.ExpiredTime || '',
+    status: a.Status,
+  }));
+  return {
+    totalCount: d.TotalCount ?? null,
+    totalDosage: d.TotalDosage ?? null,
+    packages: rows.length,
+    sumSize: sum('CapacitySize'),
+    sumUsed: sum('CapacityUsed'),
+    sumRemain: sum('CapacityRemain'),
+    sumRemainPrecise: rows.reduce((s, a) => s + num(a.CapacityRemainPrecise), 0),
+    sumCycleSize: sum('CycleCapacitySize'),
+    sumCycleUsed: sum('CycleCapacityUsed'),
+    sumCycleRemain: sum('CycleCapacityRemain'),
+    sumCycleRemainPrecise: rows.reduce((s, a) => s + num(a.CycleCapacityRemainPrecise), 0),
+    byGrant,
+    newest,
+  };
+}
+
 /**
  * 只读诊断：用账号自己的令牌把候选余额接口的原始返回倒出来。
  * 不返回任何令牌，只给状态码和字段，用来确认真实余额落在哪个字段上。
@@ -2141,17 +2185,22 @@ async function inspectBalance(env, id) {
 
     let at = String(acct.accessToken || '');
     let tokenError = '';
-    try {
-      const t = await refreshTokens(acct.refreshToken);
-      at = t.accessToken;
-      acct.refreshToken = t.refreshToken;
-      acct.accessToken = at;
-      acct.accessExp = jwtExp(at);
-      if (t.refreshExpiresIn) acct.refreshExp = Date.now() + t.refreshExpiresIn * 1000;
-      acct.tokenRefreshedAt = Date.now();
-      await putAccount(env, acct);
-    } catch (e) {
-      tokenError = e.message;
+    // 令牌还能用就不轮换；真要续期时先落盘，轮换后的 RT 丢了就找不回
+    const exp = SH.jwtExp(at);
+    const stillFresh = !!(exp && exp * 1000 - Date.now() > 120000);
+    if (!(at && stillFresh)) {
+      try {
+        const t = await refreshTokens(acct.refreshToken);
+        at = t.accessToken;
+        acct.refreshToken = t.refreshToken;
+        acct.accessToken = at;
+        if (t.refreshExpiresIn) acct.refreshExp = Date.now() + t.refreshExpiresIn * 1000;
+        acct.tokenRefreshedAt = Date.now();
+        await putAccount(env, acct);
+        acct.accessExp = SH.jwtExp(at);
+      } catch (e) {
+        tokenError = e.message;
+      }
     }
 
     const calls = [];
@@ -2164,13 +2213,15 @@ async function inspectBalance(env, id) {
       for (const [name, path, body] of probes) {
         try {
           const r = await wbFetch(path, { headers: authHeader(at), body });
-          calls.push({
+          const call = {
             name,
             status: r.status,
             code: r.json?.code ?? null,
             msg: r.json?.msg ?? r.json?.message ?? '',
             data: JSON.stringify(r.json?.data ?? r.json ?? null).slice(0, 4000),
-          });
+          };
+          if (name.startsWith('get-user-resource') && r.json?.data) call.summary = summarizeResource(r.json);
+          calls.push(call);
         } catch (e) {
           calls.push({ name, error: e.message });
         }
