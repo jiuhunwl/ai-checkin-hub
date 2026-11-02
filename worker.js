@@ -281,6 +281,17 @@ class PlatformAuthError extends Error {
     this.auth = true;
   }
 }
+
+/** 平台不回传连续天数时，按本地成功日期累计；同一天重复调用不涨 */
+function bumpStreak(acct, day) {
+  if (!acct || !day) return;
+  const prev = String(acct.streakDate || '');
+  if (prev === day) return;
+  const expected = new Date(Date.parse(day + 'T00:00:00Z') - 86400e3).toISOString().slice(0, 10);
+  acct.streakLocal = prev === expected ? (Number(acct.streakLocal) || 0) + 1 : 1;
+  acct.streakDate = day;
+}
+
 /* ================================================================== */
 /* 模块一：Trae —— 设备身份 / 扫码授权 / 签到 */
 /* ================================================================== */
@@ -871,6 +882,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     acct.lastState = 'already';
     acct.lastMsg = '今日已签';
     acct.lastOkDate = today;
+    bumpStreak(acct, today);
     acct.cooldownUntil = 0;
     const st = await statusOf(token, acct).catch(() => null);
     if (st?.ok) {
@@ -923,6 +935,7 @@ async function signinOne(env, acct, { force = false } = {}) {
   acct.lastState = 'checked';
   acct.lastMsg = points ? `+${points} 积分` : '签到成功';
   acct.lastOkDate = today;
+  bumpStreak(acct, today);
   acct.lastCredit = points;
   acct.lastCreditDate = today;
   acct.totalCredit = (acct.totalCredit ?? 0) + (Number(res.points) || 0);
@@ -998,6 +1011,7 @@ function publicView(a, now, today) {
     lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
     lastOkDate: a.lastOkDate ?? null,
     lastCredit: creditToday ? (a.lastCredit ?? null) : null,
+    streak: a.streak ?? a.streakLocal ?? null,
     credits: typeof a.credits === 'number' ? Math.round(a.credits * 100) / 100 : null,
     totalCredit: a.totalCredit ?? 0,
     totalSigned: a.totalSigned ?? 0,
@@ -1087,6 +1101,7 @@ async function refreshOne(env, id) {
     acct.checkedIn = st.checked === true;
     if (st.checked) {
       acct.lastOkDate = today;
+      bumpStreak(acct, today);
       acct.cooldownUntil = 0;
       if (!wasCheckedToday && acct.lastState !== 'token_dead') {
         acct.lastState = 'already';
@@ -2105,7 +2120,7 @@ async function doCheckin(at) {
     headers: authHeader(at),
   });
   if (json?.code === 0) {
-    return { state: 'checked', credit: json.data?.credit ?? 100, raw: json.data };
+    return { state: 'checked', credit: SH.num(json.data?.credit), raw: json.data };
   }
   if (json?.code === 10001) {
     return { state: 'already', credit: 0 };
@@ -2182,8 +2197,11 @@ async function signinOne(env, acct, { force = false } = {}) {
     acct.lastMsg = `签到失败 code=${result.code} ${result.msg ?? ''}`;
   } else {
     acct.lastState = result.state; // 'checked' | 'already'
-    acct.lastMsg = result.state === 'checked' ? `+${result.credit} 积分` : '今日已签';
+    acct.lastMsg = result.state === 'checked'
+      ? (result.credit != null ? `+${result.credit} 积分` : '签到成功')
+      : '今日已签';
     acct.lastOkDate = today;
+    bumpStreak(acct, today);
     if (result.state === 'checked') {
       acct.lastCredit = result.credit;
       acct.lastCreditDate = today;
@@ -2296,9 +2314,10 @@ function publicView(a, now, today) {
     lastRun: a.lastRun ? new Date(a.lastRun + 8 * 3600e3).toISOString().replace('Z', ' +08:00') : null,
     lastOkDate: a.lastOkDate ?? null,
     lastCredit: creditToday ? (a.lastCredit ?? null) : null,
-    streak: a.streak ?? null,
+    streak: a.streak ?? a.streakLocal ?? null,
     total: a.total ?? null,
-    credits: typeof a.total === 'number' ? a.total : null,
+    // credits 只放真实余额，本期累计留在 total，两者口径不同
+    credits: typeof a.credits === 'number' ? a.credits : null,
     totalSigned: a.totalSigned ?? 0,
     credExp: a.refreshExp || null,
     credKind: 'refresh',
@@ -2378,6 +2397,7 @@ async function refreshOne(env, id) {
     acct.total = st.data.total_credits ?? acct.total ?? null;
     if (st.data.checked_in_today === true) {
       acct.lastOkDate = today;
+      bumpStreak(acct, today);
       acct.cooldownUntil = 0;
       if (!wasCheckedToday && acct.lastState !== 'token_dead') {
         acct.lastState = 'already';
@@ -2541,6 +2561,661 @@ return {
 };
 })();
 /* ================================================================== */
+/* 平台七：Qoder 国内版（qoder.com.cn）                                 */
+/*                                                                     */
+/*   GET  /device/selectAccounts?…              官网授权页，用户自己确认 */
+/*   GET  /api/v1/deviceToken/poll              PKCE 轮询设备令牌        */
+/*   POST /api/v1/deviceToken/refresh           续期（RT 每次轮换）      */
+/*   GET  /sash/api/v1/me/campaigns             活动列表                */
+/*   POST /sash/api/v1/me/campaigns/{id}/claim  领取                    */
+/*                                                                     */
+/* cosy-* 三件套是「设备通行证」：服务端按自报版本 + 设备身份决定下发哪些 */
+/* 活动，缺任一件就退化成只发营销卡（VIEW_DETAILS），拿不到每日 credits。 */
+/* ================================================================== */
+
+const Qoder = (() => {
+const WEB = 'https://qoder.com.cn';
+const API = 'https://openapi.qoder.com.cn';
+
+const EP = {
+  devicePage: '/device/selectAccounts',
+  poll: '/api/v1/deviceToken/poll',
+  refresh: '/api/v1/deviceToken/refresh',
+  campaigns: '/sash/api/v1/me/campaigns',
+};
+
+const UA = 'Qoder';
+const PROXY_UA = 'qoder-local-proxy';
+const CLIENT_TYPE = '10';
+const LANG = 'zh-CN';
+/* 自报版本决定服务端下发哪批活动：0.4.8 有每日 credits，0.2.5 只有营销卡 */
+const CLIENT_VERSION = '0.4.8';
+const MACHINE_OS = 'x86_64_win32';
+const MACHINE_HOSTNAME = 'DESKTOP';
+const LOGIN_TTL = 900;
+const COOLDOWN_MIN = 30;
+
+const CLAIMABLE_RE = /^(CLAIMABLE|UNCLAIMED|UN_CLAIMED|AVAILABLE|PENDING_CLAIM)$/i;
+const CLAIMED_RE = /^(CLAIMED|ALREADY_CLAIMED|RECEIVED|GRANTED|DONE)$/i;
+const ACTION_PRIORITY = ['CLAIM_BENEFIT', 'VIEW_DETAILS', 'DAILY_CHECKIN', 'SIGN_IN'];
+
+const vault = SH.makeVault('qoder-signin/v1/account');
+const INDEX_KEY = 'index:accounts';
+const acctKey = (id) => `acct:${id}`;
+const loginKey = (nonce) => `login:${nonce}`;
+
+async function listRaw(env) {
+  const raw = await env.PLATFORM_KV.get(INDEX_KEY);
+  return raw ? JSON.parse(raw) : [];
+}
+
+async function saveIndex(env, list) {
+  await env.PLATFORM_KV.put(INDEX_KEY, JSON.stringify(list));
+}
+
+async function getAccount(env, id) {
+  const raw = await env.PLATFORM_KV.get(acctKey(id));
+  if (!raw) return null;
+  return vault.open(env, raw);
+}
+
+async function putAccount(env, acct) {
+  await env.PLATFORM_KV.put(acctKey(acct.id), await vault.seal(env, acct));
+}
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' },
+  });
+}
+
+async function readBody(request) {
+  try {
+    return await request.json();
+  } catch {
+    return {};
+  }
+}
+
+function requireAdmin(request, env) {
+  const url = new URL(request.url);
+  const given =
+    request.headers.get('X-Admin-Token') ||
+    (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '') ||
+    url.searchParams.get('token');
+  if (!env.ADMIN_TOKEN) return { ok: false, res: json({ error: '未配置 ADMIN_TOKEN' }, 500) };
+  if (!SH.timingSafeEqual(given, env.ADMIN_TOKEN)) return { ok: false, res: json({ error: '登录密码不正确' }, 401) };
+  return { ok: true };
+}
+
+async function sha256B64Url(text) {
+  const digest = await crypto.subtle.digest('SHA-256', SH.enc.encode(text));
+  return SH.b64urlEncode(new Uint8Array(digest));
+}
+
+/** 业务请求头：授权 + 设备通行证，两者缺一服务端就不给每日活动 */
+function authHeaders(at, acct, extra) {
+  const h = {
+    authorization: `Bearer ${at}`,
+    'cosy-clienttype': CLIENT_TYPE,
+    'user-agent': UA,
+    accept: 'application/json',
+    'accept-language': LANG,
+    'cosy-version': CLIENT_VERSION,
+    'cosy-machineos': MACHINE_OS,
+    'cosy-machinehostname': MACHINE_HOSTNAME,
+  };
+  const mid = String(acct && acct.machineId ? acct.machineId : '').trim();
+  if (mid) h['cosy-machineid'] = mid;
+  return extra ? Object.assign(h, extra) : h;
+}
+
+function qFetch(path, { method = 'GET', headers = {}, body } = {}) {
+  return SH.httpJson(API + path, {
+    method,
+    headers,
+    body: method === 'GET' ? undefined : JSON.stringify(body || {}),
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 设备授权                                                            */
+/* ------------------------------------------------------------------ */
+
+async function loginStart() {
+  const verifier = SH.randomId(32);
+  const challenge = await sha256B64Url(verifier);
+  const nonce = SH.randomHex(16);
+  const machineId = crypto.randomUUID();
+
+  const pairs = [['challenge', challenge], ['challenge_method', 'S256']];
+  pairs.push(['machine_id', machineId], ['nonce', nonce]);
+  const authUrl = `${WEB}${EP.devicePage}?${pairs
+    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
+    .join('&')}`;
+
+  return { verifier, challenge, nonce, machineId, authUrl };
+}
+
+/** 202 / 404 都算「用户还没确认」，不算失败 */
+async function loginPoll(nonce, verifier) {
+  const q = `?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(verifier)}&challenge_method=S256`;
+  const r = await qFetch(EP.poll + q, {
+    headers: { 'cosy-version': '1.0.1', 'cosy-clienttype': '5', 'user-agent': PROXY_UA },
+  });
+  if (r.status === 202 || r.status === 404) return { pending: true };
+  if (r.status >= 400) return { pending: false, error: `授权轮询失败（HTTP ${r.status}）` };
+  const d = r.json && typeof r.json.data === 'object' && r.json.data ? r.json.data : (r.json || {});
+  const accessToken = String(d.token || d.access_token || d.device_token || '').trim();
+  if (!accessToken) return { pending: true };
+  return {
+    pending: false,
+    accessToken,
+    refreshToken: String(d.refresh_token || d.refreshToken || '').trim(),
+    uid: String(d.user_id || d.userId || '').trim(),
+    email: String(d.email || d.user_email || '').trim(),
+  };
+}
+
+/** refreshToken 会轮换，换到的必须立刻回写 */
+async function refreshTokens(acct) {
+  const rt = String(acct.refreshToken || '').trim();
+  if (!rt) {
+    const e = new Error('账号缺少 refreshToken，无法续期，请删掉重新添加');
+    e.fatal = true;
+    throw e;
+  }
+  const r = await qFetch(EP.refresh, {
+    method: 'POST',
+    headers: { 'user-agent': PROXY_UA, 'content-type': 'application/json' },
+    body: { refresh_token: rt },
+  });
+  if (r.status === 401 || r.status === 403) {
+    const e = new Error('refreshToken 已失效，请删掉重新添加');
+    e.fatal = true;
+    throw e;
+  }
+  if (r.status >= 400) throw new Error(`令牌续期失败（HTTP ${r.status}）`);
+  const d = r.json && typeof r.json.data === 'object' && r.json.data ? r.json.data : (r.json || {});
+  const token = String(d.device_token || d.deviceToken || d.token || d.access_token || '').trim();
+  if (!token) throw new Error('续期响应里没有新的 access token');
+  acct.accessToken = token;
+  const nr = String(d.refresh_token || d.refreshToken || '').trim();
+  if (nr) acct.refreshToken = nr;
+  acct.tokenRefreshedAt = Date.now();
+  acct.credExp = SH.jwtExp(token) ? SH.jwtExp(token) * 1000 : 0;
+  return token;
+}
+
+async function ensureToken(acct) {
+  if (acct.accessToken) return acct.accessToken;
+  return refreshTokens(acct);
+}
+
+/* ------------------------------------------------------------------ */
+/* 活动列表与领取                                                      */
+/* ------------------------------------------------------------------ */
+
+function campaignRows(payload) {
+  const rows = (payload && (payload.campaigns ?? payload.data?.campaigns)) || [];
+  return Array.isArray(rows) ? rows : [];
+}
+
+const statusOf = (row) => String(row.status ?? row.state ?? '');
+const actionOf = (row) => String(row.action ?? row.actionType ?? row.type ?? '');
+
+function idOf(row) {
+  for (const k of ['campaignId', 'campaignKey', 'key', 'id']) {
+    const v = row && row[k];
+    if (v != null && String(v).trim()) return String(v).trim();
+  }
+  return '';
+}
+
+function amountOf(obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  const direct = SH.num(obj.credits ?? obj.creditAmount);
+  if (direct != null) return direct;
+  for (const k of ['benefit', 'reward']) {
+    const v = obj[k];
+    if (v && typeof v === 'object') {
+      const n = SH.num(v.amount ?? v.credits);
+      if (n != null) return n;
+    } else {
+      const n = SH.num(v);
+      if (n != null) return n;
+    }
+  }
+  return SH.num(obj.amount);
+}
+
+/**
+ * 领哪个：先按状态筛可领，再按动作优先级排。
+ * 枚举服务端会改，认不出的动作也照样试一遍，别用白名单把自己锁死。
+ */
+function pickCampaign(rows) {
+  const claimable = rows.filter((r) => CLAIMABLE_RE.test(statusOf(r)) && idOf(r));
+  claimable.sort((a, b) => {
+    const ia = ACTION_PRIORITY.indexOf(actionOf(a).toUpperCase());
+    const ib = ACTION_PRIORITY.indexOf(actionOf(b).toUpperCase());
+    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+  });
+  const claimedBenefit = rows.some(
+    (r) => CLAIMED_RE.test(statusOf(r)) && actionOf(r).toUpperCase() === 'CLAIM_BENEFIT'
+  );
+  const onlyMarketing = rows.length > 0 && rows.every((r) => actionOf(r).toUpperCase() === 'VIEW_DETAILS');
+  return { target: claimable[0] || null, claimedBenefit, onlyMarketing, total: rows.length };
+}
+
+async function fetchCampaigns(acct, { force = true } = {}) {
+  const at = await ensureToken(acct);
+  return qFetch(EP.campaigns + (force ? '?forceRefresh=true' : ''), { headers: authHeaders(at, acct) });
+}
+
+async function claimCampaign(acct, campaignId) {
+  const at = await ensureToken(acct);
+  return qFetch(`${EP.campaigns}/${encodeURIComponent(campaignId)}/claim`, {
+    method: 'POST',
+    headers: authHeaders(at, acct, { 'content-type': 'application/json', origin: API }),
+    body: {},
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/* 签到编排                                                            */
+/* ------------------------------------------------------------------ */
+
+async function signinOne(env, acct, { force = false } = {}) {
+  const now = Date.now();
+  const today = SH.bjDay(now);
+  const base = { id: acct.id, label: acct.label, platform: 'qoder' };
+  acct.lastRun = now;
+
+  if (acct.enabled === false) {
+    return { ...base, state: 'disabled', msg: '账号已停用' };
+  }
+  if (!force && Number(acct.cooldownUntil || 0) > now) {
+    return { ...base, state: 'cooldown', msg: `冷却中，还有 ${Math.ceil((acct.cooldownUntil - now) / 60000)} 分钟` };
+  }
+  if (!force && acct.lastOkDate === today) {
+    return { ...base, state: 'skipped', msg: '今天已领过' };
+  }
+
+  let listRes;
+  try {
+    listRes = await fetchCampaigns(acct);
+    if (listRes.status === 401 || listRes.status === 403) {
+      await refreshTokens(acct);
+      listRes = await fetchCampaigns(acct);
+    }
+  } catch (e) {
+    acct.lastState = 'error';
+    acct.lastMsg = `活动列表请求异常: ${e.message}`;
+    await putAccount(env, acct);
+    return { ...base, state: 'error', msg: acct.lastMsg };
+  }
+
+  if (listRes.status === 429) {
+    acct.lastState = 'rate';
+    acct.lastMsg = '请求过于频繁（HTTP 429）';
+    acct.cooldownUntil = now + COOLDOWN_MIN * 60000;
+    await putAccount(env, acct);
+    return { ...base, state: 'rate', msg: acct.lastMsg };
+  }
+  if (listRes.status >= 400) {
+    acct.lastState = 'error';
+    acct.lastMsg = `活动列表失败（HTTP ${listRes.status}）`;
+    await putAccount(env, acct);
+    return { ...base, state: 'error', msg: acct.lastMsg };
+  }
+
+  const picked = pickCampaign(campaignRows(listRes.json));
+  if (!picked.target) {
+    const state = picked.claimedBenefit ? 'already' : 'no_activity';
+    acct.lastState = state;
+    acct.lastMsg = picked.claimedBenefit
+      ? '今日已领取'
+      : picked.onlyMarketing
+        ? '今日没有签到活动，只有营销活动'
+        : picked.total
+          ? '活动列表里没有可领项'
+          : '接口没返回任何活动';
+    if (picked.claimedBenefit) acct.lastOkDate = today;
+    await putAccount(env, acct);
+    return { ...base, state, msg: acct.lastMsg };
+  }
+
+  const campaignId = idOf(picked.target);
+  let claimRes;
+  try {
+    claimRes = await claimCampaign(acct, campaignId);
+  } catch (e) {
+    acct.lastState = 'error';
+    acct.lastMsg = `领取请求异常: ${e.message}`;
+    await putAccount(env, acct);
+    return { ...base, state: 'error', msg: acct.lastMsg };
+  }
+
+  const body = claimRes.json || {};
+  const already =
+    claimRes.status === 409 ||
+    String(body.result || '').toUpperCase() === 'ALREADY_CLAIMED' ||
+    body.replayed === true ||
+    CLAIMED_RE.test(String(body.status || ''));
+
+  if (already) {
+    acct.lastState = 'already';
+    acct.lastMsg = '今日已领取';
+    acct.lastOkDate = today;
+    acct.cooldownUntil = 0;
+    await putAccount(env, acct);
+    return { ...base, state: 'already', msg: acct.lastMsg };
+  }
+  if (claimRes.status >= 400) {
+    acct.lastState = 'error';
+    acct.lastMsg = `领取失败（HTTP ${claimRes.status}）${SH.num(body.code) != null ? ' code=' + body.code : ''}`;
+    await putAccount(env, acct);
+    return { ...base, state: 'error', msg: acct.lastMsg };
+  }
+
+  const points = amountOf(body) ?? amountOf(picked.target);
+  const claimed = !body.status || CLAIMED_RE.test(String(body.status));
+  acct.lastRun = now;
+  acct.cooldownUntil = 0;
+  if (claimed) {
+    acct.lastState = 'checked';
+    acct.lastMsg = points != null ? `+${points} credits` : '领取成功';
+    acct.lastOkDate = today;
+    acct.lastCredit = points;
+    acct.lastCreditDate = today;
+    acct.totalCredit = (acct.totalCredit || 0) + Number(points || 0);
+    acct.totalSigned = (acct.totalSigned || 0) + 1;
+  } else {
+    acct.lastState = 'pending';
+    acct.lastMsg = `已提交，服务端状态 ${body.status}`;
+  }
+  await putAccount(env, acct);
+  return {
+    ...base,
+    state: acct.lastState,
+    msg: acct.lastMsg,
+    credit: claimed ? points : null,
+    totalCredit: acct.totalCredit,
+  };
+}
+
+/** 只读刷新：重查活动列表，把「今日是否已领」对上，不领取 */
+async function refreshOne(env, id) {
+  const now = Date.now();
+  const today = SH.bjDay(now);
+  const acct = await getAccount(env, id);
+  if (!acct) throw new Error('账号不存在');
+  try {
+    const r = await fetchCampaigns(acct, { force: true });
+    if (r.status === 401 || r.status === 403) {
+      await refreshTokens(acct);
+      return publicView(acct, now, today);
+    }
+    if (r.status < 400) {
+      const picked = pickCampaign(campaignRows(r.json));
+      if (picked.claimedBenefit) {
+        acct.lastOkDate = today;
+        if (acct.lastState !== 'checked') {
+          acct.lastState = 'already';
+          acct.lastMsg = '服务端显示今日已领';
+        }
+      }
+    }
+  } catch (e) {
+    if (e.fatal) {
+      acct.lastState = 'token_dead';
+      acct.lastMsg = e.message;
+    }
+  }
+  await putAccount(env, acct);
+  return publicView(acct, now, today);
+}
+
+function publicView(a, now, today) {
+  const creditToday = a.lastCreditDate ? a.lastCreditDate === today : false;
+  return {
+    id: a.id,
+    label: a.label,
+    enabled: a.enabled !== false,
+    lastState: a.lastState,
+    lastMsg: a.lastMsg,
+    lastRun: a.lastRun ? SH.fmtBj(a.lastRun) : null,
+    lastOkDate: a.lastOkDate ?? null,
+    lastCredit: creditToday ? (a.lastCredit ?? null) : null,
+    credits: null,
+    total: null,
+    streak: null,
+    totalSigned: a.totalSigned ?? 0,
+    totalCredit: a.totalCredit ?? 0,
+    credExp: a.credExp || null,
+    credKind: 'access',
+    cooldownUntil: Number(a.cooldownUntil || 0) > now ? a.cooldownUntil : 0,
+    signedToday: a.lastOkDate === today,
+    ranToday: a.lastRun ? SH.bjDay(a.lastRun) === today : false,
+    platform: 'qoder',
+  };
+}
+
+async function list(env) {
+  const entries = await listRaw(env);
+  const now = Date.now();
+  const today = SH.bjDay(now);
+  const out = [];
+  for (const meta of entries) {
+    const a = await getAccount(env, meta.id).catch(() => null);
+    if (!a) continue;
+    out.push(publicView(a, now, today));
+  }
+  return { count: out.length, today, accounts: out };
+}
+
+async function run(env, { force = false, id = '' } = {}) {
+  const entries = await listRaw(env);
+  const results = [];
+  for (const meta of entries) {
+    if (id && meta.id !== id) continue;
+    const acct = await getAccount(env, meta.id);
+    if (!acct) continue;
+    try {
+      results.push(await signinOne(env, acct, { force }));
+    } catch (e) {
+      results.push({ id: acct.id, label: acct.label, platform: 'qoder', state: 'error', msg: e.message });
+    }
+  }
+  return {
+    at: SH.fmtBj(Date.now()),
+    accounts: results.length,
+    checked: results.filter((r) => r.state === 'checked').length,
+    already: results.filter((r) => r.state === 'already' || r.state === 'skipped').length,
+    failed: results.filter((r) => r.state === 'error' || r.state === 'token_dead').length,
+    cooling: results.filter((r) => ['rate', 'cooldown'].includes(r.state)).length,
+    results,
+  };
+}
+
+async function add(env, { creds = {}, label = '' } = {}) {
+  const accessToken = SH.stripBearer(creds.access_token || creds.token || '');
+  const refreshToken = String(creds.refresh_token || '').trim();
+  if (!accessToken && !refreshToken) throw new Error('缺少 access_token 或 refresh_token');
+  const id = SH.randomId(9);
+  const acct = {
+    id,
+    label: String(label).trim().slice(0, 40) || `Qoder-${id.slice(0, 4)}`,
+    accessToken,
+    refreshToken,
+    machineId: String(creds.machine_id || '').trim(),
+    uid: String(creds.uid || '').trim(),
+    createdAt: Date.now(),
+    lastState: 'new',
+    lastMsg: '尚未运行',
+    verified: true,
+    enabled: true,
+    credExp: SH.jwtExp(accessToken) ? SH.jwtExp(accessToken) * 1000 : 0,
+  };
+  await putAccount(env, acct);
+  const list = await listRaw(env);
+  list.push({ id, label: acct.label, createdAt: acct.createdAt });
+  await saveIndex(env, list);
+  return { id: acct.id, label: acct.label, accounts: list.length };
+}
+
+async function removeAccount(env, id) {
+  await env.PLATFORM_KV.delete(acctKey(id));
+  const rest = (await listRaw(env)).filter((x) => x.id !== id);
+  await saveIndex(env, rest);
+  return { removed: id };
+}
+
+async function renameAccount(env, id, label) {
+  const acct = await getAccount(env, id);
+  if (!acct) throw new Error('账号不存在');
+  acct.label = label;
+  await putAccount(env, acct);
+  await saveIndex(env, (await listRaw(env)).map((x) => (x.id === id ? { ...x, label } : x)));
+  return { id, label };
+}
+
+async function setEnabled(env, id, enabled) {
+  const acct = await getAccount(env, id);
+  if (!acct) throw new Error('账号不存在');
+  acct.enabled = !!enabled;
+  await putAccount(env, acct);
+  return { id, enabled: !!enabled };
+}
+
+const __mod = {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+    const method = request.method.toUpperCase();
+    try {
+      if (!path.startsWith('/api/')) return json({ error: 'not found' }, 404);
+      const a = requireAdmin(request, env);
+      if (!a.ok) return a.res;
+
+      if (path === '/api/list' && method === 'GET') return json(await list(env));
+      if (path === '/api/run' && method === 'POST') {
+        const body = await readBody(request);
+        const force = url.searchParams.get('force') === '1' || body.force === true;
+        return json(await run(env, { force, id: String(body.id || '').trim() }));
+      }
+      if (path === '/api/login/start' && method === 'POST') {
+        const s = await loginStart();
+        await env.PLATFORM_KV.put(
+          loginKey(s.nonce),
+          await vault.seal(env, { verifier: s.verifier, machineId: s.machineId, at: Date.now() }),
+          { expirationTtl: LOGIN_TTL }
+        );
+        return json({ ok: true, nonce: s.nonce, authUrl: s.authUrl, expiresIn: LOGIN_TTL });
+      }
+      if (path === '/api/login/poll' && method === 'GET') {
+        const nonce = String(url.searchParams.get('nonce') || '').trim();
+        if (!nonce) return json({ error: '缺少 nonce' }, 400);
+        const raw = await env.PLATFORM_KV.get(loginKey(nonce));
+        if (!raw) return json({ error: '授权会话已过期，请重新点「添加账号」' }, 400);
+        const sess = await vault.open(env, raw);
+        const got = await loginPoll(nonce, sess.verifier);
+        if (got.pending) return json({ pending: true });
+        if (got.error) return json({ error: got.error }, 502);
+        const acct = {
+          id: SH.randomId(9),
+          label: (got.email || `Qoder-${got.uid.slice(-4) || sess.machineId.slice(0, 4)}`).slice(0, 40),
+          accessToken: got.accessToken,
+          refreshToken: got.refreshToken,
+          machineId: sess.machineId,
+          uid: got.uid,
+          createdAt: Date.now(),
+          lastState: 'new',
+          lastMsg: '尚未运行',
+          verified: true,
+          enabled: true,
+          tokenRefreshedAt: Date.now(),
+          credExp: SH.jwtExp(got.accessToken) ? SH.jwtExp(got.accessToken) * 1000 : 0,
+        };
+        await putAccount(env, acct);
+        const list = await listRaw(env);
+        list.push({ id: acct.id, label: acct.label, createdAt: acct.createdAt });
+        await saveIndex(env, list);
+        await env.PLATFORM_KV.delete(loginKey(nonce));
+        return json({ ok: true, pending: false, account: publicView(acct, Date.now(), SH.bjDay()), accounts: list.length });
+      }
+      if (path === '/api/add' && method === 'POST') {
+        const body = await readBody(request);
+        try {
+          return json({ ok: true, ...(await add(env, body)) });
+        } catch (e) {
+          return json({ error: e.message }, 400);
+        }
+      }
+      if (path === '/api/refresh' && method === 'POST') {
+        const body = await readBody(request);
+        const id = String(body.id || '').trim();
+        if (!id) return json({ error: '缺少 id' }, 400);
+        try {
+          return json({ ok: true, account: await refreshOne(env, id) });
+        } catch (e) {
+          return json({ error: e.message }, 502);
+        }
+      }
+      if (path === '/api/remove' && method === 'POST') {
+        const body = await readBody(request);
+        const id = String(body.id || '').trim();
+        if (!id) return json({ error: '缺少 id' }, 400);
+        return json({ ok: true, ...(await removeAccount(env, id)) });
+      }
+      if (path === '/api/rename' && method === 'POST') {
+        const body = await readBody(request);
+        const id = String(body.id || '').trim();
+        const label = String(body.label || '').trim().slice(0, 40);
+        if (!id) return json({ error: '缺少 id' }, 400);
+        if (!label) return json({ error: '备注不能为空' }, 400);
+        try {
+          return json({ ok: true, ...(await renameAccount(env, id, label)) });
+        } catch (e) {
+          return json({ error: e.message }, 404);
+        }
+      }
+      if (path === '/api/enable' && method === 'POST') {
+        const body = await readBody(request);
+        const id = String(body.id || '').trim();
+        if (!id) return json({ error: '缺少 id' }, 400);
+        try {
+          return json({ ok: true, ...(await setEnabled(env, id, body.enabled !== false)) });
+        } catch (e) {
+          return json({ error: e.message }, 404);
+        }
+      }
+      return json({ error: 'not found' }, 404);
+    } catch (e) {
+      return json({ error: e.message || String(e) }, 500);
+    }
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(run(env, { force: false }).catch(() => {}));
+  },
+};
+
+return {
+  fetch: __mod.fetch,
+  scheduled: __mod.scheduled,
+  list,
+  run,
+  refresh: refreshOne,
+  add,
+  remove: removeAccount,
+  rename: renameAccount,
+  setEnabled,
+};
+})();
+
+/* ================================================================== */
 /* 模块三：通用平台工厂                                                 */
 /*                                                                     */
 /* 新增一个「粘贴凭证即可签到」的平台，只需要提供：                      */
@@ -2599,7 +3274,7 @@ function createTokenPlatform(cfg) {
       lastOkDate: a.lastOkDate ?? null,
       lastCredit: creditToday ? (a.lastCredit ?? null) : null,
       credits: typeof a.credits === 'number' ? Math.round(a.credits * 100) / 100 : null,
-      streak: a.streak ?? null,
+      streak: a.streak ?? a.streakLocal ?? null,
       total: a.total ?? null,
       totalSigned: a.totalSigned ?? 0,
       totalCredit: a.totalCredit ?? 0,
@@ -2721,6 +3396,7 @@ function createTokenPlatform(cfg) {
       if (st.uid) acct.uid = st.uid;
       if (st.checked && st.trustworthy !== false) {
         acct.lastOkDate = today;
+        bumpStreak(acct, today);
         acct.noActivityDate = 0;
         acct.lastState = 'already';
         acct.lastMsg = '今日已签';
@@ -2780,6 +3456,7 @@ function createTokenPlatform(cfg) {
 
     // 3) 成功 / 今日已领
     acct.lastOkDate = today;
+    bumpStreak(acct, today);
     acct.noActivityDate = 0;
     acct.lastState = cl.already ? 'already' : 'checked';
     acct.lastMsg = cl.message || (cl.already ? '今日已签' : '签到成功');
@@ -2812,7 +3489,7 @@ function createTokenPlatform(cfg) {
       msg: acct.lastMsg,
       credit: cl.already ? null : cl.credit ?? null,
       credits: acct.credits ?? null,
-      streak: acct.streak ?? null,
+      streak: acct.streak ?? acct.streakLocal ?? null,
     };
   }
 
@@ -2885,6 +3562,7 @@ function createTokenPlatform(cfg) {
       if (st.uid) acct.uid = st.uid;
       if (st.checked && st.trustworthy !== false) {
         acct.lastOkDate = today;
+        bumpStreak(acct, today);
         acct.cooldownUntil = 0;
         if (!wasCheckedToday && acct.lastState !== 'token_dead') {
           acct.lastState = 'already';
@@ -4005,11 +4683,27 @@ const WB_META = {
   fields: [],
   hint: '点「添加账号」打开官方登录页，用微信扫码。',
   note: '二维码由官方页面渲染，本服务不接触你的微信信息。',
+  creditHint: '本期签到累计获得，不是官网剩余积分',
+};
+
+const QODER_META = {
+  key: 'qoder',
+  label: 'Qoder',
+  accent: 'lime',
+  verified: false,
+  verifiedNote: '按上游已实测版本移植；本部署未用真实账号复核，实机跑通后可设 QODER_VERIFIED=true 去掉标记',
+  addMode: 'device',
+  defaultHost: 'openapi.qoder.com.cn',
+  supportsRefresh: true,
+  fields: [],
+  hint: '点「添加账号」打开官方授权页，登录并确认后自动入库。',
+  note: '领取到的是 credits，累计值由本工具自己记账，接口不返回余额。',
 };
 
 const PLATFORMS = [
   { key: 'trae', meta: TRAE_META, mod: Trae, env: traeEnv, prefix: 'trae:' },
   { key: 'workbuddy', meta: WB_META, mod: WorkBuddy, env: wbEnv, prefix: 'wb:' },
+  { key: 'qoder', meta: QODER_META, mod: Qoder, env: (env) => platformEnv(env, 'qoder:'), prefix: 'qoder:' },
   { key: 'workbuddy_intl', meta: WorkBuddyIntl.meta, mod: WorkBuddyIntl, env: (env) => platformEnv(env, 'wbi:'), prefix: 'wbi:' },
   { key: 'zhipu', meta: Zhipu.meta, mod: Zhipu, env: (env) => platformEnv(env, 'zhipu:'), prefix: 'zhipu:' },
   { key: 'loomy', meta: Loomy.meta, mod: Loomy, env: (env) => platformEnv(env, 'loomy:'), prefix: 'loomy:' },
@@ -4022,6 +4716,7 @@ const NS_MAP = {
   trae: PLATFORM_MAP.trae,
   wb: PLATFORM_MAP.workbuddy,
   workbuddy: PLATFORM_MAP.workbuddy,
+  qoder: PLATFORM_MAP.qoder,
   wbi: PLATFORM_MAP.workbuddy_intl,
   workbuddy_intl: PLATFORM_MAP.workbuddy_intl,
   zhipu: PLATFORM_MAP.zhipu,
@@ -4057,6 +4752,7 @@ function metaOf(entry, env) {
     fields: m.fields || [],
     hint: m.hint || '',
     note: m.note || '',
+    creditHint: m.creditHint || '',
     available: true,
     unavailableReason: '',
   };
@@ -4175,9 +4871,11 @@ function cronInfo(env, crons) {
       next: best ? SH.fmtBjShort(best.t) : '—',
       source: 'auto',
       crons: list,
+      configured: true,
     };
   }
-  const text = String(env.CHECKIN_CRON || '08:10').trim();
+  const raw = String(env.CHECKIN_CRON || '').trim();
+  const text = raw || '08:10';
   const m = /^(\d{1,2}):(\d{2})$/.exec(text);
   const hour = m ? Math.min(23, Math.max(0, Number(m[1]))) : 8;
   const minute = m ? Math.min(59, Math.max(0, Number(m[2]))) : 10;
@@ -4186,6 +4884,7 @@ function cronInfo(env, crons) {
     next: SH.nextRunBj(hour, minute),
     source: 'env',
     crons: [],
+    configured: raw !== '',
   };
 }
 
@@ -4322,6 +5021,7 @@ async function overview(env) {
     cron: cron.text,
     nextRun: cron.next,
     cronSource: cron.source,
+    cronConfigured: cron.configured,
     crons: cron.crons,
     stats: {
       total: accounts.length,
@@ -4358,6 +5058,11 @@ async function runAll(env, { force = false, action = 'cron' } = {}) {
     out[entry.key] = await runPlatform(entry, env, { force, action });
     // 兼容旧版 /cron 响应里的 wb 键
     if (entry.key === 'workbuddy') out.wb = out[entry.key];
+  }
+  try {
+    out.notify = await notifyRun(env, out);
+  } catch (e) {
+    out.notify = { error: e.message };
   }
   return out;
 }
@@ -4475,6 +5180,207 @@ function repath(request, path) {
 }
 
 /* ================================================================== */
+/* 签到结果通知（Telegram Bot / QQ 官方机器人）                          */
+/*                                                                     */
+/* 配置存在 KV 的 notify:config，和其它凭证一样用 MASTER_KEY 加密。      */
+/* 每轮全量签到跑完推一条汇总；通道失败只记在返回里，不影响签到结论。    */
+/* ================================================================== */
+
+const NOTIFY_KEY = 'notify:config';
+const notifyVault = SH.makeVault('notify/v1/config');
+const notifyVaultEnv = (env) => ({ PLATFORM_MASTER_KEY: env.MASTER_KEY });
+
+async function readNotify(env) {
+  try {
+    const raw = await env.KV.get(NOTIFY_KEY);
+    if (!raw) return {};
+    return await notifyVault.open(notifyVaultEnv(env), raw);
+  } catch {
+    return {};
+  }
+}
+
+async function writeNotify(env, cfg) {
+  await env.KV.put(NOTIFY_KEY, await notifyVault.seal(notifyVaultEnv(env), cfg));
+}
+
+function notifyView(cfg) {
+  const tg = cfg.telegram || {};
+  const qq = cfg.qq || {};
+  return {
+    telegram: {
+      token: tg.token || '',
+      chatId: tg.chatId || '',
+      ready: !!(tg.token && tg.chatId),
+    },
+    qq: {
+      appId: qq.appId || '',
+      appSecret: qq.appSecret || '',
+      openid: qq.openid || '',
+      sandbox: !!qq.sandbox,
+      ready: !!(qq.appId && qq.appSecret && qq.openid),
+    },
+  };
+}
+
+async function sendTelegram(tg, text) {
+  const r = await SH.httpJson(`https://api.telegram.org/bot${tg.token}/sendMessage`, {
+    method: 'POST',
+    body: JSON.stringify({ chat_id: tg.chatId, text, disable_web_page_preview: true }),
+  });
+  if (r.status >= 400 || (r.json && r.json.ok === false)) {
+    throw new Error(`Telegram 发送失败（HTTP ${r.status}）`);
+  }
+}
+
+let qqTokenCache = { key: '', token: '', exp: 0 };
+
+async function qqAccessToken(qq) {
+  const now = Date.now();
+  const key = `${qq.appId}:${qq.appSecret}`;
+  if (qqTokenCache.key === key && qqTokenCache.token && qqTokenCache.exp > now) return qqTokenCache.token;
+  const r = await SH.httpJson('https://bots.qq.com/app/getAppAccessToken', {
+    method: 'POST',
+    body: JSON.stringify({ appId: qq.appId, clientSecret: qq.appSecret }),
+  });
+  const token = r.json?.access_token || r.json?.accessToken;
+  if (!token) throw new Error(`QQ 机器人取 token 失败（HTTP ${r.status}）`);
+  const ttl = Number(r.json?.expires_in || r.json?.expiresIn || 7200);
+  qqTokenCache = { key, token, exp: now + Math.max(60, ttl - 120) * 1000 };
+  return token;
+}
+
+async function sendQQ(qq, text) {
+  const at = await qqAccessToken(qq);
+  const base = qq.sandbox ? 'https://sandbox.api.sgroup.qq.com' : 'https://api.sgroup.qq.com';
+  const r = await SH.httpJson(`${base}/v2/users/${encodeURIComponent(qq.openid)}/messages`, {
+    method: 'POST',
+    headers: { authorization: `QQBot ${at}` },
+    body: JSON.stringify({ content: text, msg_type: 0 }),
+  });
+  if (r.status >= 400) throw new Error(`QQ 发送失败（HTTP ${r.status}）`);
+}
+
+/** 汇总文案：一行一个平台，账号明细最多列 6 条 */
+function formatReport(summary) {
+  const d = new Date(Date.now() + 8 * 3600e3);
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  const hh = String(d.getUTCHours()).padStart(2, '0');
+  const mi = String(d.getUTCMinutes()).padStart(2, '0');
+  const lines = [`📋 签到完成 · ${mm}-${dd} ${hh}:${mi}`];
+
+  for (const entry of PLATFORMS) {
+    const p = summary[entry.key];
+    if (!p) continue;
+    const results = p.results || [];
+    if (!results.length && !p.error) continue;
+    const total = p.accounts ?? results.length;
+    const done = (p.checked || 0) + (p.already || 0);
+    const bad = (p.failed || 0) + (p.cooling || 0);
+    const mark = bad === 0 ? '✅' : done === 0 ? '❌' : '⚠️';
+    const bits = [`${mark} ${entry.meta.label}`, `${done}/${total}`];
+    if (p.checked) bits.push(`新签 ${p.checked}`);
+    if (p.already) bits.push(`已签 ${p.already}`);
+    if (bad) bits.push(`失败 ${bad}`);
+    if (p.error) bits.push(p.error);
+    lines.push(bits.join(' · '));
+
+    const shown = results.filter((r) => r.state !== 'checked' || r.msg).slice(0, 6);
+    for (const r of shown) {
+      if (!r.msg) continue;
+      lines.push(`   · ${r.label || r.id || ''} ${r.msg}`);
+    }
+    if (results.length > shown.length) lines.push(`   …还有 ${results.length - shown.length} 个`);
+  }
+  return lines.join('\n');
+}
+
+function demoSummary() {
+  const results = [
+    { id: 'demo1', label: '示例账号', state: 'checked', msg: '+100 credits' },
+    { id: 'demo2', label: '备用号', state: 'error', msg: '令牌已失效，请重新添加' },
+  ];
+  return {
+    at: SH.fmtBj(Date.now()),
+    trae: { accounts: 1, checked: 1, already: 0, failed: 0, cooling: 0 },
+    workbuddy: { accounts: 1, checked: 0, already: 1, failed: 0, cooling: 0 },
+    qoder: { accounts: 2, checked: 1, already: 0, failed: 1, cooling: 0, results },
+  };
+}
+
+/** 配了哪个就发哪个；都没配就静默跳过 */
+async function notifyRun(env, summary) {
+  const cfg = await readNotify(env);
+  const jobs = [];
+  const out = {};
+
+  if (cfg.telegram?.token && cfg.telegram?.chatId) {
+    jobs.push(
+      sendTelegram(cfg.telegram, formatReport(summary))
+        .then(() => {
+          out.telegram = 'ok';
+        })
+        .catch((e) => {
+          out.telegram = e.message;
+        })
+    );
+  }
+  if (cfg.qq?.appId && cfg.qq?.appSecret && cfg.qq?.openid) {
+    jobs.push(
+      sendQQ(cfg.qq, formatReport(summary))
+        .then(() => {
+          out.qq = 'ok';
+        })
+        .catch((e) => {
+          out.qq = e.message;
+        })
+    );
+  }
+  if (!jobs.length) return { skipped: true };
+  await Promise.all(jobs);
+  return out;
+}
+
+/* 取 QQ 机器人 openid 的本机脚本：连网关 → 你私聊一次机器人 → 打印 openid */
+const QQ_OPENID_HELPER = `#!/usr/bin/env node
+/* 用法：node openid-helper.mjs <AppID> <AppSecret>   （需要 Node 22+） */
+const [appId, secret] = process.argv.slice(2);
+if (!appId || !secret) { console.error('参数：node openid-helper.mjs <AppID> <AppSecret>'); process.exit(1); }
+
+const post = (u, b) => fetch(u, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(b) }).then((r) => r.json());
+
+const tok = await post('https://bots.qq.com/app/getAppAccessToken', { appId, clientSecret: secret });
+const at = tok.access_token || tok.accessToken;
+if (!at) { console.error('取 token 失败：', tok); process.exit(1); }
+
+const gw = await (await fetch('https://api.sgroup.qq.com/gateway', { headers: { Authorization: 'QQBot ' + at } })).json();
+if (!gw.url) { console.error('取网关失败：', gw); process.exit(1); }
+
+const ws = new WebSocket(gw.url);
+let beat = null;
+ws.onopen = () => console.log('已连上网关，请在 60 秒内用手机 QQ 给机器人发一条私聊…');
+ws.onmessage = (ev) => {
+  const p = JSON.parse(ev.data);
+  if (p.op === 10) {
+    ws.send(JSON.stringify({ op: 2, d: { token: 'QQBot ' + at, intents: 1 << 25, shard: [0, 1] } }));
+    beat = setInterval(() => ws.send(JSON.stringify({ op: 1, d: null })), p.d.heartbeat_interval || 40000);
+  }
+  if (p.op === 0 && p.t === 'C2C_MESSAGE_CREATE') {
+    const openid = p.d && p.d.author && p.d.author.user_openid;
+    if (openid) {
+      console.log('\\n你的 user_openid：\\n' + openid + '\\n');
+      clearInterval(beat);
+      ws.close();
+      process.exit(0);
+    }
+  }
+};
+ws.onerror = (e) => { console.error('网关连接失败：', e.message || e); process.exit(1); };
+setTimeout(() => { console.error('等超时了，重新跑一次脚本再试'); process.exit(1); }, 65000);
+`;
+
+/* ================================================================== */
 /* 入口                                                                */
 /* ================================================================== */
 
@@ -4499,13 +5405,19 @@ const __worker = {
         return new Response('ok', { headers: { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' } });
       }
 
+      if (path === '/qq/openid-helper.mjs' && method === 'GET') {
+        return new Response(QQ_OPENID_HELPER, {
+          headers: { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store' },
+        });
+      }
+
       // 平台命名空间：/trae/api/*、/wb/api/*、/wbi/api/* …
       const ns = path.split('/')[1];
       if (NS_MAP[ns] && path.startsWith('/' + ns + '/')) {
         const entry = NS_MAP[ns];
         return await entry.mod.fetch(repath(request, path.slice(ns.length + 1) || '/'), entry.env(env), ctx);
       }
-      if (path === '/trae' || path === '/wb' || path === '/wbi' || path === '/zhipu' || path === '/loomy' || path === '/astudio') {
+      if (path === '/trae' || path === '/wb' || path === '/wbi' || path === '/qoder' || path === '/zhipu' || path === '/loomy' || path === '/astudio') {
         return Response.redirect(url.origin + '/', 302);
       }
 
@@ -4524,6 +5436,7 @@ const __worker = {
           cron: cron.text,
           nextRun: cron.next,
           cronSource: cron.source,
+          cronConfigured: cron.configured,
           crons: cron.crons,
         });
       }
@@ -4570,6 +5483,56 @@ const __worker = {
       if (path === '/api/accounts/refresh' && method === 'POST') return handleRefreshAccount(request, env);
       if (path === '/api/refresh-all' && method === 'POST') return jsonResponse(await refreshAll(env));
 
+      if (path === '/api/notify' && method === 'GET') {
+        return jsonResponse({ ok: true, config: notifyView(await readNotify(env)) });
+      }
+
+      if (path === '/api/notify' && method === 'POST') {
+        const body = await readBody(request);
+        const prev = await readNotify(env);
+        // 空值视为「不改」，方便只换其中一个字段
+        const keep = (v, old) => (typeof v === 'string' && v.trim() ? v.trim() : old || '');
+        const tg = body.telegram || {};
+        const qq = body.qq || {};
+        const next = {
+          telegram: {
+            token: keep(tg.token, prev.telegram?.token),
+            chatId: keep(tg.chatId, prev.telegram?.chatId),
+          },
+          qq: {
+            appId: keep(qq.appId, prev.qq?.appId),
+            appSecret: keep(qq.appSecret, prev.qq?.appSecret),
+            openid: keep(qq.openid, prev.qq?.openid),
+            sandbox: qq.sandbox != null ? !!qq.sandbox : !!prev.qq?.sandbox,
+          },
+        };
+        await writeNotify(env, next);
+        return jsonResponse({ ok: true, config: notifyView(next) });
+      }
+
+      if (path === '/api/notify/test' && method === 'POST') {
+        const cfg = await readNotify(env);
+        const summary = demoSummary();
+        const result = {};
+        if (cfg.telegram?.token && cfg.telegram?.chatId) {
+          try {
+            await sendTelegram(cfg.telegram, formatReport(summary));
+            result.telegram = 'ok';
+          } catch (e) {
+            result.telegram = e.message;
+          }
+        } else result.telegram = '未配置';
+        if (cfg.qq?.appId && cfg.qq?.appSecret && cfg.qq?.openid) {
+          try {
+            await sendQQ(cfg.qq, formatReport(summary));
+            result.qq = 'ok';
+          } catch (e) {
+            result.qq = e.message;
+          }
+        } else result.qq = '未配置';
+        return jsonResponse({ ok: true, result });
+      }
+
       return jsonResponse({ error: 'not found' }, 404);
     } catch (e) {
       return jsonResponse({ error: e.message || String(e) }, 500);
@@ -4602,95 +5565,158 @@ const PAGE = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#f6f7f5" media="(prefers-color-scheme:light)">
-<meta name="theme-color" content="#0c0e0f" media="(prefers-color-scheme:dark)">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='5' fill='%2314171a'/%3E%3Cpath d='M17 33.2 L27.4 43.4 L46.5 21.6' fill='none' stroke='%23f6f7f5' stroke-width='6.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
-<title>签到台 · 每日签到登记簿</title>
+<meta name="theme-color" content="#e9edec" media="(prefers-color-scheme:light)">
+<meta name="theme-color" content="#0a0e10" media="(prefers-color-scheme:dark)">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%230a0e10'/%3E%3Cpath d='M14 17 L31 32 L14 47' fill='none' stroke='%233fd699' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/%3E%3Crect x='33' y='41' width='18' height='7' fill='%233fd699'/%3E%3C/svg%3E">
+<title>签到值班台 · checkin-hub</title>
+<script>(function(){try{if(localStorage.getItem("checkin-theme")==="light")document.documentElement.setAttribute("data-theme","light");}catch(e){}}());</script>
 <style>
 /*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */
-@layer properties{@supports (((-webkit-hyphens:none)) and (not (margin-trim:inline))) or ((-moz-orient:inline) and (not (color:rgb(from red r g b)))){*,:before,:after,::backdrop{--tw-translate-x:0;--tw-translate-y:0;--tw-translate-z:0;--tw-space-y-reverse:0;--tw-border-style:solid;--tw-leading:initial;--tw-font-weight:initial;--tw-blur:initial;--tw-brightness:initial;--tw-contrast:initial;--tw-grayscale:initial;--tw-hue-rotate:initial;--tw-invert:initial;--tw-opacity:initial;--tw-saturate:initial;--tw-sepia:initial;--tw-drop-shadow:initial;--tw-drop-shadow-color:initial;--tw-drop-shadow-alpha:100%;--tw-drop-shadow-size:initial;--tw-duration:initial;--tw-tracking:initial}}}@layer theme{:root,:host{--font-sans:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";--font-mono:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;--spacing:.25rem;--font-weight-normal:400;--font-weight-medium:500;--font-weight-semibold:600;--font-weight-bold:700;--tracking-tight:-.025em;--leading-relaxed:1.625;--default-transition-duration:.15s;--default-transition-timing-function:cubic-bezier(.4, 0, .2, 1);--default-font-family:var(--font-sans);--default-mono-font-family:var(--font-mono);--font-display:ui-serif, Georgia, "Songti SC", "Noto Serif CJK SC", "SimSun", serif;--font-body:system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;--font-num:ui-monospace, "Cascadia Mono", "SF Mono", Consolas, "Liberation Mono", monospace;--radius-card:3px;--radius-pill:999px}}@layer base{*,:after,:before,::backdrop{box-sizing:border-box;border:0 solid;margin:0;padding:0}::file-selector-button{box-sizing:border-box;border:0 solid;margin:0;padding:0}html,:host{-webkit-text-size-adjust:100%;tab-size:4;line-height:1.5;font-family:var(--default-font-family,-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji");font-feature-settings:var(--default-font-feature-settings,normal);font-variation-settings:var(--default-font-variation-settings,normal);-webkit-tap-highlight-color:transparent}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,samp,pre{font-family:var(--default-mono-font-family,ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);font-feature-settings:var(--default-mono-font-feature-settings,normal);font-variation-settings:var(--default-mono-font-variation-settings,normal);font-size:1em}small{font-size:80%}sub,sup{vertical-align:baseline;font-size:75%;line-height:0;position:relative}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}:-moz-focusring:where(:not(iframe)){outline:auto}progress{vertical-align:baseline}summary{display:list-item}ol,ul,menu{list-style:none}img,svg,video,canvas,audio,iframe,embed,object{vertical-align:middle;display:block}img,video{max-width:100%;height:auto}button,input,select,optgroup,textarea{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}::file-selector-button{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}:where(select:is([multiple],[size])) optgroup{font-weight:bolder}:where(select:is([multiple],[size])) optgroup option{padding-inline-start:20px}::file-selector-button{margin-inline-end:4px}::placeholder{opacity:1}@supports (not ((-webkit-appearance:-apple-pay-button))) or (contain-intrinsic-size:1px){::placeholder{color:currentColor}@supports (color:color-mix(in lab, red, red)){::placeholder{color:color-mix(in oklab, currentcolor 50%, transparent)}}}textarea{resize:vertical}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-date-and-time-value{min-height:1lh;text-align:inherit}::-webkit-datetime-edit{display:inline-flex}::-webkit-datetime-edit-fields-wrapper{padding:0}::-webkit-datetime-edit{padding-block:0}::-webkit-datetime-edit-year-field{padding-block:0}::-webkit-datetime-edit-month-field{padding-block:0}::-webkit-datetime-edit-day-field{padding-block:0}::-webkit-datetime-edit-hour-field{padding-block:0}::-webkit-datetime-edit-minute-field{padding-block:0}::-webkit-datetime-edit-second-field{padding-block:0}::-webkit-datetime-edit-millisecond-field{padding-block:0}::-webkit-datetime-edit-meridiem-field{padding-block:0}::-webkit-calendar-picker-indicator{line-height:1}:-moz-ui-invalid{box-shadow:none}button,input:where([type=button],[type=reset],[type=submit]){appearance:button}::file-selector-button{appearance:button}::-webkit-inner-spin-button{height:auto}::-webkit-outer-spin-button{height:auto}[hidden]:where(:not([hidden=until-found])){display:none!important}html{background:var(--c-paper)}body{background-color:var(--c-paper);color:var(--c-ink);font-family:var(--font-body);-webkit-font-smoothing:antialiased;font-size:14px}::selection{background:var(--c-ink);color:var(--c-paper)}:focus-visible{outline:2px solid var(--c-focus);outline-offset:2px}input,button,select,textarea{font:inherit;color:inherit}code{white-space:nowrap;color:var(--c-ink);font-family:var(--font-num);background:var(--c-panel2);border:1px solid var(--c-rule);border-radius:2px;padding:0 3px;font-size:.92em}@media (prefers-reduced-motion:reduce){*{transition-duration:.001ms!important;animation-duration:.001ms!important}}}@layer components{.panel{display:none}.panel.active{display:block}.guide-panel{display:none}.guide-panel.active{display:block}.btn-ghost{height:calc(var(--spacing) * 8);align-items:center;gap:calc(var(--spacing) * 1.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 3);color:var(--c-ink2);border-radius:var(--radius-card);font-size:12.5px;transition:background-color .12s,border-color .12s,color .12s;display:inline-flex}.btn-ghost:hover:not(:disabled){border-color:var(--c-ink);color:var(--c-ink)}.btn-ghost:disabled{cursor:not-allowed;color:var(--c-ink4)}.btn-primary{height:calc(var(--spacing) * 8);align-items:center;gap:calc(var(--spacing) * 1.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-ink);background-color:var(--c-ink);padding-inline:calc(var(--spacing) * 3.5);color:var(--c-paper);border-radius:var(--radius-card);font-size:12.5px;font-weight:600;transition:opacity .12s,transform 60ms;display:inline-flex}.btn-primary:hover:not(:disabled){opacity:.85}.btn-primary:active:not(:disabled){transform:translateY(1px)}.btn-primary:disabled{border-color:var(--c-rule);background-color:var(--c-panel2);color:var(--c-ink4);font-weight:400}.btn-sm{height:calc(var(--spacing) * 7);padding-inline:calc(var(--spacing) * 2.5);font-size:12px}.btn-danger{border-color:var(--c-failed);color:var(--c-failed);background-color:#0000}.btn-danger:hover:not(:disabled){border-color:var(--c-failed);background-color:var(--c-failed);color:var(--c-paper)}.field{height:calc(var(--spacing) * 9);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);width:100%;padding-inline:calc(var(--spacing) * 2.5);color:var(--c-ink)}.field::placeholder{color:var(--c-ink4)}.field{border-radius:var(--radius-card);font-size:13px}.field:focus{border-color:var(--c-ink);--tw-outline-style:none;outline-style:none}textarea.field{height:auto;padding-block:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);line-height:var(--leading-relaxed);font-family:var(--font-num);font-size:12px}.lb{margin-bottom:var(--spacing);--tw-font-weight:var(--font-weight-medium);font-size:12px;font-weight:var(--font-weight-medium);color:var(--c-ink2);display:block}.lb .hint{margin-left:calc(var(--spacing) * 1.5);--tw-font-weight:var(--font-weight-normal);font-weight:var(--font-weight-normal);color:var(--c-ink4)}.fields{gap:calc(var(--spacing) * 2.5);display:grid}.field-row{gap:var(--spacing);display:grid}.hint{--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink3)}.tip{--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink2);background:var(--c-panel2);border-left:2px solid var(--c-rule2);border-radius:0 var(--radius-card) var(--radius-card) 0;padding:8px 10px}.tip b{--tw-font-weight:var(--font-weight-semibold);font-weight:var(--font-weight-semibold);color:var(--c-ink)}.err{color:var(--c-failed);min-height:0;font-size:12px}.err:empty{display:none}.num{font-family:var(--font-num);font-variant-numeric:tabular-nums}.badge{align-items:center;gap:var(--spacing);height:19px;padding-inline:calc(var(--spacing) * 1.5);--tw-leading:1;white-space:nowrap;border:1px solid;border-radius:2px;font-size:11px;line-height:1;display:inline-flex}.badge:before{content:"";background:currentColor;border-radius:1px;width:4px;height:4px}.badge.nodot:before{display:none}.badge.ok{color:var(--c-signed);background:var(--c-signed-weak)}.badge.idle{color:var(--c-ink3);background:0 0}.badge.warn{color:var(--c-pending);background:var(--c-pending-weak)}.badge.err{color:var(--c-failed);background:var(--c-failed-weak)}.badge.off{color:var(--c-off);background:var(--c-off-weak)}.badge.none{color:var(--c-ink4);background:0 0;border-style:dashed}.stamp{height:20px;padding-inline:calc(var(--spacing) * 2);--tw-leading:1;--tw-font-weight:var(--font-weight-bold);font-size:12px;line-height:1;font-weight:var(--font-weight-bold);white-space:nowrap;font-family:var(--font-display);color:var(--c-signed);background:var(--c-signed);border:1.4px solid;border-radius:2px;align-items:center;display:inline-flex;position:relative}@supports (color:color-mix(in lab, red, red)){.stamp{background:color-mix(in oklab,var(--c-signed) 8%,var(--c-panel))}}.stamp{letter-spacing:.12em;transform:rotate(-2.5deg)}.stamp:after{content:"";border:1px solid var(--c-signed);border-radius:4px;position:absolute;inset:-3px}@supports (color:color-mix(in lab, red, red)){.stamp:after{border:1px solid color-mix(in oklab,var(--c-signed) 42%,transparent)}}.card{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel);border-radius:var(--radius-card)}.sec-head{margin-bottom:calc(var(--spacing) * 2.5);justify-content:space-between;align-items:flex-end;gap:calc(var(--spacing) * 3);flex-wrap:wrap;display:flex}.sec-title{--tw-leading:1;color:var(--c-ink);font-family:ui-serif,Georgia,Songti SC,Noto Serif CJK SC,SimSun,serif;font-size:17px;line-height:1}.sec-title .auto-tip{margin-left:calc(var(--spacing) * 2);vertical-align:middle;--tw-font-weight:var(--font-weight-normal);font-family:system-ui,-apple-system,Segoe UI,PingFang SC,Microsoft YaHei,sans-serif;font-size:11px;font-weight:var(--font-weight-normal);color:var(--c-ink4)}.sec-acts{align-items:center;gap:calc(var(--spacing) * 1.5);flex-wrap:wrap;display:flex}.act-div{margin-inline:calc(var(--spacing) * .5);height:calc(var(--spacing) * 4);background-color:var(--c-rule);width:1px}.empty{padding-block:calc(var(--spacing) * 10);text-align:center;color:var(--c-ink3);font-size:13px}.at-wrap{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel);border-radius:var(--radius-card);overflow:hidden}.at{border-collapse:collapse;width:100%;font-size:13px}.at thead th{text-align:left;--tw-font-weight:var(--font-weight-medium);font-size:11px;font-weight:var(--font-weight-medium);white-space:nowrap;color:var(--c-ink3);border-bottom:1px solid var(--c-rule2);padding:0 10px 6px}.at thead th.num,.at thead th.act{text-align:right}.at tbody tr.ar{cursor:pointer;vertical-align:middle;border-bottom:1px solid var(--c-rule);border-left:2px solid var(--pc,transparent);transition:background-color .12s}.at tbody tr.ar:last-of-type{border-bottom:0}.at tbody tr.ar:hover{background:var(--c-panel2)}.at tbody tr.ar.open{background:var(--c-panel2);box-shadow:inset 3px 0 0 var(--c-ink)}.at tbody td{white-space:nowrap;text-overflow:ellipsis;padding:9px 10px;overflow:hidden}.at td.num,.at th.num{text-align:right}.at td.empty{text-align:center;white-space:normal}.at tbody tr.ar.st-off{border-left-color:var(--c-rule2);color:var(--c-ink4)}.at tbody tr.ar.st-off .avatar{opacity:.4}.at tbody tr.ar.st-off .plat-tag{color:var(--c-ink4)}.at tr.ar-detail{display:none}.at tr.ar-detail>td{background:var(--c-panel2);border-left:2px solid var(--pc,transparent);white-space:normal;padding:0 10px;overflow:visible}.at tr.ar-detail.show{display:table-row}.at tr.ar-detail.show>td{padding:10px 12px 14px 14px}.at .cell-acct{align-items:center;gap:calc(var(--spacing) * 2.5);white-space:nowrap;min-width:0;display:flex}.at .nm2{text-overflow:ellipsis;white-space:nowrap;--tw-font-weight:var(--font-weight-medium);min-width:0;font-weight:var(--font-weight-medium);color:var(--c-ink);flex:1;overflow:hidden}.at .col-act{justify-content:flex-end;align-items:center;gap:calc(var(--spacing) * 1.5);display:flex}.at .chev2{width:calc(var(--spacing) * 3);--tw-leading:1;color:var(--c-ink4);-webkit-user-select:none;user-select:none;font-size:15px;line-height:1}.at tr.ar.open .chev2{transform:rotate(90deg)}.at th:first-child{width:30%}.at th:nth-child(2){width:12%}.at th:nth-child(3){width:10%}.at th:nth-child(4){width:9%}.at th:nth-child(5),.at th:nth-child(6),.at th:nth-child(7){width:13%}.at .v-cred{--tw-font-weight:var(--font-weight-semibold);font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-size:13px;font-weight:var(--font-weight-semibold);color:var(--c-ink)}.at .v-up{--tw-font-weight:var(--font-weight-semibold);font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-weight:var(--font-weight-semibold);color:var(--c-signed)}.at .v-day{color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace}.at .v-date{color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .v-none{color:var(--c-ink4)}.at .v-warn{color:var(--c-pending);font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .v-bad{color:var(--c-failed);font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .btn-sign{height:calc(var(--spacing) * 7);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);padding-inline:calc(var(--spacing) * 2.5);color:var(--c-ink2);border-radius:var(--radius-card);background-color:#0000;align-items:center;font-size:12px;transition:background-color .12s,color .12s,border-color .12s;display:inline-flex}.at .btn-sign:hover:not(:disabled){border-color:var(--c-ink);background-color:var(--c-ink);color:var(--c-paper)}.at .btn-sign:disabled{cursor:not-allowed;border-color:var(--c-rule);color:var(--c-ink4)}.p-purple{--pc:var(--a-purple);--pbg:var(--a-purple)}@supports (color:color-mix(in lab, red, red)){.p-purple{--pbg:color-mix(in srgb, var(--a-purple) 11%, transparent)}}.p-purple{--pbd:var(--a-purple)}@supports (color:color-mix(in lab, red, red)){.p-purple{--pbd:color-mix(in srgb, var(--a-purple) 34%, transparent)}}.p-blue{--pc:var(--a-blue);--pbg:var(--a-blue)}@supports (color:color-mix(in lab, red, red)){.p-blue{--pbg:color-mix(in srgb, var(--a-blue) 11%, transparent)}}.p-blue{--pbd:var(--a-blue)}@supports (color:color-mix(in lab, red, red)){.p-blue{--pbd:color-mix(in srgb, var(--a-blue) 34%, transparent)}}.p-green{--pc:var(--a-green);--pbg:var(--a-green)}@supports (color:color-mix(in lab, red, red)){.p-green{--pbg:color-mix(in srgb, var(--a-green) 11%, transparent)}}.p-green{--pbd:var(--a-green)}@supports (color:color-mix(in lab, red, red)){.p-green{--pbd:color-mix(in srgb, var(--a-green) 34%, transparent)}}.p-amber{--pc:var(--a-amber);--pbg:var(--a-amber)}@supports (color:color-mix(in lab, red, red)){.p-amber{--pbg:color-mix(in srgb, var(--a-amber) 11%, transparent)}}.p-amber{--pbd:var(--a-amber)}@supports (color:color-mix(in lab, red, red)){.p-amber{--pbd:color-mix(in srgb, var(--a-amber) 34%, transparent)}}.p-cyan{--pc:var(--a-cyan);--pbg:var(--a-cyan)}@supports (color:color-mix(in lab, red, red)){.p-cyan{--pbg:color-mix(in srgb, var(--a-cyan) 11%, transparent)}}.p-cyan{--pbd:var(--a-cyan)}@supports (color:color-mix(in lab, red, red)){.p-cyan{--pbd:color-mix(in srgb, var(--a-cyan) 34%, transparent)}}.p-rose{--pc:var(--a-rose);--pbg:var(--a-rose)}@supports (color:color-mix(in lab, red, red)){.p-rose{--pbg:color-mix(in srgb, var(--a-rose) 11%, transparent)}}.p-rose{--pbd:var(--a-rose)}@supports (color:color-mix(in lab, red, red)){.p-rose{--pbd:color-mix(in srgb, var(--a-rose) 34%, transparent)}}.p-gray{--pc:var(--a-gray);--pbg:var(--a-gray)}@supports (color:color-mix(in lab, red, red)){.p-gray{--pbg:color-mix(in srgb, var(--a-gray) 11%, transparent)}}.p-gray{--pbd:var(--a-gray)}@supports (color:color-mix(in lab, red, red)){.p-gray{--pbd:color-mix(in srgb, var(--a-gray) 34%, transparent)}}.st-off{--pc:var(--c-rule2)}.plat-tag{height:18px;padding-inline:calc(var(--spacing) * 1.5);white-space:nowrap;color:var(--pc,var(--c-ink2));border:1px solid var(--pbd,var(--c-rule));background:var(--pbg,transparent);border-radius:2px;align-items:center;font-size:11px;display:inline-flex}.avatar{-webkit-user-select:none;user-select:none;border:1px solid var(--pbd,var(--c-rule2));background:var(--pbg,var(--c-panel2));width:27px;height:27px;color:var(--pc,var(--c-ink2));font-family:var(--font-display);border-radius:2px;flex-shrink:0;place-items:center;font-size:13px;line-height:1;display:inline-grid;position:relative}.avatar .dot{background:var(--pc,var(--c-rule2));width:7px;height:7px;box-shadow:0 0 0 2px var(--c-panel);border-radius:3.40282e38px;position:absolute;bottom:-3px;right:-3px}.switch{cursor:pointer;flex-shrink:0;align-items:center;display:inline-flex}.switch input{clip-path:inset(50%);white-space:nowrap;border-width:0;width:1px;height:1px;margin:-1px;padding:0;position:absolute;overflow:hidden}.switch .track{width:30px;height:16px;transition-property:color,background-color,border-color,outline-color,text-decoration-color,fill,stroke,--tw-gradient-from,--tw-gradient-via,--tw-gradient-to;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration));background:var(--c-rule2);border-radius:var(--radius-pill);transition-duration:.15s;display:inline-block;position:relative}.switch .track:after{content:"";background:var(--c-panel);border-radius:50%;width:12px;height:12px;transition:transform .15s;position:absolute;top:2px;left:2px;box-shadow:0 1px 2px #00000040}.switch input:checked+.track{background:var(--c-ink)}.switch input:checked+.track:after{transform:translate(14px)}.switch input:disabled+.track{opacity:.4}.sec-mini{margin-bottom:calc(var(--spacing) * 1.5);color:var(--c-ink3);font-size:11px}.acct-sec{margin-top:calc(var(--spacing) * 2.5);padding-top:calc(var(--spacing) * 2.5);border-top:1px dashed var(--c-rule2)}.qa{margin-bottom:calc(var(--spacing) * 2);align-items:center;gap:calc(var(--spacing) * 1.5);flex-wrap:wrap;display:flex}.qbtn{height:calc(var(--spacing) * 7);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 2.5);color:var(--c-ink2);border-radius:var(--radius-card);align-items:center;font-size:12px;transition:border-color .12s,color .12s,background-color .12s;display:inline-flex}.qbtn:hover:not(:disabled){border-color:var(--c-ink);color:var(--c-ink)}.qbtn:disabled{cursor:not-allowed;color:var(--c-ink4)}.qbtn.danger{color:var(--c-failed);border-color:var(--c-failed)}@supports (color:color-mix(in lab, red, red)){.qbtn.danger{border-color:color-mix(in srgb, var(--c-failed) 40%, transparent)}}.qbtn.danger:hover:not(:disabled){background-color:var(--c-failed);color:var(--c-paper)}.qa-tip{text-align:right;color:var(--c-ink4);margin-left:auto;font-size:11px}.acct-hint{margin-bottom:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.task-list{max-height:210px}:where(.task-list>:not(:last-child)){--tw-space-y-reverse:0;margin-block-start:calc(var(--spacing) * var(--tw-space-y-reverse));margin-block-end:calc(var(--spacing) * calc(1 - var(--tw-space-y-reverse)))}.task-list{overflow:auto}.task{align-items:baseline;gap:calc(var(--spacing) * 2);color:var(--c-ink2);font-size:12px;font-family:var(--font-num);display:flex}.task .t-state{width:calc(var(--spacing) * 3);text-align:center;--tw-font-weight:var(--font-weight-semibold);font-weight:var(--font-weight-semibold);flex-shrink:0;display:inline-block}.task.ok .t-state{color:var(--c-signed)}.task.bad .t-state{color:var(--c-failed)}.task.warn .t-state{color:var(--c-pending)}.task.mut .t-state{color:var(--c-ink4)}.task b{--tw-font-weight:var(--font-weight-medium);font-weight:var(--font-weight-medium);color:var(--c-ink);flex-shrink:0}.task span{text-overflow:ellipsis;white-space:nowrap;color:var(--c-ink3);overflow:hidden}.run-empty{color:var(--c-ink4);font-size:12px}.inline-edit{height:calc(var(--spacing) * 7);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-ink);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 1.5);color:var(--c-ink);border-radius:2px;width:min(220px,60%);font-size:13px}.at.no-click tbody tr.ar{cursor:default}.at .t-ts{color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-size:12px}.at .t-name{text-overflow:ellipsis;white-space:nowrap;--tw-font-weight:var(--font-weight-medium);max-width:150px;font-weight:var(--font-weight-medium);color:var(--c-ink);overflow:hidden}.at .t-msg{text-overflow:ellipsis;white-space:nowrap;max-width:300px;color:var(--c-ink3);font-size:12px;overflow:hidden}.at .credit-cell{--tw-font-weight:var(--font-weight-semibold);font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-weight:var(--font-weight-semibold);color:var(--c-signed)}.at .credit-cell.none{--tw-font-weight:var(--font-weight-normal);font-weight:var(--font-weight-normal);color:var(--c-ink4)}.modal-mask{z-index:100;padding:calc(var(--spacing) * 4);justify-content:center;align-items:flex-start;display:none;position:fixed;inset:0}@media (min-width:40rem){.modal-mask{padding:calc(var(--spacing) * 8)}}.modal-mask{background:var(--c-ink)}@supports (color:color-mix(in lab, red, red)){.modal-mask{background:color-mix(in srgb, var(--c-ink) 42%, transparent)}}.modal-mask{overflow:auto}.modal-mask.show{display:flex}.modal{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);border-radius:var(--radius-card);width:100%;max-width:560px;box-shadow:var(--shadow-pop);margin-block:auto}.modal.xl{max-width:760px}.modal-head{padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3);border-bottom:1px solid var(--c-rule);justify-content:space-between;align-items:center;display:flex}.modal-head h3{font-family:ui-serif,Georgia,Songti SC,Noto Serif CJK SC,SimSun,serif;font-size:16px}.modal-x{height:calc(var(--spacing) * 7);width:calc(var(--spacing) * 7);color:var(--c-ink3);place-items:center;display:grid}@media (hover:hover){.modal-x:hover{color:var(--c-ink)}}.modal-x{cursor:pointer;background:0 0;border:0}.modal-body{max-height:70vh;padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3.5);overflow:auto}.modal-foot{justify-content:flex-end;align-items:center;gap:calc(var(--spacing) * 2);padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3);border-top:1px solid var(--c-rule);display:flex}.step{margin-bottom:calc(var(--spacing) * 4);gap:calc(var(--spacing) * 3);display:flex}.step:last-child{margin-bottom:0}.step-n{width:22px;height:22px;font-size:11px;font-family:var(--font-num);color:var(--c-ink2);border:1px solid var(--c-rule2);border-radius:50%;flex-shrink:0;place-items:center;display:grid}.step-b{flex:1;min-width:0}.step-t{margin-bottom:var(--spacing);--tw-font-weight:var(--font-weight-semibold);font-size:13.5px;font-weight:var(--font-weight-semibold);color:var(--c-ink)}.step-b p{margin-bottom:calc(var(--spacing) * 1.5);--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.step-b p:last-child{margin-bottom:0}.plat-card{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 2.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);min-width:0;padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2.5);border-radius:var(--radius-card);transition:border-color .12s,background-color .12s;display:flex}.plat-card:hover{border-color:var(--c-ink4)}.plat-card.on{border-color:var(--c-ink);background:var(--c-panel2);box-shadow:inset 2px 0 0 var(--pc,var(--c-ink))}.plat-card.off{cursor:not-allowed;opacity:.5}.plat-card .ic{width:26px;height:26px;color:var(--pc,var(--c-ink2));background:var(--pbg,transparent);border:1px solid var(--pbd,var(--c-rule));font-family:var(--font-display);border-radius:2px;flex-shrink:0;place-items:center;font-size:13px;line-height:1;display:grid}.plat-card .tt{text-overflow:ellipsis;white-space:nowrap;--tw-font-weight:var(--font-weight-semibold);font-size:13px;font-weight:var(--font-weight-semibold);color:var(--c-ink);overflow:hidden}.plat-card .dd{text-overflow:ellipsis;white-space:nowrap;color:var(--c-ink3);font-size:11px;overflow:hidden}.rs-card{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel2);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 3);border-radius:var(--radius-card)}.rs-h{margin-bottom:var(--spacing);--tw-font-weight:var(--font-weight-semibold);font-size:13px;font-weight:var(--font-weight-semibold);color:var(--c-ink)}.auth-status{margin-top:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.auth-status a{color:var(--c-ink);text-decoration-line:underline}.divider{margin-block:calc(var(--spacing) * 3.5);align-items:center;gap:calc(var(--spacing) * 2.5);color:var(--c-ink4);font-size:11.5px;display:flex}.divider:before,.divider:after{content:"";background-color:var(--c-rule);flex:1;height:1px}.tabs{border-bottom:1px solid var(--c-rule);align-items:center;gap:0;display:flex}.tab{height:calc(var(--spacing) * 9);cursor:pointer;border-style:var(--tw-border-style);padding-inline:calc(var(--spacing) * 3);white-space:nowrap;color:var(--c-ink3);background-color:#0000;border-width:0;font-size:13px;transition:color .12s;position:relative}.tab:hover{color:var(--c-ink)}.tab.on{--tw-font-weight:var(--font-weight-semibold);font-weight:var(--font-weight-semibold);color:var(--c-ink)}.tab.on:after{content:"";background:var(--c-ink);height:2px;position:absolute;bottom:-1px;left:8px;right:8px}.tab .cnt{margin-left:var(--spacing);padding-inline:var(--spacing);vertical-align:middle;font-size:11px;font-family:var(--font-num);background:var(--c-panel2);color:var(--c-ink3);border-radius:2px;display:inline-block}.tab.on .cnt{background:var(--c-ink);color:var(--c-paper)}.toast-item{pointer-events:auto;background-color:var(--c-ink);padding-inline:calc(var(--spacing) * 3.5);padding-block:calc(var(--spacing) * 2);color:var(--c-paper);border-radius:var(--radius-card);box-shadow:var(--shadow-pop);opacity:0;font-size:12.5px;transition:opacity .16s,transform .16s;transform:translateY(6px)}.toast-item.show{opacity:1;transform:none}.toast-item.err{background:var(--c-failed);color:#fff}.toast-item.ok{background:var(--c-signed);color:#fff}.toast-item.warn{background:var(--c-pending);color:#fff}}@layer utilities{.pointer-events-none{pointer-events:none}.fixed{position:fixed}.bottom-6{bottom:calc(var(--spacing) * 6)}.left-1{left:var(--spacing)}.left-1\\/2{left:50%}.z-\\[200\\]{z-index:200}.mx-auto{margin-inline:auto}.mt-1{margin-top:var(--spacing)}.mt-1\\.5{margin-top:calc(var(--spacing) * 1.5)}.mt-2{margin-top:calc(var(--spacing) * 2)}.mt-2\\.5{margin-top:calc(var(--spacing) * 2.5)}.mt-3{margin-top:calc(var(--spacing) * 3)}.mt-4{margin-top:calc(var(--spacing) * 4)}.mt-5{margin-top:calc(var(--spacing) * 5)}.mb-1{margin-bottom:var(--spacing)}.mb-2{margin-bottom:calc(var(--spacing) * 2)}.mb-2\\.5{margin-bottom:calc(var(--spacing) * 2.5)}.mb-3{margin-bottom:calc(var(--spacing) * 3)}.mb-4{margin-bottom:calc(var(--spacing) * 4)}.mb-6{margin-bottom:calc(var(--spacing) * 6)}.block{display:block}.flex{display:flex}.grid{display:grid}.hidden{display:none}.h-9{height:calc(var(--spacing) * 9)}.h-\\[2px\\]{height:2px}.h-full{height:100%}.min-h-dvh{min-height:100dvh}.w-9{width:calc(var(--spacing) * 9)}.w-full{width:100%}.w-max{width:max-content}.max-w-\\[80vw\\]{max-width:80vw}.max-w-\\[380px\\]{max-width:380px}.max-w-\\[1060px\\]{max-width:1060px}.shrink-0{flex-shrink:0}.-translate-x-1\\/2{--tw-translate-x:calc(calc(1 / 2 * 100%) * -1);translate:var(--tw-translate-x) var(--tw-translate-y)}.list-disc{list-style-type:disc}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.place-items-center{place-items:center}.items-baseline{align-items:baseline}.items-center{align-items:center}.items-end{align-items:flex-end}.items-start{align-items:flex-start}.justify-between{justify-content:space-between}.gap-1\\.5{gap:calc(var(--spacing) * 1.5)}.gap-2{gap:calc(var(--spacing) * 2)}.gap-3{gap:calc(var(--spacing) * 3)}.gap-4{gap:calc(var(--spacing) * 4)}.gap-5{gap:calc(var(--spacing) * 5)}.gap-6{gap:calc(var(--spacing) * 6)}.gap-8{gap:calc(var(--spacing) * 8)}:where(.space-y-1>:not(:last-child)){--tw-space-y-reverse:0;margin-block-start:calc(var(--spacing) * var(--tw-space-y-reverse));margin-block-end:calc(var(--spacing) * calc(1 - var(--tw-space-y-reverse)))}:where(.space-y-1\\.5>:not(:last-child)){--tw-space-y-reverse:0;margin-block-start:calc(calc(var(--spacing) * 1.5) * var(--tw-space-y-reverse));margin-block-end:calc(calc(var(--spacing) * 1.5) * calc(1 - var(--tw-space-y-reverse)))}:where(.space-y-3>:not(:last-child)){--tw-space-y-reverse:0;margin-block-start:calc(calc(var(--spacing) * 3) * var(--tw-space-y-reverse));margin-block-end:calc(calc(var(--spacing) * 3) * calc(1 - var(--tw-space-y-reverse)))}.overflow-x-auto{overflow-x:auto}.border-b{border-bottom-style:var(--tw-border-style);border-bottom-width:1px}.border-rule{border-color:var(--c-rule)}.bg-rule{background-color:var(--c-rule)}.bg-signed{background-color:var(--c-signed)}.p-4{padding:calc(var(--spacing) * 4)}.px-4{padding-inline:calc(var(--spacing) * 4)}.px-5{padding-inline:calc(var(--spacing) * 5)}.py-3{padding-block:calc(var(--spacing) * 3)}.py-10{padding-block:calc(var(--spacing) * 10)}.pt-6{padding-top:calc(var(--spacing) * 6)}.pb-1{padding-bottom:var(--spacing)}.pb-3\\.5{padding-bottom:calc(var(--spacing) * 3.5)}.pb-16{padding-bottom:calc(var(--spacing) * 16)}.pl-4{padding-left:calc(var(--spacing) * 4)}.font-display{font-family:ui-serif,Georgia,Songti SC,Noto Serif CJK SC,SimSun,serif}.text-\\[11px\\]{font-size:11px}.text-\\[12\\.5px\\]{font-size:12.5px}.text-\\[13px\\]{font-size:13px}.text-\\[15px\\]{font-size:15px}.text-\\[22px\\]{font-size:22px}.text-\\[24px\\]{font-size:24px}.leading-none{--tw-leading:1;line-height:1}.leading-relaxed{--tw-leading:var(--leading-relaxed);line-height:var(--leading-relaxed)}.font-semibold{--tw-font-weight:var(--font-weight-semibold);font-weight:var(--font-weight-semibold)}.whitespace-nowrap{white-space:nowrap}.text-ink{color:var(--c-ink)}.text-ink2{color:var(--c-ink2)}.text-ink3{color:var(--c-ink3)}.text-ink4{color:var(--c-ink4)}.blur{--tw-blur:blur(8px);filter:var(--tw-blur,) var(--tw-brightness,) var(--tw-contrast,) var(--tw-grayscale,) var(--tw-hue-rotate,) var(--tw-invert,) var(--tw-saturate,) var(--tw-sepia,) var(--tw-drop-shadow,)}.transition-\\[width\\]{transition-property:width;transition-timing-function:var(--tw-ease,var(--default-transition-timing-function));transition-duration:var(--tw-duration,var(--default-transition-duration))}.duration-300{--tw-duration:.3s;transition-duration:.3s}.select-none{-webkit-user-select:none;user-select:none}@media (min-width:40rem){.sm\\:col-span-2{grid-column:span 2/span 2}.sm\\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.sm\\:gap-8{gap:calc(var(--spacing) * 8)}.sm\\:px-7{padding-inline:calc(var(--spacing) * 7)}}}:root{--c-paper:#f6f7f5;--c-panel:#fff;--c-panel2:#eff1ee;--c-rule:#dfe3de;--c-rule2:#c8cec7;--c-ink:#14171a;--c-ink2:#4b5155;--c-ink3:#848b8f;--c-ink4:#a9aeb1;--c-signed:#1f7a4d;--c-signed-weak:#e8f2ec;--c-pending:#8a6116;--c-pending-weak:#f6efdf;--c-failed:#a6332b;--c-failed-weak:#f7e9e7;--c-off:#6e7570;--c-off-weak:#eceeea;--c-focus:#2f6f57;--a-purple:#5d5a8f;--a-blue:#31618c;--a-green:#2f7a58;--a-amber:#96703a;--a-cyan:#3f8088;--a-rose:#93505c;--a-gray:#6b7169;--shadow-pop:0 18px 44px -18px #14171a4d;color-scheme:light}@media (prefers-color-scheme:dark){:root{--c-paper:#0c0e0f;--c-panel:#141718;--c-panel2:#191d1e;--c-rule:#272c2d;--c-rule2:#3a4042;--c-ink:#eef0ee;--c-ink2:#b9bfbd;--c-ink3:#828a88;--c-ink4:#656d6b;--c-signed:#4ec98a;--c-signed-weak:#12241b;--c-pending:#e0b25f;--c-pending-weak:#241d10;--c-failed:#f08b80;--c-failed-weak:#2a1513;--c-off:#8d9490;--c-off-weak:#1b1f1e;--c-focus:#7fc7a8;--a-purple:#a3a0dc;--a-blue:#8ab6df;--a-green:#6fd0a4;--a-amber:#e0b26a;--a-cyan:#86cdd6;--a-rose:#e79aa8;--a-gray:#a8afaa;--shadow-pop:0 18px 44px -18px #000000bf;color-scheme:dark}}.today-rule{border-bottom:2px solid var(--c-ink)}.today-date{--tw-leading:.92;--tw-tracking:var(--tracking-tight);letter-spacing:var(--tracking-tight);font-family:ui-serif,Georgia,Songti SC,Noto Serif CJK SC,SimSun,serif;font-size:clamp(30px,6vw,46px);line-height:.92}.today-frac{font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-size:clamp(26px,4.6vw,38px);line-height:1}.kpi-label{margin-bottom:var(--spacing);color:var(--c-ink3);font-size:11px}.kpi-value{--tw-leading:1;font-family:ui-monospace,Cascadia Mono,SF Mono,Consolas,Liberation Mono,monospace;font-size:19px;line-height:1}.punch{flex-wrap:wrap;align-items:center;gap:5px;display:flex}.punch i{background:var(--x,var(--c-panel2));border-radius:3.40282e38px;width:13px;height:13px;display:inline-block}@supports (color:color-mix(in lab, red, red)){.punch i{background:color-mix(in oklab,var(--x,var(--c-panel2)) 45%,var(--c-panel))}}.punch i{border:1px solid var(--x,var(--c-rule2))}.punch i.done{--x:var(--c-signed)}.punch i.part{--x:var(--c-pending)}.punch i.bad{--x:var(--c-failed)}.punch i.offd{--x:var(--c-rule2);opacity:.55}@media (max-width:860px){.at-wrap{background:0 0;border:0}.at,.at tbody{min-width:0;display:block}.at colgroup,.at thead{display:none}.at tbody tr.ar{margin-bottom:calc(var(--spacing) * 2);column-gap:calc(var(--spacing) * 2.5);row-gap:calc(var(--spacing) * 1.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 3);border-left:2px solid var(--pc,var(--c-rule));border-radius:var(--radius-card);grid-template-columns:minmax(0,1fr) auto auto;display:grid}.at tbody tr.ar.open{box-shadow:inset 3px 0 0 var(--c-ink)}.at tbody td{align-items:center;gap:calc(var(--spacing) * 1.5);border-style:var(--tw-border-style);white-space:nowrap;min-width:0;color:var(--c-ink3);border-width:0;padding:0;font-size:12.5px;display:flex;overflow:visible}.at td:first-child{flex-wrap:wrap;grid-area:1/1/2/3;row-gap:4px;font-size:13.5px}.at td:first-child .nm2{flex:1 0 auto;min-width:0;max-width:100%}.at td:nth-child(7){grid-area:1/3/2/4;justify-self:end}.at td:nth-child(6){grid-area:2/1/3/4}.at td:nth-child(2){grid-area:3/1/4/2}.at td:nth-child(3){grid-area:3/2/4/3}.at td:nth-child(4){grid-area:3/3/4/4;justify-self:end}.at td:nth-child(5){grid-area:4/1/5/4}.at td.num{justify-self:flex-start}.at td:nth-child(2):before{content:"积分";color:var(--c-ink4);font-size:11px}.at td:nth-child(3):before{content:"今日";color:var(--c-ink4);font-size:11px}.at td:nth-child(4):before{content:"连续";color:var(--c-ink4);font-size:11px}.at td:nth-child(5):before{content:"凭证";color:var(--c-ink4);font-size:11px}.at tr.ar-detail{display:none}.at tr.ar-detail.show{margin-top:-8px;margin-bottom:calc(var(--spacing) * 3);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel);border-top:1px dashed var(--c-rule2);border-radius:0 0 var(--radius-card) var(--radius-card);display:block}.at tr.ar-detail>td{width:auto;padding:calc(var(--spacing) * 3);white-space:normal;border-left:0;display:block}.qa .qa-tip{text-align:left;width:100%;margin-left:0}.at .t-msg{max-width:44vw}}@property --tw-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-y{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-z{syntax:"*";inherits:false;initial-value:0}@property --tw-space-y-reverse{syntax:"*";inherits:false;initial-value:0}@property --tw-border-style{syntax:"*";inherits:false;initial-value:solid}@property --tw-leading{syntax:"*";inherits:false}@property --tw-font-weight{syntax:"*";inherits:false}@property --tw-blur{syntax:"*";inherits:false}@property --tw-brightness{syntax:"*";inherits:false}@property --tw-contrast{syntax:"*";inherits:false}@property --tw-grayscale{syntax:"*";inherits:false}@property --tw-hue-rotate{syntax:"*";inherits:false}@property --tw-invert{syntax:"*";inherits:false}@property --tw-opacity{syntax:"*";inherits:false}@property --tw-saturate{syntax:"*";inherits:false}@property --tw-sepia{syntax:"*";inherits:false}@property --tw-drop-shadow{syntax:"*";inherits:false}@property --tw-drop-shadow-color{syntax:"*";inherits:false}@property --tw-drop-shadow-alpha{syntax:"<percentage>";inherits:false;initial-value:100%}@property --tw-drop-shadow-size{syntax:"*";inherits:false}@property --tw-duration{syntax:"*";inherits:false}@property --tw-tracking{syntax:"*";inherits:false}
+@layer properties{@supports (((-webkit-hyphens:none)) and (not (margin-trim:inline))) or ((-moz-orient:inline) and (not (color:rgb(from red r g b)))){*,:before,:after,::backdrop{--tw-translate-x:0;--tw-translate-y:0;--tw-translate-z:0;--tw-border-style:solid;--tw-blur:initial;--tw-brightness:initial;--tw-contrast:initial;--tw-grayscale:initial;--tw-hue-rotate:initial;--tw-invert:initial;--tw-opacity:initial;--tw-saturate:initial;--tw-sepia:initial;--tw-drop-shadow:initial;--tw-drop-shadow-color:initial;--tw-drop-shadow-alpha:100%;--tw-drop-shadow-size:initial;--tw-font-weight:initial;--tw-tracking:initial;--tw-leading:initial;--tw-space-y-reverse:0}}}@layer theme{:root,:host{--font-sans:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";--font-mono:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;--spacing:.25rem;--font-weight-normal:400;--font-weight-medium:500;--font-weight-semibold:600;--tracking-tight:-.025em;--leading-tight:1.25;--leading-relaxed:1.625;--default-transition-duration:.15s;--default-transition-timing-function:cubic-bezier(.4, 0, .2, 1);--default-font-family:var(--font-sans);--default-mono-font-family:var(--font-mono);--font-display:ui-monospace, "Cascadia Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace;--font-body:ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", "PingFang SC", "Microsoft YaHei", monospace;--font-num:ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace}}@layer base{*,:after,:before,::backdrop{box-sizing:border-box;border:0 solid;margin:0;padding:0}::file-selector-button{box-sizing:border-box;border:0 solid;margin:0;padding:0}html,:host{-webkit-text-size-adjust:100%;tab-size:4;line-height:1.5;font-family:var(--default-font-family,-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji");font-feature-settings:var(--default-font-feature-settings,normal);font-variation-settings:var(--default-font-variation-settings,normal);-webkit-tap-highlight-color:transparent}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,samp,pre{font-family:var(--default-mono-font-family,ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);font-feature-settings:var(--default-mono-font-feature-settings,normal);font-variation-settings:var(--default-mono-font-variation-settings,normal);font-size:1em}small{font-size:80%}sub,sup{vertical-align:baseline;font-size:75%;line-height:0;position:relative}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}:-moz-focusring:where(:not(iframe)){outline:auto}progress{vertical-align:baseline}summary{display:list-item}ol,ul,menu{list-style:none}img,svg,video,canvas,audio,iframe,embed,object{vertical-align:middle;display:block}img,video{max-width:100%;height:auto}button,input,select,optgroup,textarea{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}::file-selector-button{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}:where(select:is([multiple],[size])) optgroup{font-weight:bolder}:where(select:is([multiple],[size])) optgroup option{padding-inline-start:20px}::file-selector-button{margin-inline-end:4px}::placeholder{opacity:1}@supports (not ((-webkit-appearance:-apple-pay-button))) or (contain-intrinsic-size:1px){::placeholder{color:currentColor}@supports (color:color-mix(in lab, red, red)){::placeholder{color:color-mix(in oklab, currentcolor 50%, transparent)}}}textarea{resize:vertical}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-date-and-time-value{min-height:1lh;text-align:inherit}::-webkit-datetime-edit{display:inline-flex}::-webkit-datetime-edit-fields-wrapper{padding:0}::-webkit-datetime-edit{padding-block:0}::-webkit-datetime-edit-year-field{padding-block:0}::-webkit-datetime-edit-month-field{padding-block:0}::-webkit-datetime-edit-day-field{padding-block:0}::-webkit-datetime-edit-hour-field{padding-block:0}::-webkit-datetime-edit-minute-field{padding-block:0}::-webkit-datetime-edit-second-field{padding-block:0}::-webkit-datetime-edit-millisecond-field{padding-block:0}::-webkit-datetime-edit-meridiem-field{padding-block:0}::-webkit-calendar-picker-indicator{line-height:1}:-moz-ui-invalid{box-shadow:none}button,input:where([type=button],[type=reset],[type=submit]){appearance:button}::file-selector-button{appearance:button}::-webkit-inner-spin-button{height:auto}::-webkit-outer-spin-button{height:auto}[hidden]:where(:not([hidden=until-found])){display:none!important}html{background:var(--c-bg)}body{background-color:var(--c-bg);color:var(--c-ink);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,PingFang SC,Microsoft YaHei,monospace;font-size:13px;line-height:1.55}::selection{background:var(--c-signed);color:var(--c-bg)}:focus-visible{outline:2px solid var(--c-focus);outline-offset:1px}input,button,select,textarea{font:inherit;color:inherit}h1,h2,h3{--tw-font-weight:var(--font-weight-normal);font-weight:var(--font-weight-normal)}code{white-space:nowrap;color:var(--c-ink);background:var(--c-panel2);border:1px solid var(--c-rule);padding:0 4px;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:.95em}@media (prefers-reduced-motion:reduce){*{transition-duration:.001ms!important;animation-duration:.001ms!important}}}@layer components{.panel{display:none}.panel.active{display:block}.guide-panel{display:none}.guide-panel.active{display:block}.shell{width:100%;padding-inline:calc(var(--spacing) * 3);padding-bottom:calc(var(--spacing) * 16);margin-inline:auto}@media (min-width:40rem){.shell{padding-inline:calc(var(--spacing) * 5)}}.shell{max-width:1180px}.topbar{align-items:center;gap:calc(var(--spacing) * 3);border-bottom:1px solid var(--c-rule2);flex-wrap:wrap;padding:11px 0 10px;display:flex}.brand{align-items:center;gap:calc(var(--spacing) * 2);--tw-tracking:var(--tracking-tight);letter-spacing:var(--tracking-tight);font-size:15px;display:inline-flex}.brand .caret{background:var(--c-signed);flex-shrink:0;width:8px;height:15px;display:inline-block}.scope{color:var(--c-ink3);font-size:12px}.topbar-right{align-items:center;gap:calc(var(--spacing) * 1.5);flex-wrap:wrap;margin-left:auto;display:flex}.statusline{margin-top:calc(var(--spacing) * 2.5);background:var(--c-panel);border:1px solid var(--c-rule);border-left:3px solid var(--c-signed);flex-wrap:wrap;display:flex}.sl-cell{min-width:116px;padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2.5);border-right:1px solid var(--c-rule);flex-grow:1}.sl-cell:last-child{border-right:0}.sl-label{color:var(--c-ink3);letter-spacing:.09em;font-size:10.5px;display:block}.sl-value{--tw-leading:var(--leading-tight);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:18px;line-height:var(--leading-tight);display:block}.sl-sub{color:var(--c-ink4);font-size:11px;display:block}.sl-bar{margin-top:calc(var(--spacing) * 1.5);background:var(--c-rule);height:3px;display:block}.sl-bar i{background:var(--c-signed);width:0;height:100%;transition:width .25s linear;display:block}.today-date{--tw-leading:var(--leading-tight);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:18px;line-height:var(--leading-tight);display:block}.today-frac{color:var(--c-ink4);font-size:13px}.today-rule{display:none}.kpi-label{margin-bottom:var(--spacing);color:var(--c-ink3);letter-spacing:.09em;font-size:10.5px;display:block}.kpi-value{--tw-leading:1;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:18px;line-height:1;display:block}.punch{flex-wrap:wrap;align-items:flex-end;gap:3px;display:flex}.punch i{background:var(--c-rule2);width:6px;height:14px;display:inline-block}.punch i.done{background:var(--c-signed)}.punch i.part{background:var(--c-pending)}.punch i.bad{background:var(--c-failed)}.punch i.offd{background:var(--c-off);opacity:.5}.tabs{margin-top:calc(var(--spacing) * 4);border-bottom:1px solid var(--c-rule);align-items:center;gap:0;display:flex;overflow-x:auto}.tab{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 1.5);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2);white-space:nowrap;color:var(--c-ink3);background:0 0;border:0;border-bottom:2px solid #0000;font-size:12.5px;display:inline-flex;position:relative}.tab .key{color:var(--c-ink4);font-size:11px}.tab:hover{color:var(--c-ink)}.tab.on{color:var(--c-ink);border-bottom-color:var(--c-signed)}.tab.on .key{color:var(--c-signed)}.tab .cnt{min-width:20px;padding-inline:var(--spacing);text-align:center;background:var(--c-panel2);border:1px solid var(--c-rule);color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11px;display:inline-block}.tab.on .cnt{border-color:var(--c-rule2);color:var(--c-ink)}.btn-ghost{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 1.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 2.5);padding-block:calc(var(--spacing) * 1.5);white-space:nowrap;color:var(--c-ink2);font-size:12px;transition:background-color .12s,border-color .12s,color .12s;display:inline-flex}.btn-ghost:hover:not(:disabled){border-color:var(--c-ink2);background-color:var(--c-ink2);color:var(--c-bg)}.btn-ghost:disabled{cursor:not-allowed;border-color:var(--c-rule);color:var(--c-ink4)}.btn-primary{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 1.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-ink);background-color:var(--c-ink);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 1.5);white-space:nowrap;color:var(--c-bg);font-size:12px;transition:background-color .12s,border-color .12s,color .12s;display:inline-flex}.btn-primary:hover:not(:disabled){border-color:var(--c-signed);background-color:var(--c-signed)}.btn-primary:disabled{cursor:not-allowed;border-color:var(--c-rule);background-color:var(--c-panel2);color:var(--c-ink4)}.btn-sm{padding-inline:calc(var(--spacing) * 2);padding-block:var(--spacing);font-size:11.5px}.btn-danger{border-color:var(--c-failed);color:var(--c-failed);background-color:#0000}.btn-danger:hover:not(:disabled){border-color:var(--c-failed);background-color:var(--c-failed);color:var(--c-bg)}.badge{align-items:center;gap:calc(var(--spacing) * 1.5);height:20px;padding-inline:calc(var(--spacing) * 1.5);--tw-leading:1;white-space:nowrap;border:1px solid var(--c-rule2);color:var(--c-ink2);background:var(--c-panel);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11.5px;line-height:1;display:inline-flex}.badge:before{content:"";background:var(--c-ink4);width:7px;height:7px;display:inline-block}.badge.nodot:before{display:none}.badge.ok{color:var(--c-signed);background:var(--c-signed-weak);border-color:var(--c-signed)}@supports (color:color-mix(in lab, red, red)){.badge.ok{border-color:color-mix(in oklab,var(--c-signed) 50%,transparent)}}.badge.ok:before{background:var(--c-signed)}.badge.warn{color:var(--c-pending);background:var(--c-pending-weak);border-color:var(--c-pending)}@supports (color:color-mix(in lab, red, red)){.badge.warn{border-color:color-mix(in oklab,var(--c-pending) 50%,transparent)}}.badge.warn:before{background:var(--c-pending)}.badge.err{color:var(--c-failed);background:var(--c-failed-weak);border-color:var(--c-failed)}@supports (color:color-mix(in lab, red, red)){.badge.err{border-color:color-mix(in oklab,var(--c-failed) 50%,transparent)}}.badge.err:before{background:var(--c-failed)}.badge.off{color:var(--c-ink3);background:var(--c-off-weak)}.badge.off:before{background:var(--c-off)}.badge.idle{color:var(--c-ink3);background:0 0}.badge.none{color:var(--c-ink4);background:0 0;border-style:dashed}.field{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);width:100%;padding-inline:calc(var(--spacing) * 2);padding-block:calc(var(--spacing) * 1.5);color:var(--c-ink)}.field::placeholder{color:var(--c-ink4)}.field{font-family:var(--font-num);font-size:12.5px}.field:focus{border-color:var(--c-signed);--tw-outline-style:none;background:var(--c-bg);outline-style:none}textarea.field{padding-block:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);line-height:var(--leading-relaxed)}.lb{margin-bottom:var(--spacing);color:var(--c-ink2);font-size:11.5px;display:block}.lb .hint{margin-left:calc(var(--spacing) * 1.5);color:var(--c-ink4);letter-spacing:0;display:inline}.fields{gap:calc(var(--spacing) * 2.5);display:grid}.field-row{gap:var(--spacing);display:grid}.inline-edit{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-signed);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 1.5);padding-block:var(--spacing);color:var(--c-ink);width:min(220px,60%);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13px}.hint{--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink3)}.scroll-tip{display:none}.tip{--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink2);background:var(--c-panel2);border-left:3px solid var(--c-rule2);padding:8px 10px}.tip b{color:var(--c-ink)}.errbox{padding:calc(var(--spacing) * 2);color:var(--c-failed);background:var(--c-failed-weak);border-left:3px solid var(--c-failed);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12px;display:block}.errbox:empty{display:none}.num{font-family:var(--font-num);font-variant-numeric:tabular-nums}.card{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel)}.divider{margin-block:calc(var(--spacing) * 3.5);align-items:center;gap:calc(var(--spacing) * 2.5);color:var(--c-ink4);font-size:11.5px;display:flex}.divider:before,.divider:after{content:"";background-color:var(--c-rule);flex:1;height:1px}.empty{padding-block:calc(var(--spacing) * 10);text-align:center;color:var(--c-ink3);font-size:12.5px}.sec-head{margin-bottom:calc(var(--spacing) * 2.5);justify-content:space-between;align-items:flex-end;gap:calc(var(--spacing) * 3);flex-wrap:wrap;display:flex}.sec-title{color:var(--c-ink);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13.5px}.sec-title .auto-tip{margin-left:calc(var(--spacing) * 2);color:var(--c-ink4);font-size:11px}.sec-acts{align-items:center;gap:calc(var(--spacing) * 1.5);flex-wrap:wrap;display:flex}.act-div{margin-inline:calc(var(--spacing) * .5);height:calc(var(--spacing) * 4);background-color:var(--c-rule);width:1px}.sec-mini{margin-bottom:calc(var(--spacing) * 1.5);color:var(--c-ink3);letter-spacing:.09em;font-size:10.5px}.panel-h{color:var(--c-ink);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13px}.at-wrap{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel);overflow-x:auto}.at{border-collapse:collapse;width:100%;font-size:13px}.at.acct{min-width:940px}.at thead th{text-align:left;white-space:nowrap;color:var(--c-ink3);letter-spacing:.09em;border-bottom:1px solid var(--c-rule2);background:var(--c-panel2);padding:6px 10px 5px;font-size:10.5px}.at thead th.num,.at thead th.act{text-align:right}.at tbody td{white-space:nowrap;text-overflow:ellipsis;padding:8px 10px;overflow:hidden}.at tbody tr.ar{cursor:pointer;vertical-align:middle;border-bottom:1px solid var(--c-rule);border-left:3px solid var(--pc,transparent);transition:background-color .12s}.at tbody tr.ar:last-of-type{border-bottom:0}.at tbody tr.ar:hover,.at tbody tr.ar.open{background:var(--c-panel2)}.at td.num,.at th.num{text-align:right}.at td.empty{text-align:center;white-space:normal}.at tbody tr.ar.st-off{border-left-color:var(--c-rule2);color:var(--c-ink4)}.at tbody tr.ar.st-off .avatar{opacity:.4}.at tbody tr.ar.st-off .plat-tag{color:var(--c-ink4)}.at .cell-acct{align-items:center;gap:calc(var(--spacing) * 2.5);white-space:nowrap;min-width:0;display:flex}.at .nm2{text-overflow:ellipsis;white-space:nowrap;min-width:0;color:var(--c-ink);flex:1;overflow:hidden}.at .col-act{justify-content:flex-end;align-items:center;gap:calc(var(--spacing) * 1.5);display:flex}.at .chev2{width:calc(var(--spacing) * 3);--tw-leading:1;color:var(--c-ink4);-webkit-user-select:none;user-select:none;font-size:15px;line-height:1;display:inline-block}.at tr.ar.open .chev2{color:var(--c-signed);transform:rotate(90deg)}.at.acct th:first-child{width:24%}.at.acct th:nth-child(2),.at.acct th:nth-child(3){width:9%}.at.acct th:nth-child(4){width:8%}.at.acct th:nth-child(5),.at.acct th:nth-child(6){width:11%}.at.acct th:nth-child(7){width:12%}.at.acct th:nth-child(8){width:16%}.at .v-cred{color:var(--c-ink);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .v-up{color:var(--c-signed);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .v-none{color:var(--c-ink4);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .v-day{color:var(--c-ink2);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .v-date{color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .v-warn{color:var(--c-pending);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .v-bad{color:var(--c-failed);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .btn-sign{cursor:pointer;border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);padding-inline:calc(var(--spacing) * 2.5);padding-block:var(--spacing);white-space:nowrap;color:var(--c-ink2);background-color:#0000;align-items:center;font-size:12px;transition:background-color .12s,color .12s,border-color .12s;display:inline-flex}.at .btn-sign:hover:not(:disabled){border-color:var(--c-ink);background-color:var(--c-ink);color:var(--c-bg)}.at .btn-sign:disabled{cursor:not-allowed;border-color:var(--c-rule);color:var(--c-ink4)}.week{--tw-leading:1;align-items:center;gap:2px;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11px;line-height:1;display:inline-flex}.week b{--tw-font-weight:var(--font-weight-normal);font-weight:var(--font-weight-normal);color:var(--c-rule2);display:inline-block}.week b.on{color:var(--c-signed)}.week b.warn{color:var(--c-pending)}.week b.bad{color:var(--c-failed)}.week b.mute{color:var(--c-off)}.p-purple{--pc:var(--a-purple);--pbg:var(--a-purple)}@supports (color:color-mix(in lab, red, red)){.p-purple{--pbg:color-mix(in srgb, var(--a-purple) 13%, transparent)}}.p-purple{--pbd:var(--a-purple)}@supports (color:color-mix(in lab, red, red)){.p-purple{--pbd:color-mix(in srgb, var(--a-purple) 40%, transparent)}}.p-blue{--pc:var(--a-blue);--pbg:var(--a-blue)}@supports (color:color-mix(in lab, red, red)){.p-blue{--pbg:color-mix(in srgb, var(--a-blue) 13%, transparent)}}.p-blue{--pbd:var(--a-blue)}@supports (color:color-mix(in lab, red, red)){.p-blue{--pbd:color-mix(in srgb, var(--a-blue) 40%, transparent)}}.p-green{--pc:var(--a-green);--pbg:var(--a-green)}@supports (color:color-mix(in lab, red, red)){.p-green{--pbg:color-mix(in srgb, var(--a-green) 13%, transparent)}}.p-green{--pbd:var(--a-green)}@supports (color:color-mix(in lab, red, red)){.p-green{--pbd:color-mix(in srgb, var(--a-green) 40%, transparent)}}.p-amber{--pc:var(--a-amber);--pbg:var(--a-amber)}@supports (color:color-mix(in lab, red, red)){.p-amber{--pbg:color-mix(in srgb, var(--a-amber) 13%, transparent)}}.p-amber{--pbd:var(--a-amber)}@supports (color:color-mix(in lab, red, red)){.p-amber{--pbd:color-mix(in srgb, var(--a-amber) 40%, transparent)}}.p-cyan{--pc:var(--a-cyan);--pbg:var(--a-cyan)}@supports (color:color-mix(in lab, red, red)){.p-cyan{--pbg:color-mix(in srgb, var(--a-cyan) 13%, transparent)}}.p-cyan{--pbd:var(--a-cyan)}@supports (color:color-mix(in lab, red, red)){.p-cyan{--pbd:color-mix(in srgb, var(--a-cyan) 40%, transparent)}}.p-rose{--pc:var(--a-rose);--pbg:var(--a-rose)}@supports (color:color-mix(in lab, red, red)){.p-rose{--pbg:color-mix(in srgb, var(--a-rose) 13%, transparent)}}.p-rose{--pbd:var(--a-rose)}@supports (color:color-mix(in lab, red, red)){.p-rose{--pbd:color-mix(in srgb, var(--a-rose) 40%, transparent)}}.p-gray{--pc:var(--a-gray);--pbg:var(--a-gray)}.p-lime{--pc:var(--a-lime);--pbg:var(--a-lime)}@supports (color:color-mix(in lab, red, red)){.p-gray{--pbg:color-mix(in srgb, var(--a-gray) 13%, transparent)}.p-lime{--pbg:color-mix(in srgb, var(--a-lime) 13%, transparent)}}.p-gray{--pbd:var(--a-gray)}.p-lime{--pbd:var(--a-lime)}@supports (color:color-mix(in lab, red, red)){.p-gray{--pbd:color-mix(in srgb, var(--a-gray) 40%, transparent)}.p-lime{--pbd:color-mix(in srgb, var(--a-lime) 40%, transparent)}}.st-off{--pc:var(--c-rule2)}.plat-tag{height:18px;padding-inline:calc(var(--spacing) * 1.5);white-space:nowrap;color:var(--pc,var(--c-ink2));border:1px solid var(--pbd,var(--c-rule));background:var(--pbg,transparent);align-items:center;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11px;display:inline-flex}.avatar{-webkit-user-select:none;user-select:none;border:1px solid var(--pbd,var(--c-rule2));background:var(--pbg,var(--c-panel2));width:24px;height:24px;color:var(--pc,var(--c-ink2));flex-shrink:0;place-items:center;font-size:13px;line-height:1;display:inline-grid;position:relative}.avatar .dot{background:var(--pc,var(--c-rule2));width:6px;height:6px;box-shadow:0 0 0 2px var(--c-panel);position:absolute;bottom:-3px;right:-3px}.switch{cursor:pointer;flex-shrink:0;align-items:center;display:inline-flex}.switch input{clip-path:inset(50%);white-space:nowrap;border-width:0;width:1px;height:1px;margin:-1px;padding:0;position:absolute;overflow:hidden}.switch .track{background:var(--c-panel2);border:1px solid var(--c-rule2);width:32px;height:16px;transition:background-color .12s,border-color .12s;display:inline-block;position:relative}.switch .track:after{content:"";background:var(--c-ink4);width:10px;height:10px;transition:transform .12s linear,background-color .12s;position:absolute;top:2px;left:2px}.switch input:checked+.track{background:var(--c-signed-weak);border-color:var(--c-signed)}.switch input:checked+.track:after{background:var(--c-signed);transform:translate(16px)}.switch input:disabled+.track{opacity:.4}.at tr.ar-detail{display:none}.at tr.ar-detail>td{background:var(--c-bg);border-left:3px solid var(--pc,transparent);white-space:normal;padding:0 10px;overflow:visible}.at tr.ar-detail.show{display:table-row}.at tr.ar-detail.show>td{padding:11px 12px 14px 14px}.qa{margin-bottom:calc(var(--spacing) * 2);align-items:center;gap:calc(var(--spacing) * 1.5);flex-wrap:wrap;display:flex}.qbtn{cursor:pointer;border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 2.5);padding-block:var(--spacing);white-space:nowrap;color:var(--c-ink2);align-items:center;font-size:12px;transition:border-color .12s,color .12s,background-color .12s;display:inline-flex}.qbtn:hover:not(:disabled){border-color:var(--c-ink);background-color:var(--c-ink);color:var(--c-bg)}.qbtn:disabled{cursor:not-allowed;color:var(--c-ink4)}.qbtn.danger{color:var(--c-failed);border-color:var(--c-failed)}@supports (color:color-mix(in lab, red, red)){.qbtn.danger{border-color:color-mix(in srgb, var(--c-failed) 45%, transparent)}}.qbtn.danger:hover:not(:disabled){border-color:var(--c-failed);background-color:var(--c-failed);color:var(--c-bg)}.qa-tip{text-align:right;color:var(--c-ink4);margin-left:auto;font-size:11px}.acct-hint{margin-bottom:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.acct-sec{margin-top:calc(var(--spacing) * 2.5);padding-top:calc(var(--spacing) * 2.5);border-top:1px solid var(--c-rule)}.task-list{max-height:240px;overflow:auto}.task{align-items:baseline;gap:calc(var(--spacing) * 2);padding-block:var(--spacing);color:var(--c-ink2);font-size:12px;font-family:var(--font-num);border-bottom:1px solid var(--c-rule);display:flex}.task:last-child{border-bottom:0}.task .t-state{width:calc(var(--spacing) * 3);text-align:center;flex-shrink:0;display:inline-block}.task.ok .t-state{color:var(--c-signed)}.task.bad .t-state{color:var(--c-failed)}.task.warn .t-state{color:var(--c-pending)}.task.mut .t-state{color:var(--c-ink4)}.task b{color:var(--c-ink);flex-shrink:0}.task span{text-overflow:ellipsis;white-space:nowrap;color:var(--c-ink3);overflow:hidden}.run-empty{padding-block:var(--spacing);color:var(--c-ink4);font-size:12px}.at.no-click tbody tr.ar{cursor:default}.at .t-ts{color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12px}.at .t-name{text-overflow:ellipsis;white-space:nowrap;max-width:150px;color:var(--c-ink);overflow:hidden}.at .t-msg{text-overflow:ellipsis;white-space:nowrap;max-width:300px;color:var(--c-ink3);font-size:12px;overflow:hidden}.at .credit-cell{color:var(--c-signed);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .credit-cell.none{color:var(--c-ink4)}.modal-mask{z-index:100;padding:calc(var(--spacing) * 4);justify-content:center;align-items:flex-start;display:none;position:fixed;inset:0}@media (min-width:40rem){.modal-mask{padding:calc(var(--spacing) * 8)}}.modal-mask{background:var(--c-bg)}@supports (color:color-mix(in lab, red, red)){.modal-mask{background:color-mix(in srgb, var(--c-bg) 72%, transparent)}}.modal-mask{overflow:auto}.modal-mask.show{display:flex}.modal{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);width:100%;max-width:560px;box-shadow:var(--shadow-pop);margin-block:auto}.modal.xl{max-width:760px}.modal-head{padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3);border-bottom:1px solid var(--c-rule2);background:var(--c-panel2);justify-content:space-between;align-items:center;display:flex}.modal-head h3{font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13.5px}.modal-x{height:calc(var(--spacing) * 7);width:calc(var(--spacing) * 7);cursor:pointer;color:var(--c-ink3);place-items:center;display:grid}@media (hover:hover){.modal-x:hover{color:var(--c-ink)}}.modal-x{background:0 0;border:0}.modal-body{max-height:70vh;padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3.5);overflow:auto}.modal-foot{justify-content:flex-end;align-items:center;gap:calc(var(--spacing) * 2);padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3);border-top:1px solid var(--c-rule2);background:var(--c-panel2);display:flex}.step{margin-bottom:calc(var(--spacing) * 4);gap:calc(var(--spacing) * 3);display:flex}.step:last-child{margin-bottom:0}.step-n{width:22px;height:22px;color:var(--c-signed);border:1px solid var(--c-rule2);background:var(--c-panel2);flex-shrink:0;place-items:center;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11px;display:grid}.step-b{flex:1;min-width:0}.step-t{margin-bottom:var(--spacing);color:var(--c-ink);font-size:13px}.step-b p{margin-bottom:calc(var(--spacing) * 1.5);--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.step-b p:last-child{margin-bottom:0}.step-b h4{margin-bottom:var(--spacing);color:var(--c-ink);font-size:13px}.body-copy p{margin-bottom:calc(var(--spacing) * 1.5);--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.body-copy p:last-child{margin-bottom:0}.body-copy h4{margin-bottom:var(--spacing);color:var(--c-ink);font-size:13px}.body-copy ul,ul.body-copy{list-style-type:disc}:where(:is(.body-copy ul,ul.body-copy)>:not(:last-child)){--tw-space-y-reverse:0;margin-block-start:calc(var(--spacing) * var(--tw-space-y-reverse));margin-block-end:calc(var(--spacing) * calc(1 - var(--tw-space-y-reverse)))}.body-copy ul,ul.body-copy{padding-left:calc(var(--spacing) * 4)}.body-copy li{--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.plat-card{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 2.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);min-width:0;padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2.5);transition:border-color .12s,background-color .12s;display:flex}.plat-card:hover{border-color:var(--c-ink4)}.plat-card.on{border-color:var(--c-ink);background:var(--c-panel2);box-shadow:inset 3px 0 0 var(--pc,var(--c-ink))}.plat-card.off{cursor:not-allowed;opacity:.5}.plat-card .ic{width:26px;height:26px;color:var(--pc,var(--c-ink2));background:var(--pbg,transparent);border:1px solid var(--pbd,var(--c-rule));flex-shrink:0;place-items:center;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13px;line-height:1;display:grid}.plat-card .tt{text-overflow:ellipsis;white-space:nowrap;color:var(--c-ink);font-size:13px;overflow:hidden}.plat-card .dd{text-overflow:ellipsis;white-space:nowrap;color:var(--c-ink3);font-size:11px;overflow:hidden}.rs-card{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel2);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 3)}.rs-h{margin-bottom:var(--spacing);color:var(--c-ink);font-size:13px}.auth-status{margin-top:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.auth-status a{color:var(--c-ink);text-decoration-line:underline}.login-card{width:100%;padding:calc(var(--spacing) * 5);background:var(--c-panel);border:1px solid var(--c-rule2);max-width:380px;box-shadow:var(--shadow-pop)}.toast-item{pointer-events:auto;background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2);color:var(--c-ink);border:1px solid var(--c-rule2);box-shadow:var(--shadow-pop);opacity:0;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12px;transition:opacity .16s,transform .16s;transform:translateY(6px)}.toast-item.show{opacity:1;transform:none}.toast-item.err{color:var(--c-failed);border-color:var(--c-failed)}.toast-item.ok{color:var(--c-signed);border-color:var(--c-signed)}.toast-item.warn{color:var(--c-pending);border-color:var(--c-pending)}}@layer utilities{.pointer-events-none{pointer-events:none}.fixed{position:fixed}.bottom-6{bottom:calc(var(--spacing) * 6)}.left-1{left:var(--spacing)}.left-1\\/2{left:50%}.z-\\[200\\]{z-index:200}.mt-0\\.5{margin-top:calc(var(--spacing) * .5)}.mt-1\\.5{margin-top:calc(var(--spacing) * 1.5)}.mt-2{margin-top:calc(var(--spacing) * 2)}.mt-2\\.5{margin-top:calc(var(--spacing) * 2.5)}.mt-3{margin-top:calc(var(--spacing) * 3)}.mt-5{margin-top:calc(var(--spacing) * 5)}.mb-1{margin-bottom:var(--spacing)}.mb-2{margin-bottom:calc(var(--spacing) * 2)}.mb-2\\.5{margin-bottom:calc(var(--spacing) * 2.5)}.mb-3{margin-bottom:calc(var(--spacing) * 3)}.mb-4{margin-bottom:calc(var(--spacing) * 4)}.mb-5{margin-bottom:calc(var(--spacing) * 5)}.block{display:block}.flex{display:flex}.grid{display:grid}.hidden{display:none}.min-h-dvh{min-height:100dvh}.w-max{width:max-content}.max-w-\\[80vw\\]{max-width:80vw}.max-w-\\[1060px\\]{max-width:1060px}.shrink-0{flex-shrink:0}.-translate-x-1\\/2{--tw-translate-x:calc(calc(1 / 2 * 100%) * -1);translate:var(--tw-translate-x) var(--tw-translate-y)}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.place-items-center{place-items:center}.items-baseline{align-items:baseline}.items-center{align-items:center}.justify-between{justify-content:space-between}.gap-1\\.5{gap:calc(var(--spacing) * 1.5)}.gap-2{gap:calc(var(--spacing) * 2)}.gap-3{gap:calc(var(--spacing) * 3)}.gap-4{gap:calc(var(--spacing) * 4)}.overflow-x-auto{overflow-x:auto}.border-b{border-bottom-style:var(--tw-border-style);border-bottom-width:1px}.border-rule{border-color:var(--c-rule)}.px-4{padding-inline:calc(var(--spacing) * 4)}.py-3{padding-block:calc(var(--spacing) * 3)}.py-10{padding-block:calc(var(--spacing) * 10)}.text-\\[11px\\]{font-size:11px}.whitespace-nowrap{white-space:nowrap}.text-ink{color:var(--c-ink)}.text-ink4{color:var(--c-ink4)}.blur{--tw-blur:blur(8px);filter:var(--tw-blur,) var(--tw-brightness,) var(--tw-contrast,) var(--tw-grayscale,) var(--tw-hue-rotate,) var(--tw-invert,) var(--tw-saturate,) var(--tw-sepia,) var(--tw-drop-shadow,)}@media (min-width:40rem){.sm\\:col-span-2{grid-column:span 2/span 2}.sm\\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}}}:root{--c-bg:#0a0e10;--c-panel:#0e1417;--c-panel2:#131b1f;--c-raise:#182228;--c-rule:#1d2930;--c-rule2:#2c3d47;--c-ink:#d3e3e8;--c-ink2:#9db2bc;--c-ink3:#6b8290;--c-ink4:#4a5f6a;--c-signed:#3fd699;--c-signed-weak:#0c2119;--c-pending:#e7b44a;--c-pending-weak:#231b0d;--c-failed:#ff7d76;--c-failed-weak:#26100f;--c-info:#5fb6e8;--c-off:#465861;--c-off-weak:#141c20;--c-focus:#3fd699;--a-purple:#9d8bf2;--a-blue:#5aaee8;--a-green:#41cf9a;--a-amber:#e3a94f;--a-cyan:#57c2cf;--a-rose:#ea8ba0;--a-gray:#8fa3ac;--a-lime:#b8e05c;--shadow-pop:6px 6px 0 #00000073;color-scheme:dark}[data-theme=light]{--c-bg:#e9edec;--c-panel:#f6f8f7;--c-panel2:#eef2f1;--c-raise:#e2e8e6;--c-rule:#c6d1cd;--c-rule2:#a4b4af;--c-ink:#0f1c1a;--c-ink2:#3f5350;--c-ink3:#677976;--c-ink4:#8d9c99;--c-signed:#0d6b45;--c-signed-weak:#d9eee5;--c-pending:#7a5310;--c-pending-weak:#f3e8d3;--c-failed:#96291f;--c-failed-weak:#f6dfdc;--c-info:#1c5c7d;--c-off:#6d7c79;--c-off-weak:#e3e7e6;--c-focus:#0d6b45;--a-purple:#4a4390;--a-blue:#1c5c88;--a-green:#0f6b45;--a-amber:#7d5310;--a-cyan:#17656e;--a-rose:#87364d;--a-gray:#4f5d5b;--a-lime:#5c7d10;--shadow-pop:6px 6px 0 #0f1c1a21;color-scheme:light}@media (max-width:700px){.shell{padding-inline:calc(var(--spacing) * 2);padding-bottom:calc(var(--spacing) * 14)}.sl-cell{border-right:0;border-bottom:1px solid var(--c-rule);flex-grow:0;flex-basis:46%;min-width:46%}.sl-cell:last-child{border-bottom:0}.scroll-tip{display:inline}.at{min-width:760px}.qa .qa-tip{text-align:left;width:100%;margin-left:0}.at .t-msg{max-width:40vw}}@property --tw-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-y{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-z{syntax:"*";inherits:false;initial-value:0}@property --tw-border-style{syntax:"*";inherits:false;initial-value:solid}@property --tw-blur{syntax:"*";inherits:false}@property --tw-brightness{syntax:"*";inherits:false}@property --tw-contrast{syntax:"*";inherits:false}@property --tw-grayscale{syntax:"*";inherits:false}@property --tw-hue-rotate{syntax:"*";inherits:false}@property --tw-invert{syntax:"*";inherits:false}@property --tw-opacity{syntax:"*";inherits:false}@property --tw-saturate{syntax:"*";inherits:false}@property --tw-sepia{syntax:"*";inherits:false}@property --tw-drop-shadow{syntax:"*";inherits:false}@property --tw-drop-shadow-color{syntax:"*";inherits:false}@property --tw-drop-shadow-alpha{syntax:"<percentage>";inherits:false;initial-value:100%}@property --tw-drop-shadow-size{syntax:"*";inherits:false}@property --tw-font-weight{syntax:"*";inherits:false}@property --tw-tracking{syntax:"*";inherits:false}@property --tw-leading{syntax:"*";inherits:false}@property --tw-space-y-reverse{syntax:"*";inherits:false;initial-value:0}
+/* ===== 视觉层：柔和卡片风 ===== */
+:root{
+  --c-bg:#070a0e;--c-panel:#101822;--c-panel2:#0c131b;--c-raise:#141d28;
+  --c-rule:rgba(232,238,245,.08);--c-rule2:rgba(232,238,245,.16);
+  --c-ink:#e8eef5;--c-ink2:#b6c2ce;--c-ink3:#8b98a7;--c-ink4:#5f6b78;
+  --c-signed:#2fd07e;--c-signed-weak:rgba(47,208,126,.12);
+  --c-pending:#e6ae4a;--c-pending-weak:rgba(230,174,74,.12);
+  --c-failed:#ff7d6e;--c-failed-weak:rgba(255,125,110,.12);
+  --c-info:#6cb6ef;--c-off:#4a5b69;--c-off-weak:rgba(232,238,245,.06);--c-focus:#2fd07e;
+  --a-purple:#a99cf5;--a-blue:#6cb6ef;--a-green:#3ddc97;--a-amber:#e6ae4a;--a-cyan:#63cbd8;--a-rose:#f392a7;--a-gray:#8b98a7;--a-lime:#c2e46a;
+  --shadow-pop:0 18px 44px -22px rgba(0,0,0,.65);
+  color-scheme:dark;
+}
+[data-theme=light]{
+  --c-bg:#eef1f5;--c-panel:#fff;--c-panel2:#f6f8fa;--c-raise:#fff;
+  --c-rule:rgba(15,23,42,.09);--c-rule2:rgba(15,23,42,.16);
+  --c-ink:#0c141d;--c-ink2:#33404d;--c-ink3:#5e6a78;--c-ink4:#8b98a7;
+  --c-signed:#0d8a61;--c-signed-weak:rgba(13,138,97,.10);
+  --c-pending:#9a6407;--c-pending-weak:rgba(190,124,15,.13);
+  --c-failed:#bf3529;--c-failed-weak:rgba(191,53,41,.10);
+  --c-info:#2d7fc0;--c-off:#8b98a7;--c-off-weak:rgba(15,23,42,.055);--c-focus:#0d8a61;
+  --a-purple:#6f5fd0;--a-blue:#2d7fc0;--a-green:#0d8a61;--a-amber:#9a6407;--a-cyan:#17656e;--a-rose:#b8455f;--a-gray:#5e6a78;--a-lime:#5c7d10;
+  --shadow-pop:0 18px 44px -22px rgba(15,23,42,.35);
+  color-scheme:light;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue","Noto Sans","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.6}
+body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(900px 500px at 12% -10%,rgba(16,160,110,.11),transparent 70%),radial-gradient(700px 420px at 92% 0,rgba(56,110,220,.09),transparent 70%)}
+body::after{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.55;background-image:linear-gradient(rgba(15,23,42,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(15,23,42,.035) 1px,transparent 1px);background-size:46px 46px;-webkit-mask-image:radial-gradient(ellipse at 50% 0%,#000 35%,transparent 75%);mask-image:radial-gradient(ellipse at 50% 0%,#000 35%,transparent 75%)}
+[data-theme=light] body::after{background-image:linear-gradient(rgba(15,23,42,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(15,23,42,.05) 1px,transparent 1px)}
+.shell{position:relative;z-index:1;max-width:1440px;padding-inline:24px}
+.topbar{position:sticky;top:0;z-index:30;padding:12px 0;border-bottom:1px solid var(--c-rule);background:color-mix(in srgb,var(--c-bg) 78%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
+.brand{font-family:var(--font-num);font-size:16px;letter-spacing:-.01em}
+.brand .caret{width:9px;height:17px}
+.statusline{margin-top:18px;overflow:hidden;border:1px solid var(--c-rule);border-left:0;border-radius:16px;background:var(--c-panel);box-shadow:0 1px 2px rgba(15,23,42,.04),0 10px 26px -16px rgba(15,23,42,.22)}
+.sl-cell{padding:16px 18px;border-right:1px solid var(--c-rule)}
+.sl-label{font-family:var(--font-num);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase}
+.sl-value,.today-date{font-family:var(--font-num);font-size:20px}
+.punch i{border-radius:2px}
+.tabs{width:fit-content;margin-top:22px;padding:4px;gap:4px;border:0;border-radius:14px;background:var(--c-panel2)}
+.tab{padding:9px 18px;border:0;border-radius:10px;font-size:13px}
+.tab.on{border:0;background:var(--c-signed);color:var(--c-bg);box-shadow:0 6px 16px var(--c-signed-weak)}
+.tab.on .key,.tab.on .cnt,.tab.on .cnt{border-color:transparent;color:inherit}
+.btn-ghost,.btn-primary,.qbtn{padding:9px 16px;border-radius:12px;font-size:13px;transition:transform .12s ease,box-shadow .18s ease,border-color .18s ease,background-color .18s ease,color .18s ease,filter .18s ease}
+.btn-ghost:hover:not(:disabled){border-color:var(--c-rule2);background:var(--c-panel2);color:var(--c-ink);box-shadow:var(--shadow-pop);transform:translateY(-1px)}
+.btn-primary{border-color:var(--c-signed);background:var(--c-signed);color:var(--c-bg);box-shadow:0 12px 26px -14px var(--c-signed)}
+.btn-primary:hover:not(:disabled){border-color:var(--c-signed);background:var(--c-signed);filter:brightness(1.06)}
+.field{padding:11px 13px;border-radius:12px;background:var(--c-panel2)}
+.field:focus{border-color:var(--c-signed);background:var(--c-panel);box-shadow:0 0 0 4px var(--c-signed-weak)}
+.at-wrap{overflow:hidden;border-radius:16px;background:var(--c-panel);box-shadow:0 1px 2px rgba(15,23,42,.04),0 10px 26px -16px rgba(15,23,42,.22)}
+.at thead th{padding:11px 12px;background:var(--c-panel2);font-family:var(--font-num);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
+.at tbody td{padding:11px 12px}
+.at tbody tr.ar{transition:background-color .16s ease}
+.at tbody tr.ar:hover,.at tbody tr.ar.open{background:var(--c-panel2)}
+.at .nm2{font-weight:600}
+.badge{height:auto;padding:4px 10px;border-radius:999px;font-family:inherit;font-size:12px;font-weight:600}
+.badge:before{width:6px;height:6px;border-radius:999px}
+.plat-tag{height:auto;padding:3px 10px;border-radius:999px;font-family:inherit;font-size:11.5px}
+.avatar{border-radius:10px}
+.switch .track{width:34px;height:18px;border-radius:999px}
+.switch .track:after{width:12px;height:12px;border-radius:999px}
+.switch input:checked+.track:after{transform:translate(16px)}
+.modal,.login-card,.card{border-radius:16px;box-shadow:var(--shadow-pop)}
+.modal-mask{background:rgba(8,15,24,.42);-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
+.tip{border-left:0;border-radius:10px;padding:10px 12px}
+.statusline,.tabs,.at-wrap{animation:rise .55s cubic-bezier(.22,.9,.28,1) both}
+.tabs{animation-delay:.06s}
+.at-wrap{animation-delay:.12s}
+@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
+@media (prefers-reduced-motion:reduce){.statusline,.tabs,.at-wrap{animation:none}.btn-ghost:hover:not(:disabled){transform:none}}
+@media (max-width:1080px){.topbar{position:static}.shell{max-width:none}}
+@media (max-width:640px){.shell{padding-inline:12px}.topbar{padding:10px 0}}
 </style>
 </head>
 <body class="min-h-dvh">
 
 <!-- 登录 -->
-<div id="loginView" class="min-h-dvh grid place-items-center px-5 py-10">
-  <div class="w-full max-w-[380px]">
-    <div class="flex items-center gap-3 mb-6">
-      <svg class="w-9 h-9 shrink-0" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="4" fill="#14171a"/><path d="M17 33.2 L27.4 43.4 L46.5 21.6" fill="none" stroke="#f6f7f5" stroke-width="6.2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <div>
-        <h1 class="font-display text-[24px] leading-none">签到台</h1>
-        <div class="hint mt-1.5">每日考勤登记 · Cloudflare Worker</div>
-      </div>
+<div id="loginView" class="min-h-dvh grid place-items-center px-4 py-10">
+  <div class="login-card">
+    <div class="brand mb-1"><span class="caret"></span>checkin-hub</div>
+    <div class="hint mb-5">每日签到值班台 · Cloudflare Worker</div>
+    <label class="lb" for="pwd">登录密码</label>
+    <div class="flex gap-2">
+      <input id="pwd" class="field" type="password" placeholder="ADMIN_TOKEN" autocomplete="current-password">
+      <button id="loginBtn" class="btn-primary shrink-0">登录</button>
     </div>
-    <div class="card p-4">
-      <label class="lb" for="pwd">登录密码</label>
-      <div class="flex gap-2">
-        <input id="pwd" class="field" type="password" placeholder="输入 ADMIN_TOKEN" autocomplete="current-password">
-        <button id="loginBtn" class="btn-primary shrink-0">登录</button>
-      </div>
-      <div class="hint mt-3">密码即后台的 <code>ADMIN_TOKEN</code>。登录状态只存在本机浏览器，公共电脑用完请退出。</div>
-      <div class="err mt-2" id="loginErr"></div>
-    </div>
+    <div class="hint mt-3">密码即后台的 <code>ADMIN_TOKEN</code>。登录状态只存在本机浏览器，公共电脑用完请退出。</div>
+    <div class="errbox mt-2" id="loginErr"></div>
   </div>
 </div>
 
 <div id="appView" hidden>
-<div class="mx-auto w-full max-w-[1060px] px-4 sm:px-7 pb-16">
+<div class="shell">
 
-  <!-- 今日卡 -->
-  <header class="pt-6 pb-3.5 today-rule">
-    <div class="flex items-start justify-between gap-4">
-      <div class="hint select-none">签到台 <span class="text-ink4">/</span> <span id="headScope">6 平台</span></div>
-      <div class="flex items-center gap-1.5">
-        <span class="badge idle" id="schedBadge">定时 —</span>
-        <button class="btn-ghost btn-sm" onclick="openGuide()">使用教程</button>
-        <button class="btn-ghost btn-sm" onclick="logout('')">退出</button>
-      </div>
+  <div class="topbar">
+    <div class="brand"><span class="caret"></span>checkin-hub</div>
+    <div class="scope" id="headScope">6 平台</div>
+    <div class="topbar-right">
+      <span class="badge idle" id="schedBadge">定时 —</span>
+      <button class="btn-ghost btn-sm" id="themeBtn" onclick="toggleTheme()">浅色</button>
+      <button class="btn-ghost btn-sm" onclick="openNotify()">通知</button>
+      <button class="btn-ghost btn-sm" onclick="openGuide()">教程</button>
+      <button class="btn-ghost btn-sm" onclick="logout('')">退出</button>
     </div>
-    <div class="flex items-end justify-between gap-8 flex-wrap mt-4">
-      <div class="flex items-end gap-5">
-        <div class="today-date" id="stampDate">--</div>
-        <div class="pb-1">
-          <div class="hint" id="stampWeek">—</div>
-          <div class="punch mt-2" id="punchStrip" aria-hidden="true"></div>
-        </div>
-      </div>
-      <div class="flex items-end gap-6 sm:gap-8 flex-wrap">
-        <div>
-          <div class="kpi-label">今日已签</div>
-          <div class="today-frac"><span id="kpiToday">0</span><span class="text-ink4 text-[22px]" id="kpiTotal">/0</span></div>
-          <div class="hint mt-1" id="kpiEnabled">—</div>
-        </div>
-        <div>
-          <div class="kpi-label">今日积分</div>
-          <div class="kpi-value" id="kpiCredit">—</div>
-          <div class="hint mt-1">各平台合计</div>
-        </div>
-        <div>
-          <div class="kpi-label">累计签到</div>
-          <div class="kpi-value" id="kpiSigned">—</div>
-          <div class="hint mt-1">次</div>
-        </div>
-        <div>
-          <div class="kpi-label">下次自动签到</div>
-          <div class="kpi-value text-[15px]" id="kpiNext">—</div>
-          <div class="hint mt-1 num" id="kpiCron">—</div>
-        </div>
-      </div>
-    </div>
-    <div class="mt-3 h-[2px] bg-rule" aria-hidden="true"><i id="kpiBar" class="block h-full bg-signed transition-[width] duration-300" style="width:0"></i></div>
-  </header>
+  </div>
 
-  <nav class="tabs mt-5">
-    <button class="tab on" data-tab="accounts" onclick="switchTab('accounts',this)">账号 <span class="cnt" id="tabCnt">0</span></button>
-    <button class="tab" data-tab="history" onclick="switchTab('history',this)">运行历史 <span class="cnt" id="tabHist">0</span></button>
-    <button class="tab" data-tab="about" onclick="switchTab('about',this)">关于</button>
+  <div class="statusline">
+    <div class="sl-cell">
+      <span class="sl-label">今天</span>
+      <span class="today-date" id="stampDate">--</span>
+      <span class="sl-sub" id="stampWeek">—</span>
+      <span class="punch mt-1.5" id="punchStrip" aria-hidden="true"></span>
+    </div>
+    <div class="sl-cell">
+      <span class="sl-label">今日已签</span>
+      <span class="sl-value"><span id="kpiToday">0</span><span class="today-frac" id="kpiTotal">/0</span></span>
+      <span class="sl-sub mt-0.5" id="kpiEnabled">—</span>
+      <span class="sl-bar"><i id="kpiBar"></i></span>
+    </div>
+    <div class="sl-cell">
+      <span class="sl-label">今日积分</span>
+      <span class="sl-value" id="kpiCredit">—</span>
+      <span class="sl-sub">各平台合计</span>
+    </div>
+    <div class="sl-cell">
+      <span class="sl-label">累计签到</span>
+      <span class="sl-value" id="kpiSigned">—</span>
+      <span class="sl-sub">次</span>
+    </div>
+    <div class="sl-cell">
+      <span class="sl-label">下次自动签到</span>
+      <span class="sl-value" id="kpiNext">—</span>
+      <span class="sl-sub num" id="kpiCron">—</span>
+    </div>
+  </div>
+
+  <nav class="tabs">
+    <button class="tab on" data-tab="accounts" title="快捷键 1" onclick="switchTab('accounts',this)"><span class="key">1</span>账号 <span class="cnt" id="tabCnt">0</span></button>
+    <button class="tab" data-tab="history" title="快捷键 2" onclick="switchTab('history',this)"><span class="key">2</span>运行历史 <span class="cnt" id="tabHist">0</span></button>
+    <button class="tab" data-tab="about" title="快捷键 3" onclick="switchTab('about',this)"><span class="key">3</span>关于</button>
   </nav>
 
   <section class="panel active" id="panel-accounts">
     <div class="sec-head mt-5">
-      <div class="sec-title">考勤登记簿<i class="auto-tip">每分钟自动刷新</i></div>
+      <div class="sec-title">签到队列<i class="auto-tip">每分钟自动刷新</i></div>
       <div class="sec-acts">
         <button class="btn-ghost btn-sm" onclick="openAdd()">添加账号</button>
         <span class="act-div"></span>
@@ -4698,14 +5724,14 @@ const PAGE = `<!DOCTYPE html>
         <button class="btn-primary btn-sm" id="runAllBtn" onclick="runAll(this)">全部签到</button>
       </div>
     </div>
-    <div class="err mb-2" id="runMsg"></div>
+    <div class="errbox mb-2" id="runMsg"></div>
     <div id="acctList"><div class="empty">加载中…</div></div>
-    <div class="hint mt-3">点账号行展开详情：刷新积分、重命名、删除、最近执行记录都在里面。凭证只支持重新登录或重新粘贴，不支持直接查看。</div>
+    <div class="hint mt-3"><span class="scroll-tip">表格可横向滑动 · </span>点账号行展开详情：刷新积分、重命名、删除、最近执行记录都在里面。凭证只支持重新登录或重新粘贴，不支持直接查看。按 1 / 2 / 3 切换标签页。</div>
   </section>
 
   <section class="panel" id="panel-history">
     <div class="sec-head mt-5">
-      <div class="sec-title">运行历史</div>
+      <div class="sec-title">运行历史<i class="auto-tip">每次签到与定时任务的结果</i></div>
       <div class="sec-acts">
         <span class="hint" id="histHint">—</span>
         <button class="btn-ghost btn-sm" onclick="clearHistory()">清空</button>
@@ -4730,7 +5756,7 @@ const PAGE = `<!DOCTYPE html>
     <div class="grid gap-4 sm:grid-cols-2 mt-5">
       <div class="card sm:col-span-2">
         <div class="px-4 py-3 flex items-baseline justify-between gap-3 border-b border-rule">
-          <h3 class="font-display text-[15px]">支持平台</h3><span class="hint">接口按官方客户端/网页整理</span>
+          <h3 class="panel-h">支持平台</h3><span class="hint">接口按官方客户端/网页整理</span>
         </div>
         <div class="px-4 py-3 overflow-x-auto">
           <table class="at no-click">
@@ -4738,6 +5764,7 @@ const PAGE = `<!DOCTYPE html>
             <tbody>
               <tr class="ar"><td>Trae</td><td>每日积分</td><td class="num">余额 / 本次</td><td>抖音扫码 + 粘贴回调</td><td><span class="badge ok">已实测</span></td></tr>
               <tr class="ar"><td>WorkBuddy</td><td>每日签到</td><td class="num">连签 / 本期</td><td>微信扫码</td><td><span class="badge ok">已实测</span></td></tr>
+              <tr class="ar"><td>Qoder</td><td>每日活动领取</td><td class="num">本次 / 累计</td><td>官网设备授权</td><td><span class="badge warn">未验证</span></td></tr>
               <tr class="ar"><td>WorkBuddy 国际版</td><td>活动档期内</td><td class="num">余额 / 套餐</td><td>网页授权或粘贴 token</td><td><span class="badge warn">未验证</span></td></tr>
               <tr class="ar"><td>智谱清言</td><td>每日登录积分</td><td class="num">积分余额</td><td>粘贴 chatglm_token</td><td><span class="badge warn">未验证</span></td></tr>
               <tr class="ar"><td>讯飞 Loomy</td><td>每日额度池</td><td class="num">可用额度</td><td>粘贴 token</td><td><span class="badge warn">未验证</span></td></tr>
@@ -4748,7 +5775,7 @@ const PAGE = `<!DOCTYPE html>
       </div>
       <div class="card">
         <div class="px-4 py-3 flex items-baseline justify-between gap-3 border-b border-rule">
-          <h3 class="font-display text-[15px]">部署绑定</h3><span class="hint">Cloudflare Worker</span>
+          <h3 class="panel-h">部署绑定</h3><span class="hint">Cloudflare Worker</span>
         </div>
         <div class="px-4 py-3">
           <table class="at no-click">
@@ -4761,13 +5788,13 @@ const PAGE = `<!DOCTYPE html>
               <tr class="ar"><td class="num whitespace-nowrap">CHECKIN_CRON</td><td>可选，首次 Cron 触发前的展示占位</td></tr>
             </tbody>
           </table>
-          <div class="hint mt-3">Cron 在 Cloudflare 控制台 <b class="text-ink">Settings → Triggers → Cron Triggers</b> 配置，推荐 <code>10 0 * * *</code>（UTC）= 北京 08:10。页面会自动记录最近一次 Cron 触发的表达式并按北京时间算下次时间。</div>
+          <div class="hint mt-3">Cron 在 Cloudflare 控制台 <b class="text-ink">Settings → Triggers → Cron Triggers</b> 配置，推荐 <code>10 0 * * *</code>（UTC）= 北京 08:10。Worker 读不到控制台里的 Cron 列表，所以第一次自动唤醒之前角标显示「待触发」；被唤醒一次之后会永久变成「已同步」。</div>
         </div>
       </div>
       <div class="card">
-        <div class="px-4 py-3 border-b border-rule"><h3 class="font-display text-[15px]">安全设计</h3></div>
+        <div class="px-4 py-3 border-b border-rule"><h3 class="panel-h">安全设计</h3></div>
         <div class="px-4 py-3">
-          <ul class="text-[12.5px] leading-relaxed text-ink2 space-y-1.5 list-disc pl-4">
+          <ul class="body-copy">
             <li>KV 里存的是 AES-256-GCM 密文，每条记录随机 salt 与 IV，密钥由 MASTER_KEY 经 HKDF-SHA256 派生。</li>
             <li>接口响应永远不返回令牌、Cookie、私钥，连前缀都不给。</li>
             <li>登录密码与账号凭证分离；口令比较走定长比较。</li>
@@ -4778,9 +5805,9 @@ const PAGE = `<!DOCTYPE html>
         </div>
       </div>
       <div class="card sm:col-span-2">
-        <div class="px-4 py-3 border-b border-rule"><h3 class="font-display text-[15px]">已知限制</h3></div>
+        <div class="px-4 py-3 border-b border-rule"><h3 class="panel-h">已知限制</h3></div>
         <div class="px-4 py-3">
-          <ul class="text-[12.5px] leading-relaxed text-ink2 space-y-1.5 list-disc pl-4">
+          <ul class="body-copy">
             <li>除 Trae / WorkBuddy 外，新平台协议按官方客户端/网页调用整理，接口可能随客户端升级变化。</li>
             <li>智谱签名盐默认已内置；如官方客户端更新导致签名失败，可用 <code>CHATGLM_SIGN_SECRET</code> 覆盖。</li>
             <li>WorkBuddy 国际版活动按档期开放，没档期时显示「无活动」，不是凭证失效。</li>
@@ -4815,7 +5842,7 @@ const PAGE = `<!DOCTYPE html>
           <div class="step-t" id="addTitle">添加账号</div>
           <div class="hint mb-2.5" id="addHint"></div>
           <div id="addBody"></div>
-          <div class="err mt-2.5" id="addErr"></div>
+          <div class="errbox mt-2.5" id="addErr"></div>
         </div>
       </div>
       <div class="tip mt-3"><b>昵称、域名会自动识别</b>，无需手动填写。只解析展示用信息，不读取手机号等隐私字段。</div>
@@ -4823,6 +5850,43 @@ const PAGE = `<!DOCTYPE html>
     <div class="modal-foot">
       <button class="btn-ghost" id="addCancel" onclick="closeAdd()">取消</button>
       <button class="btn-primary" id="addConfirm" onclick="submitAdd()">确认添加</button>
+    </div>
+  </div>
+</div>
+
+<!-- 签到结果通知 -->
+<div class="modal-mask" id="notifyModal">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>签到结果通知</h3>
+      <button class="modal-x" onclick="closeNotify()" title="关闭">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="tip mb-3">每轮全量签到跑完推一条汇总。两个渠道各自独立，都没配就静默跳过；发送失败不影响签到结果。</div>
+      <div class="sec-mini">Telegram</div>
+      <div class="fields mb-3">
+        <div class="field-row"><label class="lb">Bot Token</label><input id="tgToken" class="field" placeholder="123456:ABC..." autocomplete="off"></div>
+        <div class="field-row"><label class="lb">Chat ID</label><input id="tgChat" class="field" placeholder="123456789" autocomplete="off"></div>
+      </div>
+      <div class="sec-mini">QQ 官方机器人</div>
+      <div class="fields">
+        <div class="field-row"><label class="lb">AppID</label><input id="qqAppId" class="field" placeholder="102xxxxxx" autocomplete="off"></div>
+        <div class="field-row"><label class="lb">AppSecret</label><input id="qqSecret" class="field" type="password" placeholder="AppSecret" autocomplete="off"></div>
+        <div class="field-row"><label class="lb">OpenID <span class="hint">用下面的脚本取</span></label><input id="qqOpenid" class="field" placeholder="user_openid" autocomplete="off"></div>
+        <label class="lb flex items-center gap-2"><input id="qqSandbox" type="checkbox"> 沙箱环境（sandbox.api.sgroup.qq.com）</label>
+      </div>
+      <div class="tip mt-3">
+        取 OpenID：先把命令里的 AppID / AppSecret 换成你的，运行后在 60 秒内用手机 QQ 私聊机器人一次。
+        <div class="mt-1.5">Windows（cmd）：</div>
+        <div class="mt-1.5"><code id="oidCmdWin"></code></div>
+        <div class="mt-1.5">macOS / Linux：</div>
+        <div class="mt-1.5"><code id="oidCmdNix"></code></div>
+      </div>
+      <div class="errbox mt-2.5" id="notifyErr"></div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn-ghost" id="notifyTestBtn" onclick="testNotify(this)">发测试</button>
+      <button class="btn-primary" id="notifySaveBtn" onclick="saveNotify(this)">保存</button>
     </div>
   </div>
 </div>
@@ -4843,9 +5907,9 @@ const PAGE = `<!DOCTYPE html>
       </div>
 
       <div id="guide-start" class="guide-panel active">
-        <div class="step"><div class="step-n">1</div><div class="step-b"><div class="step-t">添加账号</div><p>点今日卡下方的「添加账号」，选择平台后按提示扫码或粘贴凭证。昵称和域名会自动识别。</p></div></div>
+        <div class="step"><div class="step-n">1</div><div class="step-b"><div class="step-t">添加账号</div><p>点队列上方的「添加账号」，选择平台后按提示扫码或粘贴凭证。昵称和域名会自动识别。</p></div></div>
         <div class="step"><div class="step-n">2</div><div class="step-b"><div class="step-t">设置定时</div><p>在 Cloudflare 控制台给 Worker 加 Cron Trigger：<code>10 0 * * *</code>（UTC）= 北京时间每天 08:10。所有平台会在一次触发里依次跑完。</p></div></div>
-        <div class="step"><div class="step-n">3</div><div class="step-b"><div class="step-t">看结果</div><p>今日卡上的日期戳、打孔条和账号状态都是按北京时间当天现算的。点账号行可以展开最近执行记录。</p></div></div>
+        <div class="step"><div class="step-n">3</div><div class="step-b"><div class="step-t">看结果</div><p>顶部状态条的日期、方块进度和账号状态都是按北京时间当天现算的。点账号行可以展开最近执行记录。</p></div></div>
         <div class="tip mt-3"><b>不用一直开页面</b>　定时任务跑在 Cloudflare，关掉浏览器照样执行；页面只用来查看和管理。</div>
       </div>
 
@@ -4857,21 +5921,21 @@ const PAGE = `<!DOCTYPE html>
       </div>
 
       <div id="guide-more" class="guide-panel">
-        <div class="text-[12.5px] leading-relaxed text-ink2 space-y-3">
-          <div><h4 class="text-[13px] font-semibold text-ink mb-1">WorkBuddy 国际版</h4><p>与国内版登录态不通用，账号是 Google / GitHub / X 授权的。点「用 Google / GitHub / X 登录」打开官方授权页，登录完自动入库；也可以粘贴 <code>access_token</code>。</p><p class="text-ink3">活动按档期开放。没有档期时领取接口返回 10001，页面显示「无活动」，不是凭证失效。</p></div>
-          <div><h4 class="text-[13px] font-semibold text-ink mb-1">智谱清言</h4><p>浏览器登录 <code>chatglm.cn</code> 后，从 Cookie 里取 <code>chatglm_token</code> 粘贴。签名盐已内置，开箱即用。</p></div>
-          <div><h4 class="text-[13px] font-semibold text-ink mb-1">讯飞 Loomy</h4><p>登录 Loomy 客户端或网页后，从请求头 / Cookie 里取 <code>token</code> 粘贴。签到是「每日额度池重置」，不是直接加积分。</p></div>
-          <div><h4 class="text-[13px] font-semibold text-ink mb-1">讯飞 AStudio</h4><p>两种方式：① 手机号 + 密码走讯飞 SSO 换会话（密码只用一次，不保存；若被要求滑块请改用 Cookie）；② 登录后 F12 复制完整 Cookie 粘贴。</p></div>
+        <div class="body-copy">
+          <div><h4>WorkBuddy 国际版</h4><p>与国内版登录态不通用，账号是 Google / GitHub / X 授权的。点「用 Google / GitHub / X 登录」打开官方授权页，登录完自动入库；也可以粘贴 <code>access_token</code>。</p><p>活动按档期开放。没有档期时领取接口返回 10001，页面显示「无活动」，不是凭证失效。</p></div>
+          <div><h4>智谱清言</h4><p>浏览器登录 <code>chatglm.cn</code> 后，从 Cookie 里取 <code>chatglm_token</code> 粘贴。签名盐已内置，开箱即用。</p></div>
+          <div><h4>讯飞 Loomy</h4><p>登录 Loomy 客户端或网页后，从请求头 / Cookie 里取 <code>token</code> 粘贴。签到是「每日额度池重置」，不是直接加积分。</p></div>
+          <div><h4>讯飞 AStudio</h4><p>两种方式：① 手机号 + 密码走讯飞 SSO 换会话（密码只用一次，不保存；若被要求滑块请改用 Cookie）；② 登录后 F12 复制完整 Cookie 粘贴。</p></div>
         </div>
         <div class="tip mt-3"><b>未验证标记</b>　智谱、Loomy、AStudio 按官方客户端/网页调用整理，尚未在 Worker 环境用真实账号跑通，页面上会标「未验证」。接口变动时可能需要跟进适配。</div>
       </div>
 
       <div id="guide-safe" class="guide-panel">
-        <div class="text-[12.5px] leading-relaxed text-ink2 space-y-3">
-          <div><h4 class="text-[13px] font-semibold text-ink mb-1">处理哪些信息</h4><p>仅处理完成签到所需的平台登录凭证、账号昵称 / ID，以及每次执行的时间、结果与获得积分。</p></div>
-          <div><h4 class="text-[13px] font-semibold text-ink mb-1">怎么保存</h4><p>全部保存在你自己的 Cloudflare KV 中，凭证用 AES-256-GCM 加密；不经过开发者或任何第三方服务器，也不提供对外数据输出通道。</p></div>
-          <div><h4 class="text-[13px] font-semibold text-ink mb-1">不会做什么</h4><ul class="list-disc pl-4 space-y-1"><li>不收集账号密码（AStudio 密码只在单次请求内存里换会话，不落盘）。</li><li>不读取聊天内容、通讯录、文件或平台上的其它业务数据。</li><li>不出售、共享、转让凭证或数据。</li></ul></div>
-          <div><h4 class="text-[13px] font-semibold text-ink mb-1">使用边界</h4><p>仅限本人账号，用于自动化完成本应手动完成的签到。请勿用于代签、账号共享、批量注册或违反平台服务条款的用途。</p></div>
+        <div class="body-copy">
+          <div><h4>处理哪些信息</h4><p>仅处理完成签到所需的平台登录凭证、账号昵称 / ID，以及每次执行的时间、结果与获得积分。</p></div>
+          <div><h4>怎么保存</h4><p>全部保存在你自己的 Cloudflare KV 中，凭证用 AES-256-GCM 加密；不经过开发者或任何第三方服务器，也不提供对外数据输出通道。</p></div>
+          <div><h4>不会做什么</h4><ul><li>不收集账号密码（AStudio 密码只在单次请求内存里换会话，不落盘）。</li><li>不读取聊天内容、通讯录、文件或平台上的其它业务数据。</li><li>不出售、共享、转让凭证或数据。</li></ul></div>
+          <div><h4>使用边界</h4><p>仅限本人账号，用于自动化完成本应手动完成的签到。请勿用于代签、账号共享、批量注册或违反平台服务条款的用途。</p></div>
         </div>
       </div>
     </div>
@@ -4888,6 +5952,7 @@ const PAGE = `<!DOCTYPE html>
   'use strict';
   var $ = function(sel){ return document.querySelector(sel); };
   var TOKEN_KEY = 'checkin-admin-token';
+  var THEME_KEY = 'checkin-theme';
   var TOKEN = '';
   var META = { platforms: [], cron: '08:10', nextRun: '' };
   var DATA = { accounts: [], stats: {}, platforms: [], errors: [] };
@@ -4898,6 +5963,7 @@ const PAGE = `<!DOCTYPE html>
   var TIMER = null;
   var WB_TIMER = null;
   var INTL_TIMER = null;
+  var QODER_TIMER = null;
 
   function esc(s){
     return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
@@ -4929,6 +5995,31 @@ const PAGE = `<!DOCTYPE html>
   function beijingNow(){ return new Date(Date.now() + 8 * 3600e3); }
   function pad2(n){ return n < 10 ? '0' + n : String(n); }
   var WEEK_CN = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
+  function themeApply(mode){
+    var root = document.documentElement;
+    if (mode === 'light') root.setAttribute('data-theme', 'light');
+    else root.removeAttribute('data-theme');
+    var btn = $('#themeBtn');
+    if (btn){
+      btn.textContent = mode === 'light' ? '夜间' : '浅色';
+      btn.title = mode === 'light' ? '切回深色值班台' : '切到浅色白日班';
+    }
+  }
+  function themeCurrent(){
+    return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
+  }
+  function toggleTheme(){
+    var next = themeCurrent() === 'light' ? 'dark' : 'light';
+    themeApply(next);
+    try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
+  }
+  (function themeBoot(){
+    var saved = null;
+    try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
+    if (saved === 'light' || saved === 'dark'){ themeApply(saved); return; }
+    /* 无本地选择：沿用头部内联脚本按系统偏好定下的调，只补按钮文案 */
+    themeApply(themeCurrent());
+  })();
   function accentClass(a){
     return 'p-' + ((a && a.accent) || 'gray');
   }
@@ -4942,6 +6033,22 @@ const PAGE = `<!DOCTYPE html>
       if (DATA.platforms[j].key === k) return DATA.platforms[j].label;
     }
     return k || '';
+  }
+
+  function platCreditHint(key){
+    var aliases = { wb: 'workbuddy', wbi: 'workbuddy_intl' };
+    var k = aliases[key] || key;
+    for (var i = 0; i < META.platforms.length; i++){
+      if (META.platforms[i].key === k) return META.platforms[i].creditHint || '';
+    }
+    return '';
+  }
+  /** 积分列：有真余额显示余额，否则退回本期累计并说明口径 */
+  function balanceCell(a){
+    var hint = platCreditHint(a.platform);
+    if (typeof a.credits === 'number') return { text: fmtNum(a.credits), tip: hint || '当前余额' };
+    if (typeof a.total === 'number') return { text: fmtNum(a.total), tip: hint || '本期累计，不是余额' };
+    return { text: '—', tip: '该平台不返回余额，只看今日一列' };
   }
 
   function api(path, opts){
@@ -5059,17 +6166,17 @@ const PAGE = `<!DOCTYPE html>
     });
   }
 
-  /* ---------------- 今日卡 ---------------- */
+  /* ---------------- 值班状态条 ---------------- */
   function renderStamp(){
     var d = beijingNow();
-    $('#stampDate').textContent = pad2(d.getUTCMonth() + 1) + ' 月 ' + pad2(d.getUTCDate()) + ' 日';
-    $('#stampWeek').textContent = WEEK_CN[d.getUTCDay()] + ' · 北京时间 UTC+8';
+    $('#stampDate').textContent = d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate());
+    $('#stampWeek').textContent = WEEK_CN[d.getUTCDay()] + ' · 北京时间';
   }
   function renderPunch(list, now){
     var box = $('#punchStrip');
     if (!list.length){ box.innerHTML = '<i class="offd"></i>'; return; }
     var html = '';
-    var shown = Math.min(list.length, 60);
+    var shown = Math.min(list.length, 80);
     for (var i = 0; i < shown; i++){
       var st = statusOf(list[i], now);
       var cls = st.cls === 'ok' ? 'done'
@@ -5096,14 +6203,26 @@ const PAGE = `<!DOCTYPE html>
     $('#kpiSigned').textContent = fmtNum(s.totalSigned || 0);
     var crons = DATA.crons || META.crons || [];
     var cronText = DATA.cron || META.cron || '08:10';
+    var cronConfigured = DATA.cronConfigured != null ? DATA.cronConfigured : (META.cronConfigured != null ? META.cronConfigured : null);
     $('#kpiNext').textContent = DATA.nextRun || META.nextRun || '—';
-    $('#kpiCron').textContent = crons.length ? ('UTC ' + crons.join(' / ')) : ('每天 ' + cronText);
+    $('#kpiCron').textContent = crons.length
+      ? ('Cron Trigger · UTC ' + crons.join(' / '))
+      : (cronConfigured === false ? '未声明排班' : ('CHECKIN_CRON · 每天 ' + cronText));
     var badge = $('#schedBadge');
-    badge.className = 'badge ' + (crons.length ? 'ok' : 'warn');
-    badge.textContent = crons.length
-      ? ('定时 ' + (crons.length > 1 ? crons.length + ' 条' : '已同步'))
-      : ('定时未配置 ' + cronText);
-    badge.title = crons.length ? ('已自动识别的 Cloudflare Cron（UTC）：' + crons.join(' / ')) : '在 Cloudflare 控制台配置 Cron Triggers';
+    if (crons.length){
+      badge.className = 'badge ok';
+      badge.textContent = '定时 ' + (crons.length > 1 ? crons.length + ' 条' : '已同步');
+      badge.title = 'Worker 已被 Cloudflare 唤醒过，识别到的 Cron（UTC）：' + crons.join(' / ');
+    } else if (cronConfigured === false){
+      badge.className = 'badge err';
+      badge.textContent = '定时 未配置';
+      badge.title = '后台既没有 Cron Triggers，也没有 CHECKIN_CRON 变量：签到只能手动触发。';
+    } else {
+      badge.className = 'badge warn';
+      badge.textContent = '定时 待触发 ' + cronText;
+      badge.title = '排班已声明（CHECKIN_CRON=' + cronText + '），但 Worker 读不到 Cloudflare 的 Cron 列表；'
+        + '第一次自动唤醒后这里会自动变成「已同步」。北京时间 ' + cronText + ' 前后打开本页即可确认。';
+    }
     var plats = {};
     list.forEach(function(a){ plats[a.platform] = 1; });
     var pn = Object.keys(plats).length;
@@ -5116,38 +6235,74 @@ const PAGE = `<!DOCTYPE html>
     renderPunch(list, now);
   }
 
-  /* ---------------- 账号登记簿 ---------------- */
+  /* ---------------- 账号队列 ---------------- */
   function statusOf(a, now){
-    if (a.enabled === false) return { cls: 'off', text: '已停用', stamp: false };
-    if (a.signedToday) return { cls: 'ok', text: '已签', stamp: true };
+    if (a.enabled === false) return { cls: 'off', text: '已停用', tip: '开关关掉了，定时任务会跳过这个账号' };
+    if (a.signedToday) return { cls: 'ok', text: '今日已签', tip: '今天已经签到成功，重复点不会多领' };
     if (a.cooldownUntil && a.cooldownUntil > now){
-      return { cls: 'warn', text: '限流 ' + Math.ceil((a.cooldownUntil - now) / 60000) + ' 分钟', stamp: false };
+      return { cls: 'warn', text: '限流 ' + Math.ceil((a.cooldownUntil - now) / 60000) + ' 分钟', tip: '平台返回过频，冷却结束后自动恢复' };
     }
-    if (a.lastState === 'token_dead') return { cls: 'err', text: '令牌失效', stamp: false };
-    if (a.lastState === 'no_activity' && a.ranToday) return { cls: 'idle', text: '无活动', stamp: false };
-    if (a.lastState === 'pending' && a.ranToday) return { cls: 'warn', text: '待确认', stamp: false };
-    if (a.lastState === 'error' && a.ranToday) return { cls: 'err', text: '失败', stamp: false };
-    if (a.lastState === 'rate') return { cls: 'warn', text: '限流', stamp: false };
-    return { cls: 'idle', text: '待签', stamp: false };
+    if (a.lastState === 'token_dead') return { cls: 'err', text: '令牌失效', tip: '需要重新扫码或重新粘贴凭证，自动签到救不回来' };
+    if (a.lastState === 'no_activity' && a.ranToday) return { cls: 'idle', text: '无活动', tip: '今天跑过：本期没有可签的活动，属于正常状态' };
+    if (a.lastState === 'pending' && a.ranToday) return { cls: 'warn', text: '待确认', tip: '平台返回了不确定的结果，下一次运行会重新判定' };
+    if (a.lastState === 'error' && a.ranToday) return { cls: 'err', text: '失败', tip: a.lastMsg ? String(a.lastMsg) : '今天执行失败，详情见展开的最近执行' };
+    if (a.lastState === 'rate') return { cls: 'warn', text: '限流', tip: '平台侧限流，稍后自动重试' };
+    return { cls: 'idle', text: '待签', tip: a.ranToday ? '今天已尝试，未成功' : '今天还没有执行，到点自动签到' };
   }
   function todayGain(a){
-    if (a.signedToday && typeof a.lastCredit === 'number') return '+' + fmtNum(a.lastCredit);
-    if (a.lastState === 'no_activity' && a.ranToday) return '无';
-    return '—';
-  }
-  function streakText(a){
-    if (a.streak == null) return '—';
-    return fmtNum(a.streak) + ' 天';
-  }
-  function credHtml(ms, now, kind){
-    if (!ms) return '<span class="v-none">—</span>';
-    var t = Number(ms);
-    if (!isFinite(t) || t <= 0) return '<span class="v-none">—</span>';
-    if (t < now) return kind === 'access' ? '<span class="v-warn">可续期</span>' : '<span class="v-bad">已过期</span>';
-    if (t - now < 7 * 86400e3){
-      return '<span class="v-warn">' + Math.max(1, Math.ceil((t - now) / 86400e3)) + ' 天后</span>';
+    if (a.signedToday){
+      if (typeof a.lastCredit === 'number'){
+        return { text: '+' + fmtNum(a.lastCredit), cls: 'v-up', tip: '今天已签到，本次到手 ' + fmtNum(a.lastCredit) + ' 分' };
+      }
+      return { text: '已领', cls: 'v-up', tip: '今天已签到；这个平台的接口不回传本次积分，所以只记状态不记数字' };
     }
-    return esc(dateText(t));
+    if (a.lastState === 'no_activity' && a.ranToday){
+      return { text: '无活动', cls: 'v-none', tip: '今天跑过：本期没有可领的积分，不是失败' };
+    }
+    if (a.lastState === 'token_dead'){
+      return { text: '需重登', cls: 'v-bad', tip: '令牌已失效，重新授权后才能领今天的积分' };
+    }
+    return { text: '—', cls: 'v-none', tip: a.ranToday ? '今天跑过，没有拿到积分' : '今天还没执行' };
+  }
+  function streakCell(a){
+    if (a.streak != null){
+      return { text: fmtNum(a.streak) + ' 天', cls: 'v-day', tip: '连续成功签到天数，中断一天会重新开始' };
+    }
+    if (a.lastOkDate){
+      return { text: '—', cls: 'v-none', tip: '最近成功：' + esc(a.lastOkDate) + '；该平台不返回连续天数，本地统计从下一次签到开始累计' };
+    }
+    return { text: '—', cls: 'v-none', tip: '还没有成功签到过' };
+  }
+  function credCell(ms, now, kind){
+    if (!ms) return { text: '未上报', cls: 'v-none', tip: '这类凭证不带过期时间：除非平台强制下线或你重新粘贴，一直可用' };
+    var t = Number(ms);
+    if (!isFinite(t) || t <= 0) return { text: '未上报', cls: 'v-none', tip: '这类凭证不带过期时间：除非平台强制下线或你重新粘贴，一直可用' };
+    if (t < now){
+      return kind === 'access'
+        ? { text: '可续期', cls: 'v-warn', tip: dateText(t) + ' 访问令牌到期；刷新令牌还在，重新扫码或重新授权即可续期' }
+        : { text: '已过期', cls: 'v-bad', tip: dateText(t) + ' 凭证到期，签到会失败，需要重新添加' };
+    }
+    if (t - now < 7 * 86400e3){
+      return { text: Math.max(1, Math.ceil((t - now) / 86400e3)) + ' 天后', cls: 'v-warn', tip: '凭证将在 ' + dateText(t) + ' 到期，提前重新授权' };
+    }
+    return { text: esc(dateText(t)), cls: 'v-date', tip: '凭证到期日 ' + dateText(t) };
+  }
+  /* 最近 7 次执行结果：一格一次，左旧右新 */
+  function runStrip(a){
+    var rows = [];
+    for (var i = 0; i < HISTORY.length && rows.length < 7; i++){
+      var h = HISTORY[i];
+      if (h.platform === a.platform && h.id === a.id) rows.push(h);
+    }
+    var cells = rows.map(function(h){
+      var st = histState(h.state);
+      var cls = st[0] === 'ok' ? 'on' : (st[0] === 'err' ? 'bad' : (st[0] === 'warn' ? 'warn' : (st[0] === 'idle' ? 'mute' : '')));
+      var tip = shortTime(h.at) + ' · ' + st[1] + (h.msg ? ' · ' + h.msg : '');
+      return '<b' + (cls ? ' class="' + cls + '"' : '') + ' title="' + esc(tip) + '">█</b>';
+    }).reverse();
+    var pad = '';
+    for (var k = cells.length; k < 7; k++) pad += '<b>·</b>';
+    return '<span class="week">' + pad + cells.join('') + '</span>';
   }
 
   function detailHtml(a, st){
@@ -5189,40 +6344,42 @@ const PAGE = `<!DOCTYPE html>
       openKeys[r.getAttribute('data-platform') + '|' + r.getAttribute('data-id')] = true;
     });
     if (!list.length){
-      box.innerHTML = '<div class="at-wrap"><div class="empty">登记簿还是空的。点上方「添加账号」，扫码或粘一次凭证就能托管。</div></div>';
+      box.innerHTML = '<div class="at-wrap"><div class="empty">队列还是空的。点上方「添加账号」，扫码或粘一次凭证就能托管。</div></div>';
       return;
     }
     var now = Date.now();
-    var html = '<div class="at-wrap"><table class="at"><colgroup><col><col><col><col><col><col><col></colgroup>'
-      + '<thead><tr><th>账号</th><th class="num">积分</th><th class="num">今日</th><th class="num">连续</th><th>凭证</th><th>状态</th><th class="act"></th></tr></thead><tbody>';
+    var html = '<div class="at-wrap"><table class="at acct">'
+      + '<thead><tr><th>账号</th><th class="num">积分</th><th class="num">今日</th><th class="num">连续</th>'
+      + '<th title="最近 7 次执行，一格一次，左边最早：绿=拿到积分 灰=执行但无变化 黄=限流/冷却 红=失败 ·=未执行">近 7 次</th><th>凭证</th><th>状态</th><th class="act"></th></tr></thead><tbody>';
     for (var i = 0; i < list.length; i++){
       var a = list[i];
       var st = statusOf(a, now);
       var cls = accentClass(a);
       var off = a.enabled === false;
-      var mark = st.stamp
-        ? '<span class="stamp">' + esc(st.text) + '</span>'
-        : '<span class="badge ' + st.cls + '">' + esc(st.text) + '</span>';
       var gain = todayGain(a);
+      var day = streakCell(a);
+      var cred = credCell(a.credExp, now, a.credKind);
+      var bal = balanceCell(a);
       html += '<tr class="ar ' + cls + (off ? ' st-off' : '') + '" data-platform="' + esc(a.platform) + '" data-id="' + esc(a.id) + '" onclick="toggleDetail(this,event)">'
         + '<td class="cell-acct">'
         +   '<div class="avatar"><span>' + esc(firstChar(a.label)) + '</span><i class="dot"></i></div>'
         +   '<div class="nm2">' + esc(a.label || '未命名') + '</div>'
         +   '<span class="plat-tag">' + esc(a.platformLabel || platformLabel(a.platform)) + '</span>'
-        +   (a.verified ? '' : '<span class="badge none nodot">未验证</span>')
+        +   (a.verified ? '' : '<span class="badge none nodot" title="还没成功跑过一次，凭证有效性未知">未验证</span>')
         + '</td>'
-        + '<td class="num v-cred">' + fmtNum(a.credits) + '</td>'
-        + '<td class="num ' + (gain.charAt(0) === '+' ? 'v-up' : 'v-none') + '">' + gain + '</td>'
-        + '<td class="num v-day">' + streakText(a) + '</td>'
-        + '<td class="v-date">' + credHtml(a.credExp, now, a.credKind) + '</td>'
-        + '<td>' + mark + '</td>'
+        + '<td class="num v-cred" title="' + esc(bal.tip) + '">' + bal.text + '</td>'
+        + '<td class="num ' + gain.cls + '" title="' + esc(gain.tip) + '">' + gain.text + '</td>'
+        + '<td class="num ' + day.cls + '" title="' + esc(day.tip) + '">' + day.text + '</td>'
+        + '<td>' + runStrip(a) + '</td>'
+        + '<td class="' + cred.cls + '" title="' + esc(cred.tip) + '">' + cred.text + '</td>'
+        + '<td><span class="badge ' + st.cls + '" title="' + esc(st.tip) + '">' + esc(st.text) + '</span></td>'
         + '<td class="act"><div class="col-act">'
-        +   '<label class="switch" onclick="event.stopPropagation()" title="启用 / 停用"><input type="checkbox" ' + (off ? '' : 'checked') + ' onchange="toggleEnable(this,\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\')"><span class="track"></span></label>'
+        +   '<label class="switch" onclick="event.stopPropagation()" title="' + (off ? '启用这个账号' : '停用这个账号') + '"><input type="checkbox" ' + (off ? '' : 'checked') + ' onchange="toggleEnable(this,\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\')"><span class="track"></span></label>'
         +   '<button class="btn-sign" ' + (off ? 'disabled title="账号已停用"' : '') + ' onclick="event.stopPropagation();signOne(\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\',this)">签到</button>'
         +   '<span class="chev2">›</span>'
         + '</div></td>'
         + '</tr>'
-        + '<tr class="ar-detail ' + cls + '" data-detail="' + esc(a.platform) + '|' + esc(a.id) + '"><td colspan="7">' + detailHtml(a, st) + '</td></tr>';
+        + '<tr class="ar-detail ' + cls + '" data-detail="' + esc(a.platform) + '|' + esc(a.id) + '"><td colspan="8">' + detailHtml(a, st) + '</td></tr>';
     }
     html += '</tbody></table></div>';
     box.innerHTML = html;
@@ -5588,6 +6745,13 @@ const PAGE = `<!DOCTYPE html>
       return;
     }
 
+    if (meta.addMode === 'device'){
+      body.innerHTML = authBlock('Qoder 官网授权', '点下面按钮打开官方授权页，登录并确认授权。Worker 轮询到结果后自动入库，窗口自动关闭。', '打开授权页', 'startQoder(this)');
+      confirm.style.display = 'none';
+      cancel.textContent = '关闭';
+      return;
+    }
+
     if (meta.addMode === 'oauth'){
       body.innerHTML = authBlock('一键网页授权', '打开官方授权页，用 Google / GitHub / X 登录。登录完成后这里会自动识别并入库。', '用 Google / GitHub 登录', 'startIntl(this)')
         + '<div class="divider">或粘贴令牌</div>'
@@ -5750,6 +6914,55 @@ const PAGE = `<!DOCTYPE html>
       .then(function(){ if (btn) btn.disabled = false; });
   }
 
+  function stopQoderTimer(){ if (QODER_TIMER){ clearInterval(QODER_TIMER); QODER_TIMER = null; } }
+  function startQoder(btn){
+    stopQoderTimer();
+    if (btn){ btn.disabled = true; }
+    var win = window.open('about:blank', 'qoder-login', 'width=680,height=900');
+    api('/qoder/api/login/start', { method: 'POST', body: '{}' })
+      .then(function(d){
+        var opened = false;
+        if (win && !win.closed){
+          try { win.location.href = d.authUrl; opened = true; } catch (e) { opened = false; }
+        }
+        if (opened){
+          showAddMsg('已打开授权页，登录后回到这里会自动保存账号。');
+        } else {
+          showAddLink(d.authUrl);
+        }
+        var n = 0;
+        QODER_TIMER = setInterval(function(){
+          if (n++ > 150){
+            stopQoderTimer();
+            showAddMsg('授权已超时，请关闭弹窗后重试', 'err');
+            return;
+          }
+          api('/qoder/api/login/poll?nonce=' + encodeURIComponent(d.nonce))
+            .then(function(r){
+              if (r.ok){
+                stopQoderTimer();
+                if (win && !win.closed){ try { win.close(); } catch (e) {} }
+                toast('登录成功：' + ((r.account && r.account.label) || ''), 'ok');
+                closeAdd();
+                loadAll();
+              } else if (!r.pending){
+                stopQoderTimer();
+                showAddMsg(r.error || '授权会话已过期，请重试', 'err');
+              }
+            })
+            .catch(function(e){
+              stopQoderTimer();
+              showAddMsg(e.message || e, 'err');
+            });
+        }, 2500);
+      })
+      .catch(function(e){
+        if (win && !win.closed){ try { win.close(); } catch (err) {} }
+        showAddMsg(e.message || e, 'err');
+      })
+      .then(function(){ if (btn) btn.disabled = false; });
+  }
+
   function stopIntlTimer(){ if (INTL_TIMER){ clearInterval(INTL_TIMER); INTL_TIMER = null; } }
   function startIntl(btn){
     stopIntlTimer();
@@ -5827,6 +7040,69 @@ const PAGE = `<!DOCTYPE html>
   }
 
   /* ---------------- 教程 ---------------- */
+  /* ---------------- 通知设置 ---------------- */
+  function openNotify(){
+    $('#notifyModal').classList.add('show');
+    $('#notifyErr').textContent = '';
+    var origin = location.origin;
+    var tail = 'openid-helper.mjs <AppID> <AppSecret>';
+    $('#oidCmdWin').textContent = 'curl.exe -O ' + origin + '/qq/' + tail;
+    $('#oidCmdNix').textContent = 'curl -O ' + origin + '/qq/' + tail;
+    api('/api/notify').then(function(d){
+      var c = d.config || {};
+      var tg = c.telegram || {};
+      var qq = c.qq || {};
+      $('#tgToken').value = tg.token || '';
+      $('#tgChat').value = tg.chatId || '';
+      $('#qqAppId').value = qq.appId || '';
+      $('#qqSecret').value = qq.appSecret || '';
+      $('#qqOpenid').value = qq.openid || '';
+      $('#qqSandbox').checked = !!qq.sandbox;
+    }).catch(function(e){
+      $('#notifyErr').textContent = e.message || String(e);
+    });
+  }
+  function closeNotify(){ $('#notifyModal').classList.remove('show'); }
+  function notifyPayload(){
+    return {
+      telegram: {
+        token: $('#tgToken').value.trim(),
+        chatId: $('#tgChat').value.trim()
+      },
+      qq: {
+        appId: $('#qqAppId').value.trim(),
+        appSecret: $('#qqSecret').value.trim(),
+        openid: $('#qqOpenid').value.trim(),
+        sandbox: $('#qqSandbox').checked
+      }
+    };
+  }
+  function saveNotify(btn){
+    if (btn) btn.disabled = true;
+    $('#notifyErr').textContent = '';
+    api('/api/notify', { method: 'POST', body: JSON.stringify(notifyPayload()) })
+      .then(function(){
+        toast('通知配置已保存', 'ok');
+      })
+      .catch(function(e){
+        $('#notifyErr').textContent = e.message || String(e);
+      })
+      .then(function(){ if (btn) btn.disabled = false; });
+  }
+  function testNotify(btn){
+    if (btn) btn.disabled = true;
+    $('#notifyErr').textContent = '';
+    api('/api/notify/test', { method: 'POST', body: '{}' })
+      .then(function(d){
+        var r = d.result || {};
+        toast('Telegram：' + (r.telegram || '—') + ' · QQ：' + (r.qq || '—'), 'ok');
+      })
+      .catch(function(e){
+        $('#notifyErr').textContent = e.message || String(e);
+      })
+      .then(function(){ if (btn) btn.disabled = false; });
+  }
+
   function openGuide(){
     $('#guideModal').classList.add('show');
     switchGuide('start', document.querySelector('#guideTabs .tab'));
@@ -5846,23 +7122,41 @@ const PAGE = `<!DOCTYPE html>
   $('#loginBtn').onclick = function(){ login($('#pwd').value, false); };
   $('#pwd').onkeydown = function(e){ if (e.key === 'Enter') login($('#pwd').value, false); };
   document.addEventListener('keydown', function(e){
-    if (e.key !== 'Escape') return;
-    if ($('#addModal').classList.contains('show')) closeAdd();
-    else if ($('#guideModal').classList.contains('show')) closeGuide();
+    if (e.key === 'Escape'){
+      if ($('#addModal').classList.contains('show')) closeAdd();
+      else if ($('#guideModal').classList.contains('show')) closeGuide();
+      return;
+    }
+    var app = $('#appView');
+    if (!app || app.hidden) return;
+    if ($('#addModal').classList.contains('show') || $('#guideModal').classList.contains('show')) return;
+    var tag = (e.target && e.target.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.ctrlKey || e.metaKey || e.altKey) return;
+    var keys = { '1': 'accounts', '2': 'history', '3': 'about' };
+    var name = keys[e.key];
+    if (!name) return;
+    var btn = document.querySelector('.tab[data-tab="' + name + '"]');
+    if (btn) switchTab(name, btn);
   });
   document.querySelectorAll('.modal-mask').forEach(function(mask){
     mask.addEventListener('click', function(e){
       if (e.target !== mask) return;
       if (mask.id === 'addModal') closeAdd();
       if (mask.id === 'guideModal') closeGuide();
+      if (mask.id === 'notifyModal') closeNotify();
     });
   });
 
   /* 页面里大量使用内联 onclick，必须把入口函数挂到 window 上 */
   window.openGuide = openGuide;
   window.closeGuide = closeGuide;
+  window.openNotify = openNotify;
+  window.closeNotify = closeNotify;
+  window.saveNotify = saveNotify;
+  window.testNotify = testNotify;
   window.switchGuide = switchGuide;
   window.switchTab = switchTab;
+  window.toggleTheme = toggleTheme;
   window.openAdd = openAdd;
   window.closeAdd = closeAdd;
   window.pickPlatform = pickPlatform;
