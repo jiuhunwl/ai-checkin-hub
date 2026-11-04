@@ -2845,7 +2845,8 @@ function authHeaders(at, acct, extra) {
 }
 
 function qFetch(region, path, { method = 'GET', headers = {}, body } = {}) {
-  return SH.httpJson(REGIONS[region].api + path, {
+  const reg = typeof region === 'string' ? REGIONS[normRegion(region)] : (region || REGIONS.cn);
+  return SH.httpJson(reg.api + path, {
     method,
     headers,
     body: method === 'GET' ? undefined : JSON.stringify(body || {}),
@@ -3116,20 +3117,22 @@ async function inspectCampaigns(env, id) {
     if (at) {
       for (const [name, qs] of [['campaigns+force', '?forceRefresh=true'], ['campaigns', '']]) {
         try {
-          const r = await qFetch(EP.campaigns + qs, { headers: authHeaders(at, acct) });
+          const r = await qFetch(regionOf(acct), EP.campaigns + qs, { headers: authHeaders(at, acct) });
           const rows = campaignRows(r.json);
-          const picked = pickCampaign(rows);
+          const plan = classifyCampaigns(r.json, Date.now());
           calls.push({
             name,
             status: r.status,
             code: r.json?.code ?? null,
             msg: r.json?.msg ?? r.json?.message ?? '',
             rows: rows.length,
-            picked: {
-              target: picked.target ? { id: idOf(picked.target), status: statusOf(picked.target), action: actionOf(picked.target) } : null,
-              claimedBenefit: picked.claimedBenefit,
-              onlyMarketing: picked.onlyMarketing,
-              total: picked.total,
+            plan: {
+              kind: plan.kind,
+              target: plan.target ? { id: idOf(plan.target), status: statusOf(plan.target), action: actionOf(plan.target) } : null,
+              reason: plan.reason || '',
+              retryAt: plan.retryAt || null,
+              total: plan.total,
+              seen: plan.seen || '',
             },
             sample: rows.slice(0, 6).map((x) => ({
               id: idOf(x),
@@ -3198,23 +3201,18 @@ async function signinOne(env, acct, { force = false } = {}) {
     return { ...base, state: 'error', msg: acct.lastMsg };
   }
 
-  const picked = pickCampaign(campaignRows(listRes.json));
-  if (!picked.target) {
-    const state = picked.claimedBenefit ? 'already' : 'no_activity';
+  const plan = classifyCampaigns(listRes.json, now);
+  if (plan.kind !== 'claim') {
+    const state = plan.kind === 'already' ? 'already' : 'no_activity';
     acct.lastState = state;
-    acct.lastMsg = picked.claimedBenefit
-      ? '今日已领取'
-      : picked.onlyMarketing
-        ? '今日没有签到活动，只有营销活动'
-        : picked.total
-          ? '活动列表里没有可领项'
-          : '接口没返回任何活动';
-    if (picked.claimedBenefit) acct.lastOkDate = today;
+    acct.lastMsg = plan.kind === 'already' ? '今日已领取' : plan.reason || '暂无可领活动';
+    if (plan.kind === 'already') acct.lastOkDate = today;
+    if (plan.kind === 'future' && plan.retryAt) acct.nextWindowAt = plan.retryAt;
     await putAccount(env, acct);
     return { ...base, state, msg: acct.lastMsg };
   }
 
-  const campaignId = idOf(picked.target);
+  const campaignId = idOf(plan.target);
   let claimRes;
   try {
     claimRes = await claimCampaign(acct, campaignId);
@@ -3226,11 +3224,11 @@ async function signinOne(env, acct, { force = false } = {}) {
   }
 
   const body = claimRes.json || {};
+  // 注意：领取成功也会返回 status=CLAIMED，只有 409 / ALREADY_CLAIMED / replayed 才算已领
   const already =
     claimRes.status === 409 ||
     String(body.result || '').toUpperCase() === 'ALREADY_CLAIMED' ||
-    body.replayed === true ||
-    CLAIMED_RE.test(String(body.status || ''));
+    body.replayed === true;
 
   if (already) {
     acct.lastState = 'already';
@@ -3247,7 +3245,7 @@ async function signinOne(env, acct, { force = false } = {}) {
     return { ...base, state: 'error', msg: acct.lastMsg };
   }
 
-  const points = amountOf(body) ?? amountOf(picked.target);
+  const points = amountOf(body) ?? amountOf(plan.target);
   const claimed = !body.status || CLAIMED_RE.test(String(body.status));
   acct.lastRun = now;
   acct.cooldownUntil = 0;
@@ -3286,8 +3284,8 @@ async function refreshOne(env, id) {
       return publicView(acct, now, today);
     }
     if (r.status < 400) {
-      const picked = pickCampaign(campaignRows(r.json));
-      if (picked.claimedBenefit) {
+      const plan = classifyCampaigns(r.json, now);
+      if (plan.kind === 'already') {
         acct.lastOkDate = today;
         if (acct.lastState !== 'checked') {
           acct.lastState = 'already';
@@ -3327,6 +3325,8 @@ function publicView(a, now, today) {
     signedToday: a.lastOkDate === today,
     ranToday: a.lastRun ? SH.bjDay(a.lastRun) === today : false,
     platform: 'qoder',
+    region: normRegion(a.region),
+    regionLabel: REGIONS[normRegion(a.region)].label,
   };
 }
 
@@ -3379,6 +3379,7 @@ async function add(env, { creds = {}, label = '' } = {}) {
     refreshToken,
     machineId: String(creds.machine_id || '').trim(),
     uid: String(creds.uid || '').trim(),
+    region: normRegion(creds.region),
     createdAt: Date.now(),
     lastState: 'new',
     lastMsg: '尚未运行',
@@ -3442,13 +3443,14 @@ const __mod = {
         }
       }
       if (path === '/api/login/start' && method === 'POST') {
-        const s = await loginStart();
+        const body = await readBody(request);
+        const s = await loginStart(body.region);
         await env.PLATFORM_KV.put(
           loginKey(s.nonce),
-          await vault.seal(env, { verifier: s.verifier, machineId: s.machineId, at: Date.now() }),
+          await vault.seal(env, { verifier: s.verifier, machineId: s.machineId, region: s.region, at: Date.now() }),
           { expirationTtl: LOGIN_TTL }
         );
-        return json({ ok: true, nonce: s.nonce, authUrl: s.authUrl, expiresIn: LOGIN_TTL });
+        return json({ ok: true, nonce: s.nonce, authUrl: s.authUrl, region: s.region, expiresIn: LOGIN_TTL });
       }
       if (path === '/api/login/poll' && method === 'GET') {
         const nonce = String(url.searchParams.get('nonce') || '').trim();
@@ -3456,7 +3458,7 @@ const __mod = {
         const raw = await env.PLATFORM_KV.get(loginKey(nonce));
         if (!raw) return json({ error: '授权会话已过期，请重新点「添加账号」' }, 400);
         const sess = await vault.open(env, raw);
-        const got = await loginPoll(nonce, sess.verifier);
+        const got = await loginPoll(sess.region, nonce, sess.verifier);
         if (got.pending) return json({ pending: true });
         if (got.error) return json({ error: got.error }, 502);
         const acct = {
@@ -3466,6 +3468,7 @@ const __mod = {
           refreshToken: got.refreshToken,
           machineId: sess.machineId,
           uid: got.uid,
+          region: normRegion(sess.region),
           createdAt: Date.now(),
           lastState: 'new',
           lastMsg: '尚未运行',
@@ -5034,7 +5037,7 @@ const QODER_META = {
   supportsRefresh: true,
   fields: [],
   hint: '点「添加账号」打开官方授权页，登录并确认后自动入库。',
-  note: '领取到的是 credits，累计值由本工具自己记账，接口不返回余额。',
+  note: '国内版签到档期已结束；每日 credits 在国际版，每天 10:00 开窗，一窗一次。',
 };
 
 const PLATFORMS = [
@@ -7152,7 +7155,10 @@ body{font-size:13.5px;letter-spacing:.005em}
     }
 
     if (meta.addMode === 'device'){
-      body.innerHTML = authBlock('Qoder 官网授权', '点下面按钮打开官方授权页，登录并确认授权。Worker 轮询到结果后自动入库，窗口自动关闭。', '打开授权页', 'startQoder(this)');
+      body.innerHTML = authBlock('Qoder 官网授权', '选择版本后打开官方授权页，登录并确认授权。Worker 轮询到结果后自动入库，窗口自动关闭。', '打开国内版授权页', 'startQoder(this,\\'cn\\')')
+        + '<div class="divider">或</div>'
+        + '<button class="btn-ghost" onclick="startQoder(this,\\'intl\\')">打开国际版授权页</button>'
+        + '<div class="hint mt-2">国内版签到档期已结束；每日 credits 在国际版，每天 10:00 开窗，一窗一次。</div>';
       confirm.style.display = 'none';
       cancel.textContent = '关闭';
       return;
@@ -7321,11 +7327,11 @@ body{font-size:13.5px;letter-spacing:.005em}
   }
 
   function stopQoderTimer(){ if (QODER_TIMER){ clearInterval(QODER_TIMER); QODER_TIMER = null; } }
-  function startQoder(btn){
+  function startQoder(btn, region){
     stopQoderTimer();
     if (btn){ btn.disabled = true; }
     var win = window.open('about:blank', 'qoder-login', 'width=680,height=900');
-    api('/qoder/api/login/start', { method: 'POST', body: '{}' })
+    api('/qoder/api/login/start', { method: 'POST', body: JSON.stringify({ region: region || 'cn' }) })
       .then(function(d){
         var opened = false;
         if (win && !win.closed){
