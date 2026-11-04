@@ -2116,9 +2116,9 @@ async function checkinStatus(at) {
 }
 
 /**
- * 真实剩余积分：把资源包里没花完的额度加起来。
- * 每次签到/活动发的是一个独立资源包，包到期没用完就归零，
- * 所以剩余只能按包汇总，不能用「签到累计 − 已用」倒推。
+ * 真实剩余积分：按资源包的「当前周期剩余」汇总。
+ * CapacityRemain 是跨周期总量，官方客户端看的是 CycleCapacityRemain（本周期），
+ * 两者会差出一截，别混用；只有缺周期字段时才退回总量字段。
  */
 async function fetchBalance(at) {
   const { json } = await wbFetch('/v2/billing/meter/get-user-resource', { headers: authHeader(at) });
@@ -2129,9 +2129,8 @@ async function fetchBalance(at) {
   const num = (v) => (typeof v === 'number' ? v : Number(v) || 0);
   let remain = 0;
   for (const a of rows) {
-    remain += num(
-      a.CapacityRemainPrecise ?? a.CycleCapacityRemainPrecise ?? a.CapacityRemain ?? a.CycleCapacityRemain
-    );
+    const cycle = a.CycleCapacityRemainPrecise ?? a.CycleCapacityRemain;
+    remain += cycle != null && cycle !== '' ? num(cycle) : num(a.CapacityRemainPrecise ?? a.CapacityRemain);
   }
   return {
     credits: Math.round(remain * 100) / 100,
@@ -2708,7 +2707,7 @@ return {
 };
 })();
 /* ================================================================== */
-/* 平台七：Qoder 国内版（qoder.com.cn）                                 */
+/* 平台七：Qoder（国内版 qoder.com.cn + 国际版 qoder.com）              */
 /*                                                                     */
 /*   GET  /device/selectAccounts?…              官网授权页，用户自己确认 */
 /*   GET  /api/v1/deviceToken/poll              PKCE 轮询设备令牌        */
@@ -2716,13 +2715,32 @@ return {
 /*   GET  /sash/api/v1/me/campaigns             活动列表                */
 /*   POST /sash/api/v1/me/campaigns/{id}/claim  领取                    */
 /*                                                                     */
+/* 两区路径一样、域名不一样：国内版 openapi.qoder.com.cn，国际版          */
+/* openapi.qoder.sh，账号登录态不通用，所以每个账号要记住自己的 region。 */
+/* 国内版「每日签到送 100 Credits」档期 2026-07-30 已结束，现在每日档期   */
+/* 在国际版：10:00（UTC+8）开一窗，次日 10:00 前关，一窗只能领一次。      */
 /* cosy-* 三件套是「设备通行证」：服务端按自报版本 + 设备身份决定下发哪些 */
 /* 活动，缺任一件就退化成只发营销卡（VIEW_DETAILS），拿不到每日 credits。 */
+/* 服务端还会按设备判重（同设备重复登录记录会直接不给领取），所以设备名   */
+/* 跟着 machineId 走，不能让所有账号共用一个 DESKTOP。                   */
 /* ================================================================== */
 
 const Qoder = (() => {
-const WEB = 'https://qoder.com.cn';
-const API = 'https://openapi.qoder.com.cn';
+const REGIONS = {
+  cn: { key: 'cn', label: '国内版', web: 'https://qoder.com.cn', api: 'https://openapi.qoder.com.cn' },
+  intl: { key: 'intl', label: '国际版', web: 'https://qoder.com', api: 'https://openapi.qoder.sh' },
+};
+
+function normRegion(v) {
+  const s = String(v || '').toLowerCase();
+  if (s === 'intl' || s === 'international' || s === 'global') return 'intl';
+  return 'cn';
+}
+
+/** 老账号没有 region 字段，一律按国内版处理，不能猜成国际版 */
+function regionOf(acct) {
+  return REGIONS[normRegion(acct && acct.region)];
+}
 
 const EP = {
   devicePage: '/device/selectAccounts',
@@ -2738,13 +2756,21 @@ const LANG = 'zh-CN';
 /* 自报版本决定服务端下发哪批活动：0.4.8 有每日 credits，0.2.5 只有营销卡 */
 const CLIENT_VERSION = '0.4.8';
 const MACHINE_OS = 'x86_64_win32';
-const MACHINE_HOSTNAME = 'DESKTOP';
 const LOGIN_TTL = 900;
 const COOLDOWN_MIN = 30;
 
-const CLAIMABLE_RE = /^(CLAIMABLE|UNCLAIMED|UN_CLAIMED|AVAILABLE|PENDING_CLAIM)$/i;
-const CLAIMED_RE = /^(CLAIMED|ALREADY_CLAIMED|RECEIVED|GRANTED|DONE)$/i;
-const ACTION_PRIORITY = ['CLAIM_BENEFIT', 'VIEW_DETAILS', 'DAILY_CHECKIN', 'SIGN_IN'];
+const CLAIMABLE_RE = /^(CLAIMABLE|UNCLAIMED|UN_CLAIMED|NOT_CLAIMED|CAN_CLAIM|TO_CLAIM|RECEIVABLE|AVAILABLE|PENDING_CLAIM|INIT)$/i;
+const CLAIMED_RE = /^(CLAIMED|ALREADY_CLAIMED|RECEIVED|GRANTED|DONE|USED)$/i;
+const CLOSED_RE = /^(DISABLED|OFFLINE|INACTIVE|ENDED|FINISHED|EXPIRED|CLOSED|NOT_OPEN|UNSUPPORTED)$/i;
+/* 营销卡排最后：它动作名也叫 VIEW_DETAILS，抢在前面就会把每日活动挤掉 */
+const ACTION_PRIORITY = ['CLAIM_BENEFIT', 'DAILY_CHECKIN', 'SIGN_IN', 'VIEW_DETAILS'];
+const ACTION_CLAIM = /^(CLAIM_BENEFIT|DAILY_CHECKIN|SIGN_IN|CLAIM|CHECK_IN)$/i;
+
+/** 设备名跟着 machineId 走，避免所有账号共用一个 DESKTOP 被判同设备重复登录 */
+function hostNameOf(acct) {
+  const mid = String(acct && acct.machineId ? acct.machineId : '').replace(/[^a-z0-9]/gi, '');
+  return mid ? 'DESKTOP-' + mid.slice(0, 8).toUpperCase() : 'DESKTOP';
+}
 
 const vault = SH.makeVault('qoder-signin/v1/account');
 const INDEX_KEY = 'index:accounts';
@@ -2811,15 +2837,15 @@ function authHeaders(at, acct, extra) {
     'accept-language': LANG,
     'cosy-version': CLIENT_VERSION,
     'cosy-machineos': MACHINE_OS,
-    'cosy-machinehostname': MACHINE_HOSTNAME,
+    'cosy-machinehostname': hostNameOf(acct),
   };
   const mid = String(acct && acct.machineId ? acct.machineId : '').trim();
   if (mid) h['cosy-machineid'] = mid;
   return extra ? Object.assign(h, extra) : h;
 }
 
-function qFetch(path, { method = 'GET', headers = {}, body } = {}) {
-  return SH.httpJson(API + path, {
+function qFetch(region, path, { method = 'GET', headers = {}, body } = {}) {
+  return SH.httpJson(REGIONS[region].api + path, {
     method,
     headers,
     body: method === 'GET' ? undefined : JSON.stringify(body || {}),
@@ -2830,7 +2856,8 @@ function qFetch(path, { method = 'GET', headers = {}, body } = {}) {
 /* 设备授权                                                            */
 /* ------------------------------------------------------------------ */
 
-async function loginStart() {
+async function loginStart(region) {
+  const reg = REGIONS[normRegion(region)];
   const verifier = SH.randomId(32);
   const challenge = await sha256B64Url(verifier);
   const nonce = SH.randomHex(16);
@@ -2838,17 +2865,17 @@ async function loginStart() {
 
   const pairs = [['challenge', challenge], ['challenge_method', 'S256']];
   pairs.push(['machine_id', machineId], ['nonce', nonce]);
-  const authUrl = `${WEB}${EP.devicePage}?${pairs
+  const authUrl = `${reg.web}${EP.devicePage}?${pairs
     .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
     .join('&')}`;
 
-  return { verifier, challenge, nonce, machineId, authUrl };
+  return { verifier, challenge, nonce, machineId, authUrl, region: reg.key };
 }
 
 /** 202 / 404 都算「用户还没确认」，不算失败 */
-async function loginPoll(nonce, verifier) {
+async function loginPoll(region, nonce, verifier) {
   const q = `?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(verifier)}&challenge_method=S256`;
-  const r = await qFetch(EP.poll + q, {
+  const r = await qFetch(region, EP.poll + q, {
     headers: { 'cosy-version': '1.0.1', 'cosy-clienttype': '5', 'user-agent': PROXY_UA },
   });
   if (r.status === 202 || r.status === 404) return { pending: true };
@@ -2873,7 +2900,7 @@ async function refreshTokens(acct) {
     e.fatal = true;
     throw e;
   }
-  const r = await qFetch(EP.refresh, {
+  const r = await qFetch(regionOf(acct), EP.refresh, {
     method: 'POST',
     headers: { 'user-agent': PROXY_UA, 'content-type': 'application/json' },
     body: { refresh_token: rt },
@@ -2920,20 +2947,46 @@ function campaignRows(payload) {
   return [];
 }
 
-const statusOf = (row) => String(row.status ?? row.state ?? row.claimStatus ?? row.campaignStatus ?? '');
-const actionOf = (row) => String(row.action ?? row.actionType ?? row.campaignType ?? row.type ?? '');
+const statusOf = (row) =>
+  String(row.status ?? row.state ?? row.claimStatus ?? row.claim_status ?? row.campaignStatus ?? row.campaign_status ?? '');
+const actionOf = (row) =>
+  String(row.action ?? row.actionType ?? row.action_type ?? row.campaignType ?? row.campaign_type ?? row.type ?? '');
 
 function idOf(row) {
-  for (const k of ['campaignId', 'campaignKey', 'key', 'id']) {
+  for (const k of ['campaignId', 'campaign_id', 'campaignKey', 'campaign_key', 'key', 'id']) {
     const v = row && row[k];
     if (v != null && String(v).trim()) return String(v).trim();
   }
   return '';
 }
 
+/** 活动档期时间戳：上游给的是秒，容错成毫秒 */
+function windowOf(row) {
+  const toMs = (v) => {
+    const n = SH.num(v);
+    if (n == null) return null;
+    return n < 1e11 ? n * 1000 : n;
+  };
+  return {
+    start: toMs(row.startAt ?? row.start_at ?? row.startTime),
+    end: toMs(row.endAt ?? row.end_at ?? row.endTime),
+  };
+}
+
+/** now 相对档期：future=还没开，past=已经收，now=在窗内 */
+function windowPhase(row, now) {
+  const w = windowOf(row);
+  if (w.start != null && now < w.start) return 'future';
+  if (w.end != null && now > w.end) return 'past';
+  return 'now';
+}
+
+const isClaimableRow = (row) =>
+  CLAIMABLE_RE.test(statusOf(row)) || row.claimable === true || row.canClaim === true || row.can_claim === true;
+
 function amountOf(obj) {
   if (!obj || typeof obj !== 'object') return null;
-  const direct = SH.num(obj.credits ?? obj.creditAmount);
+  const direct = SH.num(obj.credits ?? obj.creditAmount ?? obj.credit_amount);
   if (direct != null) return direct;
   for (const k of ['benefit', 'reward']) {
     const v = obj[k];
@@ -2948,36 +3001,93 @@ function amountOf(obj) {
   return SH.num(obj.amount);
 }
 
+/** 活动列表的外层：顶层 showCampaign / claimable / campaignUrl 才是官方给的总开关 */
+function campaignEnvelope(payload) {
+  if (!payload || typeof payload !== 'object') return { rows: [] };
+  const inner = payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data) ? payload.data : payload;
+  return {
+    rows: campaignRows(payload),
+    show: inner.showCampaign ?? inner.show_campaign ?? payload.showCampaign,
+    claimable: inner.claimable ?? inner.canClaim ?? payload.claimable,
+    url: String(inner.campaignUrl ?? inner.campaign_url ?? payload.campaignUrl ?? ''),
+  };
+}
+
+function rowLabel(row) {
+  const key = row.campaignKey || row.campaign_key || idOf(row);
+  const status = statusOf(row) || '?';
+  return key ? `${key}(${status})` : status;
+}
+
 /**
- * 领哪个：先按状态筛可领，再按动作优先级排。
- * 枚举服务端会改，认不出的动作也照样试一遍，别用白名单把自己锁死。
+ * 这一轮到底该干什么：可领 / 本档期已领 / 档期已结束或未开放 / 窗口还没开 / 空。
+ * 枚举服务端会改，所以顶层说「能领」但行里筛不到时，兜底挑一行真去试一次，
+ * claim 是幂等的，试错不会重复加分；但绝不能因为不认识枚举就报「无活动」。
  */
-function pickCampaign(rows) {
-  const claimable = rows.filter(
-    (r) => (CLAIMABLE_RE.test(statusOf(r)) || r.claimable === true || r.canClaim === true) && idOf(r)
-  );
+function classifyCampaigns(payload, now) {
+  const env = campaignEnvelope(payload);
+  const rows = env.rows;
+  const seen = rows.map(rowLabel).join('、');
+
+  if (!rows.length) {
+    if (env.show === false) {
+      return { kind: 'closed', total: 0, seen, reason: '官方在该区不再展示签到活动（showCampaign=false）' };
+    }
+    return { kind: 'empty', total: 0, seen, reason: '接口没返回任何活动' };
+  }
+
+  const inOpen = rows.filter((r) => windowPhase(r, now) === 'now');
+  const claimable = inOpen.filter((r) => isClaimableRow(r) && idOf(r));
   claimable.sort((a, b) => {
     const ia = ACTION_PRIORITY.indexOf(actionOf(a).toUpperCase());
     const ib = ACTION_PRIORITY.indexOf(actionOf(b).toUpperCase());
     return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
   });
-  const claimedBenefit = rows.some(
-    (r) => CLAIMED_RE.test(statusOf(r)) && actionOf(r).toUpperCase() === 'CLAIM_BENEFIT'
-  );
-  const onlyMarketing = rows.length > 0 && rows.every((r) => actionOf(r).toUpperCase() === 'VIEW_DETAILS');
-  return { target: claimable[0] || null, claimedBenefit, onlyMarketing, total: rows.length };
+  if (claimable.length) {
+    return { kind: 'claim', target: claimable[0], total: rows.length, seen };
+  }
+
+  if (env.claimable === true) {
+    const guess = inOpen.find((r) => idOf(r) && !CLAIMED_RE.test(statusOf(r)) && !CLOSED_RE.test(statusOf(r)));
+    if (guess) return { kind: 'claim', target: guess, fallback: true, total: rows.length, seen };
+  }
+
+  const claimedNow = inOpen.find((r) => CLAIMED_RE.test(statusOf(r)));
+  if (claimedNow) {
+    return { kind: 'already', total: rows.length, seen, reason: `本档期已领取（${rowLabel(claimedNow)}）` };
+  }
+
+  const future = rows
+    .filter((r) => windowPhase(r, now) === 'future')
+    .sort((a, b) => (windowOf(a).start || 0) - (windowOf(b).start || 0));
+  if (future.length) {
+    const start = windowOf(future[0]).start;
+    return { kind: 'future', retryAt: start, total: rows.length, seen, reason: `领取窗口 ${SH.fmtBjShort(start)} 开启` };
+  }
+
+  const disabled = rows.find((r) => CLOSED_RE.test(statusOf(r)));
+  if (disabled) {
+    return { kind: 'closed', total: rows.length, seen, reason: `活动未开放或被下线（${rowLabel(disabled)}）` };
+  }
+  const past = rows
+    .filter((r) => windowPhase(r, now) === 'past')
+    .sort((a, b) => (windowOf(b).end || 0) - (windowOf(a).end || 0))[0];
+  const endText = past && windowOf(past).end ? `，${SH.fmtBjShort(windowOf(past).end)} 结束` : '';
+  const marketing = rows.every((r) => actionOf(r).toUpperCase() === 'VIEW_DETAILS') ? '，只有营销活动' : '';
+  return { kind: 'closed', total: rows.length, seen, reason: `档期已结束${endText}${marketing}` };
 }
 
 async function fetchCampaigns(acct, { force = true } = {}) {
   const at = await ensureToken(acct);
-  return qFetch(EP.campaigns + (force ? '?forceRefresh=true' : ''), { headers: authHeaders(at, acct) });
+  return qFetch(regionOf(acct), EP.campaigns + (force ? '?forceRefresh=true' : ''), { headers: authHeaders(at, acct) });
 }
 
 async function claimCampaign(acct, campaignId) {
   const at = await ensureToken(acct);
-  return qFetch(`${EP.campaigns}/${encodeURIComponent(campaignId)}/claim`, {
+  const reg = regionOf(acct);
+  return qFetch(reg.key, `${EP.campaigns}/${encodeURIComponent(campaignId)}/claim`, {
     method: 'POST',
-    headers: authHeaders(at, acct, { 'content-type': 'application/json', origin: API }),
+    headers: authHeaders(at, acct, { 'content-type': 'application/json', origin: reg.api }),
     body: {},
   });
 }
@@ -4909,7 +5019,7 @@ const WB_META = {
   fields: [],
   hint: '点「添加账号」打开官方登录页，用微信扫码。',
   note: '二维码由官方页面渲染，本服务不接触你的微信信息。',
-  creditHint: '当前剩余积分（未用完的资源包合计）',
+  creditHint: '当前剩余积分（按资源包当前周期合计）',
   totalHint: '本期签到累计获得，不是余额',
 };
 
