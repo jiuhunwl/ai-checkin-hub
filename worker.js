@@ -1,23 +1,29 @@
 /**
- * 多平台每日签到 · Cloudflare Worker（单文件）
+ * 签到塔 · SIGN-IN TOWER
+ * 多平台每日签到 + WorkBuddy 自动旅行 · Cloudflare Worker（单文件）
  *
- * 一套部署、一个控制台、一条定时任务，管理下面 6 个平台的每日签到：
+ * 一套部署、一个控制台、三条定时班次，管理下面 10 个平台：
  *
  *   trae              Trae（抖音扫码 / 设备密钥 / refreshToken 续期）
- *   workbuddy         WorkBuddy 国内版（微信扫码 / refreshToken 续期）
+ *   workbuddy         WorkBuddy 国内版（微信扫码 / 令牌轮换 / 签到 / 派猫猫旅行）
+ *   qoder             Qoder（国内 + 国际版，设备授权或 PAT，双签到通道）
  *   workbuddy_intl    WorkBuddy 国际版（Google / GitHub / X 授权，或粘贴 token）
+ *   minimax           MiniMax Code（accessToken / refreshToken + 桌面端签名）
+ *   dumate            百度搭子 DuMate（Cookie）
+ *   lobster           LobsterAI（accessToken）
  *   zhipu             智谱清言（chatglm_token，需要 CHATGLM_SIGN_SECRET）
- *   loomy             讯飞 Loomy（token）
+ *   loomy             讯飞 Loomy（token，每日额度池重置）
  *   astudio           讯飞 AStudio（Cookie，或手机号 + 密码换会话）
  *
  * 代码结构：
- *   0. 公共工具        编码 / 时间 / HTTP / MD5 / 加密保险箱
+ *   0. 公共工具        编码 / 时间 / HTTP / MD5 / AES-256-GCM 保险箱
  *   1. Trae 模块       设备身份、抖音扫码授权、签到与积分查询
- *   2. WorkBuddy 模块  扫码授权、令牌轮换、签到
- *   3. 通用平台工厂    KV / 加密 / 签到编排 / 增删改查 / 路由
- *   4. 国际版模块      WorkBuddy 国际版（协议差异较大，单独实现）
- *   5. 外壳            平台注册表 + 聚合接口 + 定时任务
- *   6. 控制台页面      参考「签到台」的极简工具风（账号列表 / 运行历史 / 教程）
+ *   2. WorkBuddy 模块  扫码授权、令牌轮换、签到、成长中心自动旅行
+ *   3. Qoder 模块      双区域、设备授权、旧版签到 + 活动平台
+ *   4. 通用平台工厂    KV / 加密 / 签到编排 / 增删改查 / 路由
+ *   5. 自定义平台      WorkBuddy 国际版、MiniMax、DuMate、Lobster、智谱、Loomy、AStudio
+ *   6. 外壳            平台注册表 + 聚合接口 + 通知 + 定时任务
+ *   7. 控制台页面      Apple 风格控制台：总览 / 平台 / 账号 / 旅行 / 活动
  *
  * 环境绑定：
  *
@@ -25,12 +31,14 @@
  *   Secret     MASTER_KEY             32 字节随机值的 base64，所有平台共用
  *   Secret     ADMIN_TOKEN            控制台登录密码
  *   Secret     CRON_SECRET            （可选）/cron 独立口令，缺省回落到 ADMIN_TOKEN
- *   Secret     CHATGLM_SIGN_SECRET    （可选）智谱客户端签名盐；不配则智谱不可用
- *   变量       <平台键>_VERIFIED      （可选）覆盖页面上的「未验证」标记，如 ZHIPU_VERIFIED=true
+ *   Secret     CHATGLM_SIGN_SECRET    （可选）智谱客户端签名盐；不配则使用内置默认值
+ *   变量       <平台键>_VERIFIED      （可选）覆盖页面上的「未实测」标记，如 ZHIPU_VERIFIED=true
  *
  * Cron 配置（Cloudflare 的 cron 走 UTC，比北京时间慢 8 小时）：
- *   北京 08:10 = UTC 00:10
- *   crons = ["10 0 * * *"]
+ *   北京 08:10 = UTC 00:10   全量签到 + 派发旅行 + 日报
+ *   北京 12:10 = UTC 04:10   重试失败/待确认 + 领取旅行奖励
+ *   北京 20:10 = UTC 12:10   晚间兜底 + 旅行收尾
+ *   crons = ["10 0 * * *", "10 4 * * *", "10 12 * * *"]
  */
 'use strict';
 
@@ -205,7 +213,10 @@ const SH = (() => {
     try {
       const res = await fetch(url, {
         method,
-        headers: { 'Content-Type': 'application/json', ...headers },
+        headers: {
+          ...(method === 'GET' ? {} : { 'Content-Type': 'application/json' }),
+          ...headers,
+        },
         body: method === 'GET' ? undefined : body,
         signal: ctrl.signal,
       });
@@ -290,6 +301,15 @@ function bumpStreak(acct, day) {
   const expected = new Date(Date.parse(day + 'T00:00:00Z') - 86400e3).toISOString().slice(0, 10);
   acct.streakLocal = prev === expected ? (Number(acct.streakLocal) || 0) + 1 : 1;
   acct.streakDate = day;
+}
+
+/** 全局延时（重试/退避用） */
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** 上游布尔字段可能是 true / 1 / "true" / "1"，统一判断 */
+function isTrue(v) {
+  if (v === true || v === 1) return true;
+  return String(v).toLowerCase() === 'true' || String(v) === '1';
 }
 
 /* ================================================================== */
@@ -1959,11 +1979,11 @@ async function putAccount(env, acct) {
 /* 与 WorkBuddy 服务端交互                                              */
 /* ------------------------------------------------------------------ */
 
-async function wbFetch(path, { method = 'POST', headers = {}, body = '{}', timeout = 20000 } = {}) {
+async function wbFetch(path, { method = 'POST', headers = {}, body = '{}', timeout = 20000, base = API } = {}) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), timeout);
   try {
-    const res = await fetch(API + path, {
+    const res = await fetch(base + path, {
       method,
       headers: {
         'Content-Type': 'application/json',
@@ -1991,6 +2011,20 @@ async function wbFetch(path, { method = 'POST', headers = {}, body = '{}', timeo
  * 注意：refreshToken 会轮换，先前签发的随即失效，调用方必须立刻保存新的。
  */
 async function refreshTokens(refreshToken) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await sleep(800);
+    try {
+      return await refreshTokensOnce(refreshToken);
+    } catch (e) {
+      lastErr = e;
+      if (e.fatal) break;
+    }
+  }
+  throw lastErr;
+}
+
+async function refreshTokensOnce(refreshToken) {
   const { status, json } = await wbFetch('/v2/plugin/auth/token/refresh', {
     headers: {
       'X-Refresh-Token': refreshToken,
@@ -1999,12 +2033,15 @@ async function refreshTokens(refreshToken) {
     },
   });
 
+  const text = JSON.stringify(json ?? {});
   if (json?.code !== 0 || !json?.data) {
+    const dead = /12153|Offline user session not found|invalid_grant/i.test(text);
     const err = new Error(
       `刷新令牌失败 code=${json?.code} ${json?.msg ?? ''} (HTTP ${status})`
     );
     err.code = json?.code;
-    err.fatal = true; // 令牌链路断了，需要人工重新抓
+    // 只有明确的会话失效才判死刑；网络抖动/5xx 交给上层重试
+    err.fatal = dead || status === 401 || status === 403;
     throw err;
   }
 
@@ -2061,32 +2098,49 @@ async function pollLoginToken(state) {
   throw new Error(`轮询登录结果失败 code=${json?.code} ${json?.msg ?? ''} (HTTP ${status})`);
 }
 
-/** 尽量取一个昵称当备注名，取不到就算了，不影响登录 */
-async function fetchNickname(at) {
+/** 尽量取昵称和 uid；取不到就算了，不影响登录 */
+async function fetchIdentity(at) {
   try {
     const { json } = await wbFetch('/v2/accounts', {
       method: 'GET',
       headers: { ...authHeader(at), 'X-Domain': 'copilot.tencent.com' },
     });
     const list = json?.data?.accounts ?? json?.data;
-    const first = Array.isArray(list) ? list[0] : null;
-    return String(first?.nickname ?? first?.nickName ?? '').trim();
+    const first = Array.isArray(list) ? list[0] : (list && typeof list === 'object' ? list : null);
+    return {
+      name: String(first?.nickname ?? first?.nickName ?? '').trim(),
+      uid: String(first?.uid ?? first?.userId ?? first?.user_id ?? '').trim(),
+    };
   } catch {
-    return '';
+    return { name: '', uid: '' };
   }
+}
+
+/** 从 JWT 里兜底取 uid（WorkBuddy 的 accessToken 带 sub/uid） */
+function uidFromToken(token) {
+  const c = SH.jwtClaims(token);
+  return String(c.uid ?? c.user_id ?? c.userId ?? c.sub ?? '').trim();
 }
 
 /** 把一条令牌落成账号记录（加密存 KV + 更新索引） */
 async function persistAccount(env, { refreshToken, label, accessToken, refreshExpiresIn }) {
   const id = randomId(9);
   let name = String(label ?? '').trim().slice(0, 40);
-  if (!name && accessToken) name = await fetchNickname(accessToken);
+  let uid = uidFromToken(accessToken || '');
+  if (accessToken && (!name || !uid)) {
+    const who = await fetchIdentity(accessToken);
+    if (!name) name = who.name;
+    if (!uid) uid = who.uid;
+  }
   if (!name) name = `账号-${id.slice(0, 4)}`;
 
   const acct = {
     id,
     label: name,
+    uid,
     refreshToken,
+    accessToken: String(accessToken || ''),
+    accessExp: SH.jwtExp(accessToken || '') * 1000 || 0,
     createdAt: Date.now(),
     lastState: 'new',
     lastMsg: '尚未运行',
@@ -2105,14 +2159,33 @@ async function persistAccount(env, { refreshToken, label, accessToken, refreshEx
 
 const authHeader = (at) => ({ Authorization: `Bearer ${at}` });
 
-async function checkinStatus(at) {
+/** 所有请求都带上账号身份，服务端按人记账时缺它会出现「返回成功但没记到人」 */
+function wbAuthHeaders(acct) {
+  const h = authHeader(acct.accessToken || '');
+  if (acct.uid) h['X-User-Id'] = String(acct.uid);
+  return h;
+}
+
+/**
+ * 今日签到状态。字段名上游改过几版，这里全部兼容：
+ * today_checked_in（现行）/ checked_in_today / checkedIn / alreadyCheckedIn。
+ * 只有服务端明确说「今天签过」才算 confirmed，别用客户端自己的乐观判断。
+ */
+async function checkinStatus(acct) {
   const { json } = await wbFetch('/v2/billing/meter/checkin-activity-status', {
-    headers: authHeader(at),
+    headers: wbAuthHeaders(acct),
   });
   if (json?.code !== 0 || !json?.data) {
     return { ok: false, code: json?.code, msg: json?.msg };
   }
-  return { ok: true, data: json.data };
+  const d = json.data;
+  const checked =
+    isTrue(d.today_checked_in) ||
+    isTrue(d.checked_in_today) ||
+    isTrue(d.todayCheckedIn) ||
+    isTrue(d.checkedIn) ||
+    isTrue(d.alreadyCheckedIn);
+  return { ok: true, checked, data: d };
 }
 
 /**
@@ -2120,8 +2193,8 @@ async function checkinStatus(at) {
  * CapacityRemain 是跨周期总量，官方客户端看的是 CycleCapacityRemain（本周期），
  * 两者会差出一截，别混用；只有缺周期字段时才退回总量字段。
  */
-async function fetchBalance(at) {
-  const { json } = await wbFetch('/v2/billing/meter/get-user-resource', { headers: authHeader(at) });
+async function fetchBalance(acct) {
+  const { json } = await wbFetch('/v2/billing/meter/get-user-resource', { headers: wbAuthHeaders(acct) });
   if (json?.code !== 0 || !json?.data) return null;
   const d = json.data.Response?.Data || json.data;
   const rows = Array.isArray(d?.Accounts) ? d.Accounts : [];
@@ -2139,17 +2212,494 @@ async function fetchBalance(at) {
   };
 }
 
-async function doCheckin(at) {
+async function doCheckin(acct) {
   const { json } = await wbFetch('/v2/billing/meter/daily-checkin', {
-    headers: authHeader(at),
+    headers: wbAuthHeaders(acct),
   });
+  const msg = String(json?.msg ?? json?.message ?? '');
   if (json?.code === 0) {
-    return { state: 'checked', credit: SH.num(json.data?.credit), raw: json.data };
+    return { state: 'checked', credit: SH.num(json.data?.credit ?? json.data?.credits ?? json.data?.reward), raw: json.data };
   }
-  if (json?.code === 10001) {
+  if (json?.code === 10001 || /已签|已领|重复|already/i.test(msg)) {
     return { state: 'already', credit: 0 };
   }
-  return { state: 'error', code: json?.code, msg: json?.msg };
+  return { state: 'error', code: json?.code, msg };
+}
+
+/* ------------------------------------------------------------------ */
+/* 令牌生命周期：复用 → 临期才续 → 401 再续一次                          */
+/*                                                                     */
+/* WorkBuddy 的 refreshToken 是一次性轮换的：每轮签到都无条件刷新，       */
+/* 一旦刷新响应丢失或两次运行撞车，旧 RT 立刻作废 → 断签。               */
+/* 所以能复用 accessToken 就复用，续期成功后必须第一时间落盘。           */
+/* ------------------------------------------------------------------ */
+
+const TOKEN_MARGIN_MS = 5 * 60 * 1000;
+
+function accessExpOf(acct) {
+  const exp = Number(acct.accessExp || 0);
+  if (exp > 0) return exp;
+  const fromJwt = SH.jwtExp(acct.accessToken || '') * 1000;
+  return fromJwt || 0;
+}
+
+function accessFresh(acct, margin = TOKEN_MARGIN_MS) {
+  if (!acct.accessToken) return false;
+  const exp = accessExpOf(acct);
+  return !exp || exp - Date.now() > margin;
+}
+
+/** 确保有一条可用 accessToken；续期后立即加密落盘，避免轮换丢失 */
+async function ensureAccess(env, acct) {
+  if (accessFresh(acct)) return acct.accessToken;
+  const t = await refreshTokens(acct.refreshToken);
+  acct.accessToken = t.accessToken;
+  if (t.refreshToken) acct.refreshToken = t.refreshToken;
+  acct.accessExp = SH.jwtExp(t.accessToken) * 1000 || 0;
+  acct.tokenRefreshedAt = Date.now();
+  if (t.refreshExpiresIn) acct.refreshExp = Date.now() + t.refreshExpiresIn * 1000;
+  if (!acct.uid) {
+    acct.uid = uidFromToken(t.accessToken);
+    if (!acct.uid) acct.uid = (await fetchIdentity(t.accessToken)).uid;
+  }
+  await putAccount(env, acct);
+  return acct.accessToken;
+}
+
+/** 业务请求遇到 401/403：强制轮换一次令牌再重试 */
+async function rotateAccess(env, acct) {
+  const t = await refreshTokens(acct.refreshToken);
+  acct.accessToken = t.accessToken;
+  if (t.refreshToken) acct.refreshToken = t.refreshToken;
+  acct.accessExp = SH.jwtExp(t.accessToken) * 1000 || 0;
+  acct.tokenRefreshedAt = Date.now();
+  if (t.refreshExpiresIn) acct.refreshExp = Date.now() + t.refreshExpiresIn * 1000;
+  await putAccount(env, acct);
+  return acct.accessToken;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/** 只读查一次状态；网络异常不抛，交给调用方决定是否继续 */
+async function statusOnce(acct) {
+  try {
+    return await checkinStatus(acct);
+  } catch (e) {
+    return { ok: false, msg: e.message };
+  }
+}
+
+/** 反复查状态直到服务端确认「今天已签」；状态有延迟，不能只看一次 */
+async function confirmChecked(acct, { tries = 3, delay = 1200 } = {}) {
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    if (i) await sleep(delay * i);
+    last = await statusOnce(acct);
+    if (last.ok && last.checked) return { confirmed: true, status: last };
+  }
+  return { confirmed: false, status: last };
+}
+
+/* ------------------------------------------------------------------ */
+/* 成长中心：自动派猫猫旅行                                              */
+/*                                                                     */
+/* 接口挂在 www.codebuddy.cn（和 /v2/plugin 签到网关同账号体系），       */
+/* 状态机完全以服务端 data.state 为准：                                 */
+/*   idle →(depart)→ traveling →(到点)→ arrived →(claim)→ idle          */
+/* idle + daily_limit_reached 对应官网「累了，明天再来吧」，按已完成展示。 */
+/* 参考 changexbc/workbuddy-switch 的 travel.rs 复刻判定逻辑：           */
+/*   - 429 是限流，不等于「今日已派」，必须看文案里的 daily limit         */
+/*   - 缺 state / 未知 state 判失败，绝不默认成 idle 后误标已领           */
+/*   - no-buddy / config-error / status-error 都是可重试项，不写完成标记   */
+/* ------------------------------------------------------------------ */
+
+const TRAVEL_BASE = 'https://www.codebuddy.cn';
+const TRAVEL_FALLBACK_BASE = 'https://copilot.tencent.com';
+const TRAVEL_PREFIX = '/activity/growth/buddy/travel';
+const TRAVEL_STATES = ['idle', 'traveling', 'arrived'];
+
+function travelHeaders(acct) {
+  const h = wbAuthHeaders(acct);
+  h.Accept = 'application/json';
+  h['X-Client-Platform'] = 'web';
+  h.Origin = TRAVEL_BASE;
+  h.Referer = TRAVEL_BASE + '/profile/growth-center';
+  return h;
+}
+
+/** 秒级/毫秒级时间戳统一成毫秒 */
+function travelTs(v) {
+  const n = Number(v) || 0;
+  return n > 0 && n < 1e12 ? n * 1000 : n;
+}
+
+function travelMsg(res) {
+  const j = res.json || {};
+  return String(j.msg ?? j.message ?? `HTTP ${res.status}`);
+}
+
+function travelUnauthorized(res) {
+  if (!res) return false;
+  if (res.status === 401 || res.status === 403) return true;
+  const code = Number((res.json || {}).code);
+  if (code === 401 || code === 403) return true;
+  return /unauthorized|login required|登录|失效|过期/i.test(travelMsg(res));
+}
+
+async function travelRaw(acct, path, { method = 'GET', body = null, base = TRAVEL_BASE } = {}) {
+  return wbFetch(TRAVEL_PREFIX + path, {
+    base,
+    method,
+    headers: travelHeaders(acct),
+    body: body ? JSON.stringify(body) : '{}',
+    timeout: 15000,
+  });
+}
+
+/** 旅行请求：401 先轮换令牌；主域名不可用/无路由时回落到 copilot 网关 */
+async function travelFetch(env, acct, path, opts = {}) {
+  let res = null;
+  let err = null;
+  try {
+    res = await travelRaw(acct, path, opts);
+  } catch (e) {
+    err = e;
+  }
+  if (res && travelUnauthorized(res) && acct.refreshToken) {
+    try {
+      await rotateAccess(env, acct);
+      res = await travelRaw(acct, path, opts);
+    } catch {
+      /* 续期失败保留原始响应 */
+    }
+  }
+  if (!res || res.status === 404 || travelUnauthorized(res)) {
+    try {
+      const alt = await travelRaw(acct, path, { ...opts, base: TRAVEL_FALLBACK_BASE });
+      if (alt && alt.status !== 404) return alt;
+    } catch {
+      /* 回落失败就报告第一次的结论 */
+    }
+  }
+  if (!res) throw err || new Error('旅行接口不可达');
+  return res;
+}
+
+function travelParse(res) {
+  const j = res.json || {};
+  const code = Number(j.code);
+  if (j.code !== undefined && code !== 0 && code !== 200) {
+    return { ok: false, code, msg: travelMsg(res) };
+  }
+  if (!j.data || typeof j.data !== 'object') {
+    return { ok: false, code, msg: travelMsg(res) || '响应缺少 data' };
+  }
+  return { ok: true, data: j.data };
+}
+
+async function fetchTravelStatus(env, acct) {
+  let last = { ok: false, msg: '旅行状态查询失败' };
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await sleep(900);
+    try {
+      const p = travelParse(await travelFetch(env, acct, '/status'));
+      if (!p.ok) {
+        last = { ok: false, msg: p.msg };
+        continue;
+      }
+      const d = p.data;
+      const state = String(d.state ?? '').trim().toLowerCase();
+      if (!TRAVEL_STATES.includes(state)) {
+        last = { ok: false, msg: state ? `未知旅行状态：${state}` : '响应缺少旅行状态' };
+        continue;
+      }
+      return {
+        ok: true,
+        state,
+        locationId: d.location?.id ?? null,
+        locationName: String(d.location?.name ?? '').trim(),
+        departAt: travelTs(d.depart_at),
+        arriveAt: travelTs(d.arrive_at),
+        dailyLimit: d.daily_limit_reached === true,
+        buddyId: Number(d.buddy_id) || 0,
+        recordId: Number(d.record_id) || 0,
+        rewardCredit: SH.num(d.reward_credit),
+        serverNow: travelTs(d.server_now),
+      };
+    } catch (e) {
+      last = { ok: false, msg: e.message };
+    }
+  }
+  return last;
+}
+
+async function fetchTravelConfig(env, acct) {
+  try {
+    const p = travelParse(await travelFetch(env, acct, '/config'));
+    if (!p.ok) return { ok: false, msg: p.msg };
+    const d = p.data;
+    const locations = (Array.isArray(d.locations) ? d.locations : [])
+      .map((l) => ({ id: l?.id ?? null, name: String(l?.name ?? '').trim() }))
+      .filter((l) => l.id !== null && l.id !== undefined);
+    return {
+      ok: true,
+      enabled: d.enabled !== false && locations.length > 0,
+      locations,
+      msg: locations.length ? '' : '没有可用旅行地点',
+    };
+  } catch (e) {
+    return { ok: false, msg: e.message };
+  }
+}
+
+async function departTravel(env, acct) {
+  const cfg = await fetchTravelConfig(env, acct);
+  if (!cfg.ok) return { ok: false, kind: 'error', msg: cfg.msg || '读取旅行配置失败' };
+  if (!cfg.enabled) return { ok: false, kind: 'no-location', msg: cfg.msg || '没有可用旅行地点' };
+  let lastUnavailable = false;
+  let lastMsg = '';
+  for (const loc of cfg.locations) {
+    try {
+      const p = travelParse(
+        await travelFetch(env, acct, '/depart', { method: 'POST', body: { location_id: loc.id } })
+      );
+      if (p.ok) {
+        return {
+          ok: true,
+          state: String(p.data.state ?? 'traveling').toLowerCase(),
+          locationName: loc.name,
+          msg: '',
+        };
+      }
+      const msg = String(p.msg || '');
+      const low = msg.toLowerCase();
+      lastMsg = msg;
+      if (/already traveling|already_traveling|已在旅行/.test(low)) {
+        return { ok: true, already: true, state: 'traveling', locationName: loc.name, msg: '已在旅行中' };
+      }
+      if (/daily limit|daily_limit|今日.*(已|上限)/.test(low)) {
+        return { ok: true, dailyLimit: true, state: 'idle', locationName: loc.name, msg: '今日已派' };
+      }
+      if (/no active buddy|no_buddy|无.*buddy|没有.*buddy/.test(low)) {
+        return { ok: false, kind: 'no-buddy', msg: '账号还没有 Buddy，请先在 WorkBuddy 创建' };
+      }
+      if (/location not available|地点不可用/.test(low)) {
+        lastUnavailable = true;
+        continue;
+      }
+      return { ok: false, kind: 'error', msg };
+    } catch (e) {
+      lastMsg = e.message;
+    }
+  }
+  return lastUnavailable
+    ? { ok: false, kind: 'no-location', msg: '所选旅行地点暂不可用' }
+    : { ok: false, kind: 'error', msg: lastMsg || '派发失败' };
+}
+
+async function claimTravel(env, acct, recordId) {
+  const body = recordId > 0 ? { record_id: recordId } : {};
+  try {
+    const p = travelParse(
+      await travelFetch(env, acct, '/claim', { method: 'POST', body })
+    );
+    if (p.ok) return { ok: true, rewardCredit: SH.num(p.data.reward_credit), msg: '' };
+    const msg = String(p.msg || '');
+    const low = msg.toLowerCase();
+    if (/no unclaimed travel|daily_limit|已领/.test(low)) {
+      return { ok: true, already: true, msg: '奖励已在网页端领取' };
+    }
+    if (/not arrived yet|尚未到达/.test(low)) {
+      return { ok: false, wait: true, msg: '旅行还没到点，稍后再来' };
+    }
+    return { ok: false, msg };
+  } catch (e) {
+    return { ok: false, msg: e.message };
+  }
+}
+
+async function saveTravel(env, acct, rec) {
+  const next = {
+    label: rec.label || 'untraveled',
+    state: rec.state || '',
+    locationName: rec.locationName || '',
+    rewardCredit: typeof rec.rewardCredit === 'number' ? rec.rewardCredit : null,
+    departAt: Number(rec.departAt) || 0,
+    arriveAt: Number(rec.arriveAt) || 0,
+    dailyLimit: rec.dailyLimit === true,
+    recordId: Number(rec.recordId) || 0,
+    message: rec.message || '',
+    checkedAt: Date.now(),
+    claimedAt: Number(rec.claimedAt) || 0,
+  };
+  acct.travel = next;
+  await putAccount(env, acct);
+  return next;
+}
+
+/**
+ * 同步单个账号的旅行：到达就领、旅行中就等、今天是 idle 才派。
+ * allowDepart = null 时跟随账号的 autoTravel 开关。
+ */
+async function travelSync(env, acct, { allowDepart = null } = {}) {
+  const now = Date.now();
+  const base = { id: acct.id, label: acct.label, platform: 'workbuddy' };
+  if (acct.enabled === false) {
+    return { ...base, ok: false, travelLabel: 'disabled', msg: '账号已停用' };
+  }
+
+  try {
+    await ensureAccess(env, acct);
+  } catch (e) {
+    const exp = accessExpOf(acct);
+    if (!acct.accessToken || (exp && exp <= now)) {
+      await saveTravel(env, acct, { label: 'error', message: e.message });
+      return { ...base, ok: false, travelLabel: 'error', msg: e.message, travel: acct.travel };
+    }
+  }
+
+  const status = await fetchTravelStatus(env, acct);
+  if (!status.ok) {
+    const rec = { label: 'error', message: status.msg || '状态查询失败' };
+    await saveTravel(env, acct, rec);
+    return { ...base, ok: false, travelLabel: 'error', msg: rec.message, travel: acct.travel };
+  }
+
+  const common = {
+    state: status.state,
+    locationName: status.locationName,
+    departAt: status.departAt,
+    arriveAt: status.arriveAt,
+    dailyLimit: status.dailyLimit,
+    recordId: status.recordId,
+    rewardCredit: status.rewardCredit,
+  };
+
+  if (status.state === 'traveling') {
+    const rec = { ...common, label: 'traveling', message: '猫猫正在路上' };
+    await saveTravel(env, acct, rec);
+    return { ...base, ok: true, travelLabel: 'traveling', msg: rec.message, travel: acct.travel };
+  }
+
+  if (status.state === 'arrived') {
+    const claim = await claimTravel(env, acct, status.recordId);
+    if (claim.ok) {
+      const rec = {
+        ...common,
+        label: 'finished',
+        message: claim.already ? claim.msg : `旅行奖励 +${claim.rewardCredit ?? 0}`,
+        rewardCredit: claim.rewardCredit ?? status.rewardCredit,
+        claimedAt: Date.now(),
+      };
+      await saveTravel(env, acct, rec);
+      return { ...base, ok: true, travelLabel: 'finished', msg: rec.message, travel: acct.travel };
+    }
+    const rec = { ...common, label: 'arrived', message: claim.msg || '已到达，等待领取' };
+    await saveTravel(env, acct, rec);
+    return { ...base, ok: false, travelLabel: 'arrived', msg: rec.message, travel: acct.travel };
+  }
+
+  // idle：官网把「今日次数用完」也返回 idle，必须看 daily_limit_reached
+  if (status.dailyLimit) {
+    const rec = { ...common, label: 'finished', message: '今日旅行已完成（累了，明天再来吧）' };
+    await saveTravel(env, acct, rec);
+    return { ...base, ok: true, travelLabel: 'finished', msg: rec.message, travel: acct.travel };
+  }
+
+  const mayDepart = allowDepart == null ? acct.autoTravel !== false : allowDepart;
+  if (!mayDepart) {
+    const rec = { label: 'untraveled', state: 'idle', locationName: status.locationName, message: '今日尚未派发' };
+    await saveTravel(env, acct, rec);
+    return { ...base, ok: true, travelLabel: 'untraveled', msg: rec.message, travel: acct.travel };
+  }
+
+  const dep = await departTravel(env, acct);
+  if (dep.ok) {
+    if (dep.dailyLimit) {
+      const rec = { ...common, label: 'finished', state: 'idle', message: '今日已派' };
+      await saveTravel(env, acct, rec);
+      return { ...base, ok: true, travelLabel: 'finished', msg: rec.message, travel: acct.travel };
+    }
+    // 派发成功后回查一次，拿到到达时间和积分预览
+    const after = await fetchTravelStatus(env, acct).catch(() => null);
+    const okAfter = after && after.ok;
+    const rec = {
+      label: okAfter && after.state === 'arrived' ? 'arrived' : 'traveling',
+      state: okAfter ? after.state : 'traveling',
+      locationName: (okAfter && after.locationName) || dep.locationName || '',
+      departAt: okAfter ? after.departAt : 0,
+      arriveAt: okAfter ? after.arriveAt : 0,
+      dailyLimit: false,
+      recordId: okAfter ? after.recordId : 0,
+      rewardCredit: okAfter ? after.rewardCredit : null,
+      message: '已派出猫猫去旅行',
+    };
+    await saveTravel(env, acct, rec);
+    return { ...base, ok: true, travelLabel: rec.label, msg: rec.message, travel: acct.travel };
+  }
+
+  const rec = {
+    ...common,
+    label: dep.kind === 'no-buddy' ? 'no-buddy' : dep.kind === 'no-location' ? 'no-location' : 'error',
+    message: dep.msg || '派发失败',
+  };
+  await saveTravel(env, acct, rec);
+  return { ...base, ok: false, travelLabel: rec.label, msg: rec.message, travel: acct.travel };
+}
+
+async function runTravel(env, { id = '', onlyAuto = true } = {}) {
+  const list = await listAccounts(env);
+  const results = [];
+  for (const meta of list) {
+    if (id && meta.id !== id) continue;
+    const acct = await getAccount(env, meta.id);
+    if (!acct || acct.enabled === false) continue;
+    if (!id && onlyAuto && acct.autoTravel === false) continue;
+    try {
+      results.push(await travelSync(env, acct, { allowDepart: id ? true : null }));
+    } catch (e) {
+      results.push({ id: acct.id, label: acct.label, platform: 'workbuddy', ok: false, travelLabel: 'error', msg: e.message });
+    }
+  }
+  return {
+    accounts: results.length,
+    traveling: results.filter((r) => r.travelLabel === 'traveling').length,
+    finished: results.filter((r) => r.travelLabel === 'finished').length,
+    failed: results.filter((r) => !r.ok).length,
+    results,
+  };
+}
+
+async function setAutoTravel(env, id, on) {
+  const acct = await getAccount(env, id);
+  if (!acct) throw new Error('账号不存在');
+  acct.autoTravel = !!on;
+  await putAccount(env, acct);
+  return { id, autoTravel: !!on };
+}
+
+/** 旅行总入口：sync / depart / claim / run / auto-on / auto-off */
+async function travel(env, { id = '', action = 'sync' } = {}) {
+  if (action === 'auto-on' || action === 'auto-off') {
+    return { ok: true, ...(await setAutoTravel(env, id, action === 'auto-on')) };
+  }
+  if (action === 'run') return { ok: true, ...(await runTravel(env, { id, onlyAuto: false })) };
+  if (!id) return { ok: false, error: '缺少 id' };
+
+  const acct = await getAccount(env, id);
+  if (!acct) throw new Error('账号不存在');
+
+  let result;
+  if (action === 'depart') result = await travelSync(env, acct, { allowDepart: true });
+  else if (action === 'claim') result = await travelSync(env, acct, { allowDepart: false });
+  else result = await travelSync(env, acct, { allowDepart: null });
+
+  const now = Date.now();
+  return {
+    ok: result.ok,
+    account: publicView(acct, now, bjDayOf(now)),
+    result,
+  };
 }
 
 /** 资源包列表按口径汇总：剩余到底该取哪一列，先让这些数字互相对上 */
@@ -2209,22 +2759,10 @@ async function inspectBalance(env, id) {
 
     let at = String(acct.accessToken || '');
     let tokenError = '';
-    // 令牌还能用就不轮换；真要续期时先落盘，轮换后的 RT 丢了就找不回
-    const exp = SH.jwtExp(at);
-    const stillFresh = !!(exp && exp * 1000 - Date.now() > 120000);
-    if (!(at && stillFresh)) {
-      try {
-        const t = await refreshTokens(acct.refreshToken);
-        at = t.accessToken;
-        acct.refreshToken = t.refreshToken;
-        acct.accessToken = at;
-        if (t.refreshExpiresIn) acct.refreshExp = Date.now() + t.refreshExpiresIn * 1000;
-        acct.tokenRefreshedAt = Date.now();
-        await putAccount(env, acct);
-        acct.accessExp = SH.jwtExp(at);
-      } catch (e) {
-        tokenError = e.message;
-      }
+    try {
+      at = await ensureAccess(env, acct);
+    } catch (e) {
+      tokenError = e.message;
     }
 
     const calls = [];
@@ -2258,99 +2796,168 @@ async function inspectBalance(env, id) {
 
 /* ------------------------------------------------------------------ */
 /* 单个账号的完整签到流程                                               */
+/*                                                                     */
+/* 关键原则：                                                            */
+/*   1. 只有服务端回查 confirmed 才算成功，接口 code=0 只是「已提交」。   */
+/*   2. 失败/待确认不写 lastOkDate，下一轮 Cron 会自动重试。             */
+/*   3. 令牌能复用就复用，轮换后立刻落盘，避免一次性 RT 被浪费。         */
 /* ------------------------------------------------------------------ */
 
 async function signinOne(env, acct, { force = false } = {}) {
   const now = Date.now();
-  const today = new Date(now + 8 * 3600 * 1000).toISOString().slice(0, 10); // 按北京时间算日期
+  const today = SH.bjDay(now);
+  const wasVerified = acct.verifiedDate === today;
+  const base = { id: acct.id, label: acct.label, platform: 'workbuddy' };
 
   if (acct.enabled === false) {
-    return { id: acct.id, label: acct.label, state: 'disabled', msg: '账号已停用' };
+    return { ...base, state: 'disabled', msg: '账号已停用' };
   }
 
-  // 今天已成功过、且没要求强制，直接跳过（省一次请求，也避免无谓刷新）
-  if (!force && acct.lastOkDate === today && acct.lastState !== 'error') {
-    return { id: acct.id, label: acct.label, state: 'skipped', msg: '今日已完成' };
+  // 只有「服务端确认过」才允许跳过；仅本地乐观标记不算
+  if (!force && acct.verifiedDate === today) {
+    return { ...base, state: 'skipped', verified: true, msg: '今日已确认签到' };
   }
 
-  let tokens;
+  // 1) 令牌：复用未过期的 accessToken，避免无谓轮换
   try {
-    tokens = await refreshTokens(acct.refreshToken);
+    await ensureAccess(env, acct);
   } catch (e) {
-    acct.lastState = e.fatal ? 'token_dead' : 'error';
-    acct.lastMsg = e.message;
-    acct.lastRun = now;
-    await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: acct.lastState, msg: e.message };
-  }
-
-  // 先落盘新令牌。哪怕后面签到失败，令牌链也不能断。
-  acct.refreshToken = tokens.refreshToken;
-  acct.tokenRefreshedAt = now;
-  if (tokens.refreshExpiresIn) acct.refreshExp = now + tokens.refreshExpiresIn * 1000;
-
-  let result;
-  try {
-    result = await doCheckin(tokens.accessToken);
-  } catch (e) {
-    acct.lastState = 'error';
-    acct.lastMsg = `签到请求异常: ${e.message}`;
-    acct.lastRun = now;
-    await putAccount(env, acct);
-    return { id: acct.id, label: acct.label, state: 'error', msg: acct.lastMsg };
-  }
-
-  let streak = null;
-  let total = null;
-  try {
-    const st = await checkinStatus(tokens.accessToken);
-    if (st.ok) {
-      streak = st.data.streak_days ?? null;
-      total = st.data.total_credits ?? null;
-      // 顺手把最新 accessToken 的服务端视图对上，用于判断是否真的已签
-      if (st.data.checked_in_today === true && result.state === 'error') {
-        result = { state: 'already', credit: 0 };
-      }
+    // 续期失败但手上的 accessToken 还没过期：先用它完成今天，别直接断签
+    const exp = accessExpOf(acct);
+    const usable = !!acct.accessToken && (!exp || exp > Date.now());
+    if (!usable) {
+      acct.lastState = e.fatal ? 'token_dead' : 'error';
+      acct.lastMsg = e.message;
+      acct.lastRun = now;
+      await putAccount(env, acct);
+      return { ...base, state: acct.lastState, msg: e.message };
     }
-  } catch {
-    /* 状态查询失败不影响主流程 */
   }
 
+  // 2) 先查状态：已经签过就不发写请求
+  let before = await statusOnce(acct);
+  if (before.ok) {
+    acct.streak = before.data.streak_days ?? acct.streak ?? null;
+    acct.total = before.data.total_credits ?? acct.total ?? null;
+    if (before.checked) {
+      acct.verifiedDate = today;
+      acct.verifiedAt = now;
+      acct.lastOkDate = today;
+      acct.lastState = 'already';
+      acct.lastMsg = '服务端确认今日已签';
+      acct.lastRun = now;
+      acct.cooldownUntil = 0;
+      bumpStreak(acct, today);
+      await putAccount(env, acct);
+      return { ...base, state: 'already', verified: true, msg: acct.lastMsg, streak: acct.streak, total: acct.total };
+    }
+  }
+
+  // 3) 执行签到：网络异常/5xx 重试一次；401 强制轮换一次令牌
+  let result = null;
+  let lastErr = '';
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await sleep(1500);
+    try {
+      const { status, json } = await wbFetch('/v2/billing/meter/daily-checkin', {
+        headers: wbAuthHeaders(acct),
+      });
+      if (status === 401 || status === 403) {
+        lastErr = `HTTP ${status}`;
+        if (attempt === 0) {
+          try {
+            await rotateAccess(env, acct);
+            continue;
+          } catch (e) {
+            lastErr = e.message;
+            break;
+          }
+        }
+        break;
+      }
+      if (status === 429) {
+        acct.cooldownUntil = now + 30 * 60000;
+        acct.lastState = 'rate';
+        acct.lastMsg = '平台限流（HTTP 429），30 分钟后重试';
+        acct.lastRun = now;
+        await putAccount(env, acct);
+        return { ...base, state: 'rate', msg: acct.lastMsg };
+      }
+      const msg = String(json?.msg ?? json?.message ?? '');
+      if (json?.code === 0) {
+        result = { state: 'checked', credit: SH.num(json.data?.credit ?? json.data?.credits ?? json.data?.reward) };
+        break;
+      }
+      if (json?.code === 10001 || /已签|已领|重复|already/i.test(msg)) {
+        result = { state: 'already', credit: 0 };
+        break;
+      }
+      lastErr = `code=${json?.code ?? status} ${msg}`.trim();
+      // 5xx 或未知业务码：再试一次
+    } catch (e) {
+      lastErr = e.message;
+    }
+  }
+
+  // 4) 回查确认：接口说成功不等于真到账，必须让服务端点头
+  const confirm = await confirmChecked(acct, { tries: 3, delay: 1200 });
+  const statusUnavailable = !confirm.status || confirm.status.ok !== true;
+  const st = confirm.status && confirm.status.ok ? confirm.status.data : null;
+  if (st) {
+    acct.streak = st.streak_days ?? acct.streak ?? null;
+    acct.total = st.total_credits ?? acct.total ?? null;
+  }
+
+  // 状态接口本身不可用时，「已签到」是服务端给出的明确断言，可以采信；
+  // 但「签到成功」仍保持待确认，等状态接口恢复后再复核。
+  const alreadyProof = statusUnavailable && result && result.state === 'already';
   acct.lastRun = now;
-  acct.streak = streak;
-  acct.total = total;
-  const bal = await fetchBalance(tokens.accessToken).catch(() => null);
-  if (bal) {
-    acct.credits = bal.credits;
-    acct.dosage = bal.dosage;
+  if (confirm.confirmed || alreadyProof) {
+    acct.verifiedDate = today;
+    acct.verifiedAt = now;
+    acct.lastOkDate = today;
+    acct.lastState = result && result.state === 'already' ? 'already' : 'checked';
+    const credit = result && result.state === 'checked' ? result.credit : null;
+    acct.lastMsg = result && result.state === 'already'
+      ? '服务端确认今日已签'
+      : (credit != null ? `签到成功 +${credit} 积分（已复核）` : '签到成功（已复核）');
+    acct.cooldownUntil = 0;
+    bumpStreak(acct, today);
+    if (!acct.lastCreditDate || acct.lastCreditDate !== today) {
+      acct.lastCredit = credit;
+      acct.lastCreditDate = today;
+    }
+    if (!wasVerified) acct.totalSigned = (acct.totalSigned ?? 0) + 1;
+  } else if (result && result.state !== 'error') {
+    // 接口看起来成功，但服务端还没记账：不写成功日期，下一轮继续复查
+    acct.lastState = 'unverified';
+    acct.lastMsg = result.state === 'already'
+      ? '接口提示今日已签，服务端状态尚未确认，稍后自动复查'
+      : '接口已受理，服务端状态尚未确认，稍后自动复查';
+  } else {
+    acct.lastState = 'error';
+    acct.lastMsg = `签到失败：${lastErr || '未知错误'}`;
   }
 
-  if (result.state === 'error') {
-    acct.lastState = 'error';
-    acct.lastMsg = `签到失败 code=${result.code} ${result.msg ?? ''}`;
-  } else {
-    acct.lastState = result.state; // 'checked' | 'already'
-    acct.lastMsg = result.state === 'checked'
-      ? (result.credit != null ? `+${result.credit} 积分` : '签到成功')
-      : '今日已签';
-    acct.lastOkDate = today;
-    bumpStreak(acct, today);
-    if (result.state === 'checked') {
-      acct.lastCredit = result.credit;
-      acct.lastCreditDate = today;
-      acct.totalSigned = (acct.totalSigned ?? 0) + 1;
+  // 余额不是签到必需项，6 小时内查过就复用，省子请求配额
+  if (!acct.balanceAt || now - Number(acct.balanceAt) > 6 * 3600e3) {
+    const bal = await fetchBalance(acct).catch(() => null);
+    if (bal) {
+      acct.credits = bal.credits;
+      acct.dosage = bal.dosage;
+      acct.balanceAt = now;
     }
   }
 
   await putAccount(env, acct);
   return {
-    id: acct.id,
-    label: acct.label,
+    ...base,
     state: acct.lastState,
+    verified: !!(confirm.confirmed || alreadyProof),
     msg: acct.lastMsg,
-    credit: result.state === 'checked' ? result.credit : null,
-    streak,
-    total,
+    credit: (confirm.confirmed || alreadyProof) && result && result.state === 'checked' ? result.credit : null,
+    streak: acct.streak ?? null,
+    total: acct.total ?? null,
   };
 }
 
@@ -2438,9 +3045,11 @@ function publicView(a, now, today) {
   const creditToday = a.lastCreditDate
     ? a.lastCreditDate === today
     : (a.lastOkDate === today && (a.lastState === 'checked' || a.lastState === 'already'));
+  const verified = a.verifiedDate === today;
   return {
     id: a.id,
     label: a.label,
+    uid: a.uid || '',
     enabled: a.enabled !== false,
     lastState: a.lastState,
     lastMsg: a.lastMsg,
@@ -2455,8 +3064,26 @@ function publicView(a, now, today) {
     credExp: a.refreshExp || null,
     credKind: 'refresh',
     today,
-    signedToday: a.lastOkDate === today,
+    signedToday: verified,
+    verified,
+    verifiedAt: a.verifiedAt || null,
     ranToday: a.lastRun ? bjDayOf(a.lastRun) === today : false,
+    // 成长中心 · 派猫猫旅行（仅国内版，国际版没有这个活动）
+    autoTravel: a.autoTravel !== false,
+    travel: a.travel
+      ? {
+          label: a.travel.label || 'untraveled',
+          state: a.travel.state || '',
+          locationName: a.travel.locationName || '',
+          rewardCredit: typeof a.travel.rewardCredit === 'number' ? a.travel.rewardCredit : null,
+          departAt: Number(a.travel.departAt) || 0,
+          arriveAt: Number(a.travel.arriveAt) || 0,
+          dailyLimit: a.travel.dailyLimit === true,
+          message: a.travel.message || '',
+          checkedAt: Number(a.travel.checkedAt) || 0,
+          claimedAt: Number(a.travel.claimedAt) || 0,
+        }
+      : { label: 'untraveled', state: '', locationName: '', rewardCredit: null, departAt: 0, arriveAt: 0, dailyLimit: false, message: '今日尚未派发', checkedAt: 0, claimedAt: 0 },
     // 永远不返回令牌，连指纹都不给
   };
 }
@@ -2501,17 +3128,15 @@ async function setEnabled(env, id, enabled) {
   return { id, enabled: !!enabled };
 }
 
-/** 只查状态与连签，不签到。用于控制台「刷新积分」。 */
+/** 只查状态与连签，不签到。用于控制台「刷新 / 复查」。 */
 async function refreshOne(env, id) {
   const now = Date.now();
   const today = bjDayOf(now);
   const acct = await getAccount(env, id);
   if (!acct) throw new Error('账号不存在');
-  const wasCheckedToday = acct.lastOkDate === today && acct.lastState === 'checked';
 
-  let tokens;
   try {
-    tokens = await refreshTokens(acct.refreshToken);
+    await ensureAccess(env, acct);
   } catch (e) {
     acct.lastState = 'token_dead';
     acct.lastMsg = e.message;
@@ -2520,25 +3145,26 @@ async function refreshOne(env, id) {
     return publicView(acct, now, today);
   }
 
-  acct.refreshToken = tokens.refreshToken;
-  acct.tokenRefreshedAt = now;
-  if (tokens.refreshExpiresIn) acct.refreshExp = now + tokens.refreshExpiresIn * 1000;
-
-  const st = await checkinStatus(tokens.accessToken).catch(() => ({ ok: false }));
+  const st = await statusOnce(acct);
   if (st.ok) {
     acct.streak = st.data.streak_days ?? acct.streak ?? null;
     acct.total = st.data.total_credits ?? acct.total ?? null;
-    if (st.data.checked_in_today === true) {
+    acct.verified = st.checked;
+    if (st.checked) {
+      acct.verifiedDate = today;
+      acct.verifiedAt = now;
       acct.lastOkDate = today;
-      bumpStreak(acct, today);
       acct.cooldownUntil = 0;
-      if (!wasCheckedToday && acct.lastState !== 'token_dead') {
+      bumpStreak(acct, today);
+      if (acct.lastState !== 'checked') {
         acct.lastState = 'already';
-        acct.lastMsg = '服务端显示今日已签';
+        acct.lastMsg = '服务端确认今日已签';
       }
+    } else if (acct.lastState === 'unverified') {
+      acct.lastMsg = '服务端仍未确认今日签到，稍后自动重试';
     }
   }
-  const bal = await fetchBalance(tokens.accessToken).catch(() => null);
+  const bal = await fetchBalance(acct).catch(() => null);
   if (bal) {
     acct.credits = bal.credits;
     acct.dosage = bal.dosage;
@@ -2550,24 +3176,62 @@ async function refreshOne(env, id) {
 async function run(env, { force = false, id = '' } = {}) {
   const list = await listAccounts(env);
   const results = [];
+  const retryIds = [];
   for (const meta of list) {
     if (id && meta.id !== id) continue;
     const a = await getAccount(env, meta.id);
     if (!a) continue;
     try {
-      results.push({ platform: 'workbuddy', ...(await signinOne(env, a, { force })) });
+      const r = await signinOne(env, a, { force });
+      results.push({ platform: 'workbuddy', ...r });
+      if (['error', 'unverified', 'pending'].includes(r.state)) retryIds.push(meta.id);
     } catch (e) {
       results.push({ id: a.id, label: a.label, platform: 'workbuddy', state: 'error', msg: e.message });
+      retryIds.push(meta.id);
     }
   }
+
+  // 同一轮里给失败/待确认的账号一次补救机会（网络抖动、状态延迟最常见）
+  if (retryIds.length) {
+    await sleep(2500);
+    for (const rid of retryIds) {
+      const a = await getAccount(env, rid).catch(() => null);
+      if (!a) continue;
+      try {
+        const r = await signinOne(env, a, { force: true });
+        const idx = results.findIndex((x) => x.id === rid);
+        if (idx >= 0) results[idx] = { platform: 'workbuddy', ...r };
+      } catch {
+        /* 补救失败保留第一次的结论 */
+      }
+    }
+  }
+
+  // 签到收尾后顺带同步成长中心旅行：已到达就领、未派就派。
+  // 旅行失败不影响签到结论，单独放在 travels 里返回。
+  let travels = { accounts: 0, results: [] };
+  try {
+    travels = await runTravel(env, { id, onlyAuto: true });
+  } catch (e) {
+    travels = { accounts: 0, results: [], error: e.message };
+  }
+
   return {
     at: new Date(Date.now() + 8 * 3600e3).toISOString().replace('Z', ' +08:00'),
     accounts: results.length,
     checked: results.filter((r) => r.state === 'checked').length,
     already: results.filter((r) => r.state === 'already' || r.state === 'skipped').length,
     failed: results.filter((r) => r.state === 'error' || r.state === 'token_dead').length,
-    cooling: results.filter((r) => ['rate', 'cooldown', 'pending'].includes(r.state)).length,
+    cooling: results.filter((r) => ['rate', 'cooldown', 'pending', 'unverified'].includes(r.state)).length,
     results,
+    travels: travels.results || [],
+    travelSummary: {
+      accounts: travels.accounts || 0,
+      traveling: travels.traveling || 0,
+      finished: travels.finished || 0,
+      failed: travels.failed || 0,
+      error: travels.error || '',
+    },
   };
 }
 
@@ -2640,6 +3304,17 @@ const __mod = {
           return json({ error: e.message }, 502);
         }
       }
+      if (path === '/api/travel' && method === 'POST') {
+        const body = await readBody(request);
+        try {
+          return json(await travel(env, {
+            id: String(body.id ?? '').trim(),
+            action: String(body.action ?? 'sync').trim(),
+          }));
+        } catch (e) {
+          return json({ error: e.message }, 400);
+        }
+      }
       if (path === '/api/login/start' && method === 'POST') return handleLoginStart(request, env);
       if (path === '/api/login/poll' && method === 'GET') return handleLoginPoll(request, env);
       if (path === '/api/remove' && method === 'POST') return handleRemove(request, env);
@@ -2704,6 +3379,8 @@ return {
   remove: removeAccount,
   rename: renameAccount,
   setEnabled,
+  travel,
+  setAutoTravel,
 };
 })();
 /* ================================================================== */
@@ -2727,8 +3404,26 @@ return {
 
 const Qoder = (() => {
 const REGIONS = {
-  cn: { key: 'cn', label: '国内版', web: 'https://qoder.com.cn', api: 'https://openapi.qoder.com.cn' },
-  intl: { key: 'intl', label: '国际版', web: 'https://qoder.com', api: 'https://openapi.qoder.sh' },
+  cn: {
+    key: 'cn',
+    label: '国内版',
+    web: 'https://qoder.com.cn',
+    api: 'https://openapi.qoder.com.cn',
+    clientId: '1c5e33e1-364d-4ce6-b02c-acaa81274a5c',
+    redirectUri: 'qoder-work-cn://',
+    ua: 'QoderWork/1.1.75',
+    nonceDashed: true,
+  },
+  intl: {
+    key: 'intl',
+    label: '国际版',
+    web: 'https://qoder.com',
+    api: 'https://openapi.qoder.sh',
+    clientId: 'e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb',
+    redirectUri: '',
+    ua: 'Qoder/1.1.75',
+    nonceDashed: false,
+  },
 };
 
 function normRegion(v) {
@@ -2747,6 +3442,9 @@ const EP = {
   poll: '/api/v1/deviceToken/poll',
   refresh: '/api/v1/deviceToken/refresh',
   campaigns: '/sash/api/v1/me/campaigns',
+  /* 旧版「每日签到」：活动平台没下发活动时的主通道，国内版实测可用 */
+  checkinStatus: '/sash/api/v1/me/daily-check-in/status',
+  checkinClaim: '/sash/api/v1/me/daily-check-in/claim',
 };
 
 const UA = 'Qoder';
@@ -2758,6 +3456,8 @@ const CLIENT_VERSION = '0.4.8';
 const MACHINE_OS = 'x86_64_win32';
 const LOGIN_TTL = 900;
 const COOLDOWN_MIN = 30;
+/* 领取是写操作，成功/失败都要回查；活动列表偶发返回空，允许短退避重取 */
+const CAMPAIGN_RETRY_DELAYS = [800, 2000];
 
 const CLAIMABLE_RE = /^(CLAIMABLE|UNCLAIMED|UN_CLAIMED|NOT_CLAIMED|CAN_CLAIM|TO_CLAIM|RECEIVABLE|AVAILABLE|PENDING_CLAIM|INIT)$/i;
 const CLAIMED_RE = /^(CLAIMED|ALREADY_CLAIMED|RECEIVED|GRANTED|DONE|USED)$/i;
@@ -2827,20 +3527,23 @@ async function sha256B64Url(text) {
   return SH.b64urlEncode(new Uint8Array(digest));
 }
 
-/** 业务请求头：授权 + 设备通行证，两者缺一服务端就不给每日活动 */
+/**
+ * 业务请求头：只发官方桌面端真正会发的那几项。
+ *
+ * 重要：不要再自行拼 cosy-machine* 全套。服务端会把「派生出来的六件套」
+ * 判定为非官方客户端，直接把 CLAIMABLE 的每日 Credits 活动整条过滤掉，
+ * 表现就是「活动列表里什么都没有，但官方客户端明明能领」。
+ * 没有真实 machineToken 时，一个机器头都不发是最稳的（CN/INTL 实测）。
+ */
 function authHeaders(at, acct, extra) {
   const h = {
+    accept: 'application/json',
+    'user-agent': UA,
     authorization: `Bearer ${at}`,
     'cosy-clienttype': CLIENT_TYPE,
-    'user-agent': UA,
-    accept: 'application/json',
-    'accept-language': LANG,
     'cosy-version': CLIENT_VERSION,
-    'cosy-machineos': MACHINE_OS,
-    'cosy-machinehostname': hostNameOf(acct),
+    'accept-language': LANG,
   };
-  const mid = String(acct && acct.machineId ? acct.machineId : '').trim();
-  if (mid) h['cosy-machineid'] = mid;
   return extra ? Object.assign(h, extra) : h;
 }
 
@@ -2861,11 +3564,17 @@ async function loginStart(region) {
   const reg = REGIONS[normRegion(region)];
   const verifier = SH.randomId(32);
   const challenge = await sha256B64Url(verifier);
-  const nonce = SH.randomHex(16);
+  // CN 的 nonce 是带横线的 UUID，intl 是 32 位 hex
+  const nonce = reg.nonceDashed
+    ? (crypto.randomUUID ? crypto.randomUUID() : SH.randomHex(16))
+    : SH.randomHex(16);
   const machineId = crypto.randomUUID();
 
-  const pairs = [['challenge', challenge], ['challenge_method', 'S256']];
-  pairs.push(['machine_id', machineId], ['nonce', nonce]);
+  const pairs = [['challenge', challenge], ['challenge_method', 'S256'], ['nonce', nonce]];
+  if (reg.redirectUri) pairs.push(['redirect_uri', reg.redirectUri]);
+  if (reg.clientId) pairs.push(['client_id', reg.clientId]);
+  pairs.push(['machine_id', machineId]);
+
   const authUrl = `${reg.web}${EP.devicePage}?${pairs
     .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
     .join('&')}`;
@@ -2875,14 +3584,15 @@ async function loginStart(region) {
 
 /** 202 / 404 都算「用户还没确认」，不算失败 */
 async function loginPoll(region, nonce, verifier) {
+  const reg = REGIONS[normRegion(region)];
   const q = `?nonce=${encodeURIComponent(nonce)}&verifier=${encodeURIComponent(verifier)}&challenge_method=S256`;
-  const r = await qFetch(region, EP.poll + q, {
-    headers: { 'cosy-version': '1.0.1', 'cosy-clienttype': '5', 'user-agent': PROXY_UA },
+  const r = await qFetch(reg.key, EP.poll + q, {
+    headers: { Accept: 'application/json', 'User-Agent': reg.ua },
   });
   if (r.status === 202 || r.status === 404) return { pending: true };
   if (r.status >= 400) return { pending: false, error: `授权轮询失败（HTTP ${r.status}）` };
   const d = r.json && typeof r.json.data === 'object' && r.json.data ? r.json.data : (r.json || {});
-  const accessToken = String(d.token || d.access_token || d.device_token || '').trim();
+  const accessToken = String(d.token || d.device_token || d.deviceToken || d.access_token || '').trim();
   if (!accessToken) return { pending: true };
   return {
     pending: false,
@@ -2893,27 +3603,44 @@ async function loginPoll(region, nonce, verifier) {
   };
 }
 
-/** refreshToken 会轮换，换到的必须立刻回写 */
+/** refreshToken 会轮换，换到的必须立刻回写。drt-=设备令牌，jrt-=jobToken */
 async function refreshTokens(acct) {
   const rt = String(acct.refreshToken || '').trim();
+  const reg = regionOf(acct);
   if (!rt) {
+    if (acct.personalToken) {
+      const got = await exchangePersonalToken(reg, acct.personalToken);
+      acct.accessToken = got.accessToken;
+      if (got.refreshToken) acct.refreshToken = got.refreshToken;
+      acct.credExp = SH.jwtExp(got.accessToken) ? SH.jwtExp(got.accessToken) * 1000 : 0;
+      return got.accessToken;
+    }
     const e = new Error('账号缺少 refreshToken，无法续期，请删掉重新添加');
     e.fatal = true;
     throw e;
   }
-  const r = await qFetch(regionOf(acct), EP.refresh, {
+
+  const path = rt.startsWith('jrt-') ? '/api/v1/jobToken/refresh' : EP.refresh;
+  const r = await qFetch(reg, path, {
     method: 'POST',
-    headers: { 'user-agent': PROXY_UA, 'content-type': 'application/json' },
+    headers: { 'user-agent': PROXY_UA, 'content-type': 'application/json', accept: 'application/json' },
     body: { refresh_token: rt },
   });
   if (r.status === 401 || r.status === 403) {
+    if (acct.personalToken) {
+      const got = await exchangePersonalToken(reg, acct.personalToken);
+      acct.accessToken = got.accessToken;
+      if (got.refreshToken) acct.refreshToken = got.refreshToken;
+      acct.credExp = SH.jwtExp(got.accessToken) ? SH.jwtExp(got.accessToken) * 1000 : 0;
+      return got.accessToken;
+    }
     const e = new Error('refreshToken 已失效，请删掉重新添加');
     e.fatal = true;
     throw e;
   }
   if (r.status >= 400) throw new Error(`令牌续期失败（HTTP ${r.status}）`);
   const d = r.json && typeof r.json.data === 'object' && r.json.data ? r.json.data : (r.json || {});
-  const token = String(d.device_token || d.deviceToken || d.token || d.access_token || '').trim();
+  const token = String(d.device_token || d.job_token || d.jobToken || d.deviceToken || d.token || d.access_token || '').trim();
   if (!token) throw new Error('续期响应里没有新的 access token');
   acct.accessToken = token;
   const nr = String(d.refresh_token || d.refreshToken || '').trim();
@@ -2924,8 +3651,19 @@ async function refreshTokens(acct) {
 }
 
 async function ensureToken(acct) {
-  if (acct.accessToken) return acct.accessToken;
+  const exp = Number(acct.credExp || 0);
+  if (acct.accessToken && (!exp || exp - Date.now() > 5 * 60 * 1000)) return acct.accessToken;
+  if (acct.accessToken && !exp) return acct.accessToken;
   return refreshTokens(acct);
+}
+
+/** 401/403 时强制换一次令牌；轮换结果由调用方落盘 */
+async function rotateToken(acct) {
+  const token = await refreshTokens(acct);
+  acct.accessToken = token;
+  acct.tokenRefreshedAt = Date.now();
+  acct.credExp = SH.jwtExp(token) ? SH.jwtExp(token) * 1000 : 0;
+  return token;
 }
 
 /* ------------------------------------------------------------------ */
@@ -3020,10 +3758,34 @@ function rowLabel(row) {
   return key ? `${key}(${status})` : status;
 }
 
+/** 活动奖励：Credits 类才是「每日签到」；券/兑换码另算 */
+function benefitOf(row) {
+  const b = row && row.benefit;
+  if (b && typeof b === 'object') {
+    return { kind: String(b.kind || b.type || '').toUpperCase(), amount: SH.num(b.amount ?? b.credits) };
+  }
+  return { kind: '', amount: amountOf(row) };
+}
+
+function isDailyCredits(row) {
+  const b = benefitOf(row);
+  if (b.kind) return b.kind === 'CREDITS';
+  return (b.amount || 0) > 0 || ACTION_CLAIM.test(actionOf(row));
+}
+
+/** 领取动作只认这几种；纯 VIEW_DETAILS 的营销卡不能点 */
+function isClaimAction(row) {
+  const a = actionOf(row).toUpperCase();
+  return a === '' || ACTION_CLAIM.test(a);
+}
+
 /**
  * 这一轮到底该干什么：可领 / 本档期已领 / 档期已结束或未开放 / 窗口还没开 / 空。
  * 枚举服务端会改，所以顶层说「能领」但行里筛不到时，兜底挑一行真去试一次，
  * claim 是幂等的，试错不会重复加分；但绝不能因为不认识枚举就报「无活动」。
+ *
+ * 另一个坑：领取成功后官方会把 actionType 降级成 VIEW_DETAILS（国际版实测），
+ * 所以「已领」必须先按 benefit.amount / CLAIMED 归类，再看 actionType。
  */
 function classifyCampaigns(payload, now) {
   const env = campaignEnvelope(payload);
@@ -3038,24 +3800,44 @@ function classifyCampaigns(payload, now) {
   }
 
   const inOpen = rows.filter((r) => windowPhase(r, now) === 'now');
-  const claimable = inOpen.filter((r) => isClaimableRow(r) && idOf(r));
-  claimable.sort((a, b) => {
-    const ia = ACTION_PRIORITY.indexOf(actionOf(a).toUpperCase());
-    const ib = ACTION_PRIORITY.indexOf(actionOf(b).toUpperCase());
-    return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
-  });
+
+  const claimable = inOpen
+    .filter((r) => isClaimableRow(r) && idOf(r) && isClaimAction(r))
+    .sort((a, b) => {
+      // 每日 Credits 优先，其次按动作优先级；奖励大的排前面
+      const da = isDailyCredits(a) ? 0 : 1;
+      const db = isDailyCredits(b) ? 0 : 1;
+      if (da !== db) return da - db;
+      const ia = ACTION_PRIORITY.indexOf(actionOf(a).toUpperCase());
+      const ib = ACTION_PRIORITY.indexOf(actionOf(b).toUpperCase());
+      if (ia !== ib) return (ia < 0 ? 99 : ia) - (ib < 0 ? 99 : ib);
+      return (benefitOf(b).amount || 0) - (benefitOf(a).amount || 0);
+    });
   if (claimable.length) {
-    return { kind: 'claim', target: claimable[0], total: rows.length, seen };
+    return { kind: 'claim', target: claimable[0], candidates: claimable, total: rows.length, seen };
   }
 
   if (env.claimable === true) {
-    const guess = inOpen.find((r) => idOf(r) && !CLAIMED_RE.test(statusOf(r)) && !CLOSED_RE.test(statusOf(r)));
+    const guess = inOpen.find(
+      (r) => idOf(r) && isClaimAction(r) && !CLAIMED_RE.test(statusOf(r)) && !CLOSED_RE.test(statusOf(r))
+    );
     if (guess) return { kind: 'claim', target: guess, fallback: true, total: rows.length, seen };
   }
 
-  const claimedNow = inOpen.find((r) => CLAIMED_RE.test(statusOf(r)));
+  const claimedNow = inOpen.find((r) => {
+    if (!CLAIMED_RE.test(statusOf(r))) return false;
+    const b = benefitOf(r);
+    return (b.amount || 0) > 0 || isClaimAction(r);
+  });
   if (claimedNow) {
-    return { kind: 'already', total: rows.length, seen, reason: `本档期已领取（${rowLabel(claimedNow)}）` };
+    return {
+      kind: 'already',
+      target: claimedNow,
+      daily: isDailyCredits(claimedNow),
+      total: rows.length,
+      seen,
+      reason: `本档期已领取（${rowLabel(claimedNow)}）`,
+    };
   }
 
   const future = rows
@@ -3083,14 +3865,100 @@ async function fetchCampaigns(acct, { force = true } = {}) {
   return qFetch(regionOf(acct), EP.campaigns + (force ? '?forceRefresh=true' : ''), { headers: authHeaders(at, acct) });
 }
 
+/**
+ * 取活动列表并给「空结果/无可领项」一次短退避重试。
+ * 上游偶发返回空（实测 10 次里 2 次），一次空结果就放弃会让当天直接漏签。
+ */
+async function fetchCampaignsWithRetry(acct, now = Date.now()) {
+  let res = await fetchCampaigns(acct, { force: true });
+  let plan = res.status < 400 ? classifyCampaigns(res.json, now) : null;
+  for (const wait of CAMPAIGN_RETRY_DELAYS) {
+    const needsRetry = !plan || plan.kind === 'empty' || (plan.kind === 'closed' && plan.total === 0);
+    if (!needsRetry) break;
+    await sleep(wait);
+    const again = await fetchCampaigns(acct, { force: true });
+    if (again.status < 400) {
+      res = again;
+      plan = classifyCampaigns(again.json, now);
+    }
+  }
+  return { res, plan: plan || classifyCampaigns(res.json, now) };
+}
+
 async function claimCampaign(acct, campaignId) {
   const at = await ensureToken(acct);
   const reg = regionOf(acct);
   return qFetch(reg.key, `${EP.campaigns}/${encodeURIComponent(campaignId)}/claim`, {
     method: 'POST',
-    headers: authHeaders(at, acct, { 'content-type': 'application/json', origin: reg.api }),
+    headers: authHeaders(at, acct, { 'content-type': 'application/json', accept: 'application/json' }),
     body: {},
   });
+}
+
+/* ---------------- 旧版每日签到（活动平台之外的第二条通道） ---------------- */
+
+function todayBj() {
+  return SH.bjDay(Date.now());
+}
+
+function parseDailyStatus(payload) {
+  const raw = payload && typeof payload === 'object' ? payload : {};
+  const d = raw.data && typeof raw.data === 'object' ? raw.data : raw;
+  const status = String(d.status || d.claimStatus || '').toUpperCase();
+  const last = d.lastClaimedAt ?? d.last_claimed_at ?? d.lastCheckinAt ?? 0;
+  let lastDay = '';
+  if (last) {
+    const n = SH.num(last);
+    if (n != null) lastDay = SH.bjDay(n < 1e11 ? n * 1000 : n);
+    else lastDay = String(last).slice(0, 10);
+  }
+  const today = todayBj();
+  return {
+    ok: true,
+    status,
+    // 有些账号的响应不带 lastClaimedAt，只有 CLAIMED；此时按已签处理，
+    // 否则会陷入「接口说已签、状态却永远无法确认」的循环。
+    checked: status === 'CLAIMED' && (!lastDay || lastDay === today),
+    active: status === 'CLAIMABLE' || status === 'CLAIMED',
+    streak: SH.num(d.currentStreakDays ?? d.streak_days ?? d.currentStreak),
+    totalDays: SH.num(d.totalClaimDays ?? d.total_claim_days),
+    reward: SH.num(d.rewardCredits ?? d.reward_credits),
+    lastDay,
+    raw,
+  };
+}
+
+async function dailyCheckinStatus(acct) {
+  const at = await ensureToken(acct);
+  const r = await qFetch(regionOf(acct), EP.checkinStatus, { headers: authHeaders(at, acct) });
+  if (r.status === 404 || r.status === 405 || r.status === 410) {
+    return { ok: false, unavailable: true, http: r.status };
+  }
+  if (r.status === 401 || r.status === 403) return { ok: false, authFailed: true, http: r.status };
+  if (r.status >= 400) return { ok: false, http: r.status, msg: r.json?.msg || r.text.slice(0, 120) };
+  return parseDailyStatus(r.json);
+}
+
+async function claimDailyCheckin(acct) {
+  const at = await ensureToken(acct);
+  const reg = regionOf(acct);
+  const r = await qFetch(reg.key, EP.checkinClaim, {
+    method: 'POST',
+    headers: authHeaders(at, acct, { 'content-type': 'application/json' }),
+    body: {},
+  });
+  const body = r.json && typeof r.json === 'object' ? r.json : {};
+  const text = JSON.stringify(body);
+  const result = String(body.result || body.data?.result || '').toUpperCase();
+  if (r.status === 409 || result === 'ALREADY_CLAIMED' || /ALREADY_CLAIMED|已签到|重复领取/.test(text)) {
+    return { ok: true, already: true, message: '今日已签到' };
+  }
+  if (r.status === 401 || r.status === 403) return { ok: false, authFailed: true, message: '凭证失效' };
+  if (r.status >= 400 || body.success === false) {
+    return { ok: false, message: String(body.error || body.msg || body.message || `HTTP ${r.status}`).slice(0, 160) };
+  }
+  const reward = SH.num(body.rewardCredits ?? body.data?.rewardCredits);
+  return { ok: true, already: false, reward, message: reward != null ? `签到成功 +${reward} Credits` : '签到成功' };
 }
 
 /** 只读诊断：把活动列表原始返回倒出来，确认「无活动」是真的没有还是没解析到 */
@@ -3155,11 +4023,128 @@ async function inspectCampaigns(env, id) {
 
 /* ------------------------------------------------------------------ */
 /* 签到编排                                                            */
+/*                                                                     */
+/* 双通道 + 强制复核：                                                   */
+/*   A. /sash/api/v1/me/daily-check-in/*  旧版每日签到（国内版主通道）    */
+/*   B. /sash/api/v1/me/campaigns/*      活动平台（每日 Credits / 福利） */
+/*                                                                     */
+/* 只有「回查看到 CLAIMED / 今日已签」才算成功；接口 200 只算已提交。    */
 /* ------------------------------------------------------------------ */
+
+function findCampaignRow(payload, id) {
+  const want = String(id || '');
+  return campaignRows(payload).find((r) => idOf(r) === want) || null;
+}
+
+async function campaignsConfirmed(acct, campaignId) {
+  const r = await fetchCampaigns(acct, { force: true });
+  if (r.status >= 400) return { ok: false, http: r.status };
+  const row = findCampaignRow(r.json, campaignId);
+  if (row && CLAIMED_RE.test(statusOf(row))) return { ok: true, row };
+  const plan = classifyCampaigns(r.json, Date.now());
+  if (plan.kind === 'already' && plan.daily) return { ok: true, row: plan.target || null };
+  return { ok: false, row };
+}
+
+async function dailyConfirmed(acct, { tries = 3 } = {}) {
+  for (let i = 0; i < tries; i++) {
+    if (i) await sleep(900 * i);
+    const st = await dailyCheckinStatus(acct).catch(() => null);
+    if (st && st.ok && st.checked) return st;
+  }
+  return null;
+}
+
+async function claimCampaignVerified(env, acct, target) {
+  const cid = idOf(target);
+  const points = benefitOf(target).amount ?? amountOf(target);
+  let lastErr = '';
+  let already = false;
+
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt) await sleep(1500);
+    let res;
+    try {
+      res = await claimCampaign(acct, cid);
+    } catch (e) {
+      lastErr = e.message;
+      continue;
+    }
+    if (res.status === 429) return { state: 'rate', msg: '领取过于频繁（HTTP 429）' };
+
+    const body = res.json || {};
+    const text = JSON.stringify(body);
+    const failure = String(body.failureCode || body.failure_code || body.code || '').toUpperCase();
+    // 同人去重可能以 403 返回，必须先在响应体里识别，不能当凭证失效
+    if (/SAME_PERSON_ALREADY_CLAIMED/.test(text) || /SAME_PERSON_ALREADY_CLAIMED/.test(failure)) {
+      return {
+        state: 'blocked',
+        msg: '同一设备/身份下的其他账号本轮已领取（服务端按人去重）',
+        cooldownMs: 6 * 3600e3,
+      };
+    }
+    if (res.status === 401 || res.status === 403) {
+      await rotateToken(acct);
+      await putAccount(env, acct);
+      lastErr = `HTTP ${res.status}`;
+      continue;
+    }
+    if (res.status === 409 || String(body.result || '').toUpperCase() === 'ALREADY_CLAIMED' || body.replayed === true) {
+      already = true;
+    } else if (res.status >= 400) {
+      lastErr = `领取失败（HTTP ${res.status}）${failure ? ' ' + failure : ''}`;
+      continue;
+    } else if (body.success === false && !CLAIMED_RE.test(String(body.status || ''))) {
+      lastErr = String(body.error || body.msg || '领取返回失败');
+      continue;
+    }
+
+    // 写操作后必须回查，不能拿 200 当成功
+    const verify = await campaignsConfirmed(acct, cid);
+    if (verify.ok) {
+      return {
+        state: already ? 'already' : 'checked',
+        credit: already ? null : points,
+        msg: already ? '今日已领取（复核确认）' : `领取成功${points != null ? ' +' + points + ' Credits' : ''}（已复核）`,
+      };
+    }
+    lastErr = '领取接口已返回，但服务端活动状态尚未变成 CLAIMED';
+  }
+
+  // 活动平台没确认时，再看一眼旧版每日签到（部分账号两条通道共用同一份额度）
+  const daily = await dailyConfirmed(acct, { tries: 2 });
+  if (daily) {
+    return { state: 'checked', credit: points, msg: `已复核确认（连续 ${daily.streak ?? 0} 天）` };
+  }
+  return { state: 'unverified', msg: lastErr || '领取已提交，服务端状态尚未确认，稍后自动复查' };
+}
+
+async function claimDailyVerified(env, acct) {
+  let res = await claimDailyCheckin(acct).catch((e) => ({ ok: false, message: e.message }));
+  if (res.authFailed) {
+    await rotateToken(acct);
+    await putAccount(env, acct);
+    res = await claimDailyCheckin(acct).catch((e) => ({ ok: false, message: e.message }));
+  }
+  const confirmed = await dailyConfirmed(acct, { tries: 3 });
+  if (confirmed) {
+    return {
+      state: res.already ? 'already' : 'checked',
+      credit: res.already ? null : (res.reward ?? confirmed.reward ?? null),
+      streak: confirmed.streak ?? null,
+      msg: res.already ? '今日已签到（复核确认）' : `签到成功${confirmed.reward != null ? ' +' + confirmed.reward + ' Credits' : ''}（已复核）`,
+    };
+  }
+  if (res.ok) {
+    return { state: 'unverified', msg: '签到接口已受理，服务端状态尚未确认，稍后自动复查' };
+  }
+  return { state: 'error', msg: res.message || '签到失败' };
+}
 
 async function signinOne(env, acct, { force = false } = {}) {
   const now = Date.now();
   const today = SH.bjDay(now);
+  const wasVerified = acct.verifiedDate === today;
   const base = { id: acct.id, label: acct.label, platform: 'qoder' };
   acct.lastRun = now;
 
@@ -3169,17 +4154,55 @@ async function signinOne(env, acct, { force = false } = {}) {
   if (!force && Number(acct.cooldownUntil || 0) > now) {
     return { ...base, state: 'cooldown', msg: `冷却中，还有 ${Math.ceil((acct.cooldownUntil - now) / 60000)} 分钟` };
   }
-  if (!force && acct.lastOkDate === today) {
-    return { ...base, state: 'skipped', msg: '今天已领过' };
+  if (!force && acct.verifiedDate === today) {
+    return { ...base, state: 'skipped', verified: true, msg: '今日已确认领取' };
   }
 
-  let listRes;
+  // 1) 令牌：复用未过期 accessToken；即将过期才轮换
   try {
-    listRes = await fetchCampaigns(acct);
-    if (listRes.status === 401 || listRes.status === 403) {
-      await refreshTokens(acct);
-      listRes = await fetchCampaigns(acct);
+    await ensureToken(acct);
+    await putAccount(env, acct);
+  } catch (e) {
+    acct.lastState = e.fatal ? 'token_dead' : 'error';
+    acct.lastMsg = e.message;
+    await putAccount(env, acct);
+    return { ...base, state: acct.lastState, msg: acct.lastMsg };
+  }
+
+  // 2) 通道 A：旧版每日签到（国内版）
+  let daily = await dailyCheckinStatus(acct).catch((e) => ({ ok: false, msg: e.message }));
+  if (daily.authFailed) {
+    try {
+      await rotateToken(acct);
+      await putAccount(env, acct);
+      daily = await dailyCheckinStatus(acct).catch(() => ({ ok: false }));
+    } catch (e) {
+      acct.lastState = 'token_dead';
+      acct.lastMsg = e.message;
+      await putAccount(env, acct);
+      return { ...base, state: 'token_dead', msg: acct.lastMsg };
     }
+  }
+  if (daily.ok && daily.checked) {
+    acct.verifiedDate = today;
+    acct.verifiedAt = now;
+    acct.lastOkDate = today;
+    acct.lastState = 'already';
+    acct.lastMsg = '服务端确认今日已签到';
+    acct.streak = daily.streak ?? acct.streak ?? null;
+    acct.cooldownUntil = 0;
+    bumpStreak(acct, today);
+    await putAccount(env, acct);
+    return { ...base, state: 'already', verified: true, msg: acct.lastMsg, streak: acct.streak };
+  }
+
+  // 3) 通道 B：活动平台（空结果自动短退避重取）
+  let plan = null;
+  let listRes = null;
+  try {
+    const got = await fetchCampaignsWithRetry(acct, now);
+    listRes = got.res;
+    plan = got.plan;
   } catch (e) {
     acct.lastState = 'error';
     acct.lastMsg = `活动列表请求异常: ${e.message}`;
@@ -3194,6 +4217,12 @@ async function signinOne(env, acct, { force = false } = {}) {
     await putAccount(env, acct);
     return { ...base, state: 'rate', msg: acct.lastMsg };
   }
+  if (listRes.status === 401 || listRes.status === 403) {
+    acct.lastState = 'token_dead';
+    acct.lastMsg = `活动列表拒绝访问（HTTP ${listRes.status}），请删除后重新授权`;
+    await putAccount(env, acct);
+    return { ...base, state: 'token_dead', msg: acct.lastMsg };
+  }
   if (listRes.status >= 400) {
     acct.lastState = 'error';
     acct.lastMsg = `活动列表失败（HTTP ${listRes.status}）`;
@@ -3201,98 +4230,130 @@ async function signinOne(env, acct, { force = false } = {}) {
     return { ...base, state: 'error', msg: acct.lastMsg };
   }
 
-  const plan = classifyCampaigns(listRes.json, now);
-  if (plan.kind !== 'claim') {
-    const state = plan.kind === 'already' ? 'already' : 'no_activity';
-    acct.lastState = state;
-    acct.lastMsg = plan.kind === 'already' ? '今日已领取' : plan.reason || '暂无可领活动';
-    if (plan.kind === 'already') acct.lastOkDate = today;
-    if (plan.kind === 'future' && plan.retryAt) acct.nextWindowAt = plan.retryAt;
-    await putAccount(env, acct);
-    return { ...base, state, msg: acct.lastMsg };
-  }
-
-  const campaignId = idOf(plan.target);
-  let claimRes;
-  try {
-    claimRes = await claimCampaign(acct, campaignId);
-  } catch (e) {
-    acct.lastState = 'error';
-    acct.lastMsg = `领取请求异常: ${e.message}`;
-    await putAccount(env, acct);
-    return { ...base, state: 'error', msg: acct.lastMsg };
-  }
-
-  const body = claimRes.json || {};
-  // 注意：领取成功也会返回 status=CLAIMED，只有 409 / ALREADY_CLAIMED / replayed 才算已领
-  const already =
-    claimRes.status === 409 ||
-    String(body.result || '').toUpperCase() === 'ALREADY_CLAIMED' ||
-    body.replayed === true;
-
-  if (already) {
-    acct.lastState = 'already';
-    acct.lastMsg = '今日已领取';
-    acct.lastOkDate = today;
-    acct.cooldownUntil = 0;
-    await putAccount(env, acct);
-    return { ...base, state: 'already', msg: acct.lastMsg };
-  }
-  if (claimRes.status >= 400) {
-    acct.lastState = 'error';
-    acct.lastMsg = `领取失败（HTTP ${claimRes.status}）${SH.num(body.code) != null ? ' code=' + body.code : ''}`;
-    await putAccount(env, acct);
-    return { ...base, state: 'error', msg: acct.lastMsg };
-  }
-
-  const points = amountOf(body) ?? amountOf(plan.target);
-  const claimed = !body.status || CLAIMED_RE.test(String(body.status));
-  acct.lastRun = now;
-  acct.cooldownUntil = 0;
-  if (claimed) {
-    acct.lastState = 'checked';
-    acct.lastMsg = points != null ? `+${points} credits` : '领取成功';
-    acct.lastOkDate = today;
-    acct.lastCredit = points;
-    acct.lastCreditDate = today;
-    acct.totalCredit = (acct.totalCredit || 0) + Number(points || 0);
-    acct.totalSigned = (acct.totalSigned || 0) + 1;
+  // 4) 按活动状态决定动作
+  let outcome = null;
+  if (plan.kind === 'claim') {
+    outcome = await claimCampaignVerified(env, acct, plan.target);
+  } else if (plan.kind === 'already' && (plan.daily || (daily.ok && daily.checked))) {
+    outcome = { state: 'already', msg: '服务端活动状态为 CLAIMED（今日已领）' };
+  } else if (daily.ok && daily.active && !daily.checked) {
+    outcome = await claimDailyVerified(env, acct);
   } else {
-    acct.lastState = 'pending';
-    acct.lastMsg = `已提交，服务端状态 ${body.status}`;
+    const reason = plan.reason || (daily.ok ? `签到活动未开放（status=${daily.status || '?'}）` : '暂无可领活动');
+    outcome = { state: 'no_activity', msg: reason };
   }
+
+  if (outcome.state === 'rate') {
+    acct.lastState = 'rate';
+    acct.lastMsg = outcome.msg;
+    acct.cooldownUntil = now + COOLDOWN_MIN * 60000;
+    await putAccount(env, acct);
+    return { ...base, state: 'rate', msg: acct.lastMsg };
+  }
+  if (outcome.state === 'blocked') {
+    acct.lastState = 'blocked';
+    acct.lastMsg = outcome.msg;
+    acct.cooldownUntil = now + Number(outcome.cooldownMs || 6 * 3600e3);
+    await putAccount(env, acct);
+    return { ...base, state: 'blocked', msg: acct.lastMsg };
+  }
+  if (outcome.state === 'unverified') {
+    acct.lastState = 'unverified';
+    acct.lastMsg = outcome.msg;
+    await putAccount(env, acct);
+    return { ...base, state: 'unverified', verified: false, msg: acct.lastMsg };
+  }
+  if (outcome.state === 'error') {
+    acct.lastState = 'error';
+    acct.lastMsg = outcome.msg;
+    await putAccount(env, acct);
+    return { ...base, state: 'error', msg: acct.lastMsg };
+  }
+  if (outcome.state === 'no_activity') {
+    acct.lastState = 'no_activity';
+    acct.lastMsg = outcome.msg;
+    acct.lastRun = now;
+    await putAccount(env, acct);
+    return { ...base, state: 'no_activity', msg: acct.lastMsg };
+  }
+
+  // 5) 已复核的成功
+  const already = outcome.state === 'already';
+  acct.verifiedDate = today;
+  acct.verifiedAt = now;
+  acct.lastOkDate = today;
+  acct.lastState = already ? 'already' : 'checked';
+  acct.lastMsg = outcome.msg;
+  acct.cooldownUntil = 0;
+  acct.streak = outcome.streak ?? daily.streak ?? acct.streak ?? null;
+  if (!already) {
+    acct.lastCredit = outcome.credit ?? null;
+    acct.lastCreditDate = today;
+    acct.totalCredit = (acct.totalCredit || 0) + Number(outcome.credit || 0);
+    if (!wasVerified) acct.totalSigned = (acct.totalSigned || 0) + 1;
+  }
+  bumpStreak(acct, today);
+
+  if (!acct.balanceAt || now - Number(acct.balanceAt) > 6 * 3600e3) {
+    const bal = await fetchCredits(acct).catch(() => null);
+    if (bal != null) {
+      acct.credits = bal;
+      acct.balanceAt = now;
+    }
+  }
+
   await putAccount(env, acct);
   return {
     ...base,
     state: acct.lastState,
+    verified: true,
     msg: acct.lastMsg,
-    credit: claimed ? points : null,
+    credit: already ? null : (outcome.credit ?? null),
+    credits: acct.credits ?? null,
+    streak: acct.streak ?? null,
     totalCredit: acct.totalCredit,
   };
 }
 
-/** 只读刷新：重查活动列表，把「今日是否已领」对上，不领取 */
+/** 只读刷新：重查两条通道，把「今日是否已领」对上，不领取 */
 async function refreshOne(env, id) {
   const now = Date.now();
   const today = SH.bjDay(now);
   const acct = await getAccount(env, id);
   if (!acct) throw new Error('账号不存在');
   try {
-    const r = await fetchCampaigns(acct, { force: true });
-    if (r.status === 401 || r.status === 403) {
-      await refreshTokens(acct);
-      return publicView(acct, now, today);
+    await ensureToken(acct);
+    const daily = await dailyCheckinStatus(acct).catch(() => null);
+    if (daily && daily.ok) {
+      acct.streak = daily.streak ?? acct.streak ?? null;
+      if (daily.checked) {
+        acct.verifiedDate = today;
+        acct.verifiedAt = now;
+        acct.lastOkDate = today;
+        acct.lastState = 'already';
+        acct.lastMsg = '服务端确认今日已签到';
+        bumpStreak(acct, today);
+      }
     }
+    const r = await fetchCampaigns(acct, { force: true });
     if (r.status < 400) {
       const plan = classifyCampaigns(r.json, now);
-      if (plan.kind === 'already') {
+      if (plan.kind === 'already' || (daily && daily.checked)) {
+        acct.verifiedDate = today;
+        acct.verifiedAt = acct.verifiedAt || now;
         acct.lastOkDate = today;
         if (acct.lastState !== 'checked') {
           acct.lastState = 'already';
-          acct.lastMsg = '服务端显示今日已领';
+          acct.lastMsg = acct.lastMsg && /确认/.test(acct.lastMsg) ? acct.lastMsg : '服务端显示今日已领取';
         }
+        bumpStreak(acct, today);
       }
+    } else if (r.status === 401 || r.status === 403) {
+      acct.lastState = 'token_dead';
+      acct.lastMsg = '凭证失效，请删除后重新授权';
     }
+    const bal = await fetchCredits(acct).catch(() => null);
+    if (bal != null) acct.credits = bal;
   } catch (e) {
     if (e.fatal) {
       acct.lastState = 'token_dead';
@@ -3303,8 +4364,22 @@ async function refreshOne(env, id) {
   return publicView(acct, now, today);
 }
 
+/** 积分余额：官方 0.4.8 的 quota/usage，读失败不影响签到 */
+async function fetchCredits(acct) {
+  const at = await ensureToken(acct);
+  const r = await qFetch(regionOf(acct), '/api/v2/quota/usage', { headers: authHeaders(at, acct) });
+  if (r.status >= 400 || !r.json) return null;
+  const d = r.json.data && typeof r.json.data === 'object' ? r.json.data : r.json;
+  for (const k of ['remainingCredits', 'remainCredits', 'availableCredits', 'creditsRemaining', 'balance']) {
+    const v = SH.num(d[k]);
+    if (v != null) return Math.round(v * 100) / 100;
+  }
+  return null;
+}
+
 function publicView(a, now, today) {
   const creditToday = a.lastCreditDate ? a.lastCreditDate === today : false;
+  const verified = a.verifiedDate === today;
   return {
     id: a.id,
     label: a.label,
@@ -3314,15 +4389,17 @@ function publicView(a, now, today) {
     lastRun: a.lastRun ? SH.fmtBj(a.lastRun) : null,
     lastOkDate: a.lastOkDate ?? null,
     lastCredit: creditToday ? (a.lastCredit ?? null) : null,
-    credits: null,
+    credits: typeof a.credits === 'number' ? a.credits : null,
     total: null,
-    streak: null,
+    streak: a.streak ?? null,
     totalSigned: a.totalSigned ?? 0,
     totalCredit: a.totalCredit ?? 0,
     credExp: a.credExp || null,
     credKind: 'access',
     cooldownUntil: Number(a.cooldownUntil || 0) > now ? a.cooldownUntil : 0,
-    signedToday: a.lastOkDate === today,
+    signedToday: verified,
+    verified,
+    verifiedAt: a.verifiedAt || null,
     ranToday: a.lastRun ? SH.bjDay(a.lastRun) === today : false,
     platform: 'qoder',
     region: normRegion(a.region),
@@ -3346,40 +4423,92 @@ async function list(env) {
 async function run(env, { force = false, id = '' } = {}) {
   const entries = await listRaw(env);
   const results = [];
+  const retryIds = [];
   for (const meta of entries) {
     if (id && meta.id !== id) continue;
     const acct = await getAccount(env, meta.id);
     if (!acct) continue;
     try {
-      results.push(await signinOne(env, acct, { force }));
+      const r = await signinOne(env, acct, { force });
+      results.push(r);
+      if (['error', 'unverified'].includes(r.state)) retryIds.push(meta.id);
     } catch (e) {
       results.push({ id: acct.id, label: acct.label, platform: 'qoder', state: 'error', msg: e.message });
+      retryIds.push(meta.id);
     }
   }
+
+  // 上游偶发空列表/状态延迟：同一轮内补一次
+  if (retryIds.length) {
+    await sleep(2500);
+    for (const rid of retryIds) {
+      const acct = await getAccount(env, rid).catch(() => null);
+      if (!acct) continue;
+      try {
+        const r = await signinOne(env, acct, { force: true });
+        const idx = results.findIndex((x) => x.id === rid);
+        if (idx >= 0) results[idx] = r;
+      } catch {
+        /* 保留第一次的结论 */
+      }
+    }
+  }
+
   return {
     at: SH.fmtBj(Date.now()),
     accounts: results.length,
     checked: results.filter((r) => r.state === 'checked').length,
     already: results.filter((r) => r.state === 'already' || r.state === 'skipped').length,
     failed: results.filter((r) => r.state === 'error' || r.state === 'token_dead').length,
-    cooling: results.filter((r) => ['rate', 'cooldown'].includes(r.state)).length,
+    cooling: results.filter((r) => ['rate', 'cooldown', 'unverified', 'blocked'].includes(r.state)).length,
     results,
   };
 }
 
+/** Qoder PAT（pt-）→ jobToken；PAT 最长可用一年，是设备授权失败时的备用入口 */
+async function exchangePersonalToken(region, personalToken) {
+  const r = await qFetch(region, '/api/v1/jobToken/exchange', {
+    method: 'POST',
+    headers: { 'user-agent': UA, 'content-type': 'application/json', accept: 'application/json' },
+    body: { personal_token: personalToken },
+  });
+  if (r.status >= 400) {
+    throw new Error(`PAT 交换失败（HTTP ${r.status}）：${r.json?.message || r.json?.msg || ''}`.trim());
+  }
+  const d = r.json?.data && typeof r.json.data === 'object' ? r.json.data : (r.json || {});
+  const token = String(d.token || d.jobToken || d.access_token || '').trim();
+  if (!token) throw new Error('PAT 交换响应里没有 jobToken');
+  return {
+    accessToken: token,
+    refreshToken: String(d.refresh_token || d.refreshToken || '').trim(),
+    uid: String(d.uid || d.user_id || '').trim(),
+    expireAt: SH.num(d.expire_time || d.expires_at || d.expiresAt),
+  };
+}
+
 async function add(env, { creds = {}, label = '' } = {}) {
-  const accessToken = SH.stripBearer(creds.access_token || creds.token || '');
-  const refreshToken = String(creds.refresh_token || '').trim();
-  if (!accessToken && !refreshToken) throw new Error('缺少 access_token 或 refresh_token');
+  let accessToken = SH.stripBearer(creds.access_token || creds.token || '');
+  let refreshToken = String(creds.refresh_token || '').trim();
+  const personalToken = String(creds.personal_token || '').trim();
+  let uid = String(creds.uid || '').trim();
+  const region = normRegion(creds.region);
+  if (!accessToken && personalToken) {
+    const got = await exchangePersonalToken(REGIONS[region], personalToken);
+    accessToken = got.accessToken;
+    refreshToken = got.refreshToken || refreshToken;
+    uid = uid || got.uid;
+  }
+  if (!accessToken && !refreshToken) throw new Error('缺少 access_token / refresh_token / personal_token');
   const id = SH.randomId(9);
   const acct = {
     id,
     label: String(label).trim().slice(0, 40) || `Qoder-${id.slice(0, 4)}`,
     accessToken,
     refreshToken,
+    personalToken,
     machineId: String(creds.machine_id || '').trim(),
-    uid: String(creds.uid || '').trim(),
-    region: normRegion(creds.region),
+    uid,
+    region,
     createdAt: Date.now(),
     lastState: 'new',
     lastMsg: '尚未运行',
@@ -3620,7 +4749,9 @@ function createTokenPlatform(cfg) {
       credExp: a.credExp || null,
       credKind: META.credKind || 'static',
       cooldownUntil: Number(a.cooldownUntil || 0) > now ? a.cooldownUntil : 0,
-      signedToday: a.lastOkDate === today,
+      signedToday: a.verifiedDate === today || a.lastOkDate === today,
+      verified: a.verifiedDate === today,
+      verifiedAt: a.verifiedAt || null,
       ranToday: a.lastRun ? SH.bjDay(a.lastRun) === today : false,
       platform: META.key,
     };
@@ -3683,6 +4814,7 @@ function createTokenPlatform(cfg) {
   async function runOne(env, acct, { force = false } = {}) {
     const now = Date.now();
     const today = SH.bjDay(now);
+    const wasVerified = acct.verifiedDate === today;
     const base = { id: acct.id, label: acct.label, platform: META.key };
 
     if (acct.enabled === false) return { ...base, state: 'disabled', msg: '账号已停用' };
@@ -3692,7 +4824,14 @@ function createTokenPlatform(cfg) {
       return { ...base, state: 'cooldown', msg: `限流冷却中，约 ${left} 分钟` };
     }
 
-    if (!force && acct.lastOkDate === today && acct.lastState !== 'error' && acct.lastState !== 'token_dead') {
+    if (!force && acct.verifiedDate === today) {
+      return { ...base, state: 'skipped', verified: true, msg: '今日已确认' };
+    }
+    if (
+      !force &&
+      acct.lastOkDate === today &&
+      (acct.lastState === 'checked' || acct.lastState === 'already')
+    ) {
       return { ...base, state: 'skipped', msg: '今日已完成' };
     }
     if (!force && acct.noActivityDate === today) {
@@ -3708,6 +4847,73 @@ function createTokenPlatform(cfg) {
       acct.lastRun = now;
       await putAccount(env, acct);
       return { ...base, state: acct.lastState, msg: e.message };
+    }
+
+    // 0) 平台自带完整流程（多步接口 / 签名 / 回查）：交给 cfg.checkin
+    if (cfg.checkin) {
+      let r;
+      try {
+        r = await cfg.checkin(env, prepared, acct);
+      } catch (e) {
+        acct.lastState = e.auth ? 'token_dead' : 'error';
+        acct.lastMsg = e.message;
+        acct.lastRun = now;
+        await putAccount(env, acct);
+        return { ...base, state: acct.lastState, msg: acct.lastMsg };
+      }
+      if (r.creds) acct.creds = r.creds;
+      if (r.credits != null) acct.credits = r.credits;
+      if (r.streak != null) acct.streak = r.streak;
+      if (r.credExp) acct.credExp = r.credExp;
+      if (r.uid) acct.uid = r.uid;
+      acct.lastRun = now;
+      if (r.state === 'checked' || r.state === 'already') {
+        const verified = r.verified !== false;
+        if (verified) {
+          acct.verifiedDate = today;
+          acct.verifiedAt = now;
+          acct.lastOkDate = today;
+          acct.noActivityDate = 0;
+          acct.cooldownUntil = 0;
+          bumpStreak(acct, today);
+          if (r.state === 'checked') {
+            acct.lastCredit = r.credit ?? null;
+            acct.lastCreditDate = today;
+            if (r.credit != null) acct.totalCredit = (acct.totalCredit || 0) + Number(r.credit || 0);
+            if (!wasVerified) acct.totalSigned = (acct.totalSigned || 0) + 1;
+          }
+        }
+        acct.lastState = verified ? r.state : 'unverified';
+        acct.lastMsg = r.msg || (verified ? '签到成功' : '接口已受理，服务端尚未确认');
+        await putAccount(env, acct);
+        return {
+          ...base,
+          state: acct.lastState,
+          verified,
+          msg: acct.lastMsg,
+          credit: verified && r.state === 'checked' ? (r.credit ?? null) : null,
+          credits: acct.credits ?? null,
+          streak: acct.streak ?? null,
+        };
+      }
+      if (r.state === 'no_activity') {
+        acct.lastState = 'no_activity';
+        acct.lastMsg = r.msg || '当前没有可签到的活动';
+        acct.noActivityDate = today;
+        await putAccount(env, acct);
+        return { ...base, state: 'no_activity', msg: acct.lastMsg, credits: acct.credits ?? null };
+      }
+      if (r.state === 'rate' || r.state === 'blocked') {
+        acct.lastState = r.state;
+        acct.lastMsg = r.msg || '限流';
+        acct.cooldownUntil = now + Number(r.cooldownMs || 30 * 60000);
+        await putAccount(env, acct);
+        return { ...base, state: r.state, msg: acct.lastMsg };
+      }
+      acct.lastState = r.auth ? 'token_dead' : (r.state || 'error');
+      acct.lastMsg = r.msg || '签到失败';
+      await putAccount(env, acct);
+      return { ...base, state: acct.lastState, msg: acct.lastMsg };
     }
 
     // 1) 先查状态；状态查询失败不致命，继续尝试领取
@@ -3746,13 +4952,22 @@ function createTokenPlatform(cfg) {
       }
     }
 
-    // 2) 领取（各平台都是幂等的）
-    let cl;
-    try {
-      cl = await readClaim(env, prepared);
-    } catch (e) {
+    // 2) 领取（各平台都是幂等的）；网络抖动/5xx 再试一次
+    let cl = null;
+    let claimErr = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+      if (attempt) await sleep(1500);
+      try {
+        cl = await readClaim(env, prepared);
+        break;
+      } catch (e) {
+        claimErr = e.message;
+        cl = null;
+      }
+    }
+    if (!cl) {
       acct.lastState = 'error';
-      acct.lastMsg = `签到请求异常: ${e.message}`;
+      acct.lastMsg = `签到请求异常: ${claimErr}`;
       acct.lastRun = now;
       await putAccount(env, acct);
       return { ...base, state: 'error', msg: acct.lastMsg };
@@ -3793,18 +5008,49 @@ function createTokenPlatform(cfg) {
       return { ...base, state: 'error', msg: acct.lastMsg };
     }
 
-    // 3) 成功 / 今日已领
+    // 3) 成功 / 今日已领 —— 再回查一次，只有服务端确认才落成功日期
+    let verified = true;
+    let verifyMsg = '';
+    if (typeof cfg.verify === 'function') {
+      try {
+        const v = await cfg.verify(env, prepared, cl);
+        verified = v !== false;
+        if (v && v.message) verifyMsg = v.message;
+      } catch {
+        verified = true; // 复核本身失败不推翻已经成功的领取结果
+      }
+    } else if (cfg.urls && cl.already !== true) {
+      try {
+        const st2 = await readStatus(env, prepared);
+        if (st2 && st2.ok && st2.trustworthy !== false && st2.checked === false) {
+          verified = false;
+          verifyMsg = '接口已受理，服务端状态尚未确认';
+        }
+      } catch {
+        /* 状态查询失败不阻塞 */
+      }
+    }
+
+    if (!verified) {
+      acct.lastState = 'unverified';
+      acct.lastMsg = verifyMsg || '接口已受理，服务端状态尚未确认，稍后自动复查';
+      await putAccount(env, acct);
+      return { ...base, state: 'unverified', verified: false, msg: acct.lastMsg };
+    }
+
+    acct.verifiedDate = today;
+    acct.verifiedAt = now;
     acct.lastOkDate = today;
     bumpStreak(acct, today);
     acct.noActivityDate = 0;
     acct.lastState = cl.already ? 'already' : 'checked';
-    acct.lastMsg = cl.message || (cl.already ? '今日已签' : '签到成功');
+    acct.lastMsg = (cl.message || (cl.already ? '今日已签' : '签到成功')) + (verifyMsg ? '；' + verifyMsg : '');
     acct.cooldownUntil = 0;
     if (!cl.already) {
       acct.lastCredit = cl.credit ?? null;
       acct.lastCreditDate = today;
       if (cl.credit != null) acct.totalCredit = (acct.totalCredit || 0) + Number(cl.credit || 0);
-      acct.totalSigned = (acct.totalSigned || 0) + 1;
+      if (!wasVerified) acct.totalSigned = (acct.totalSigned || 0) + 1;
     }
     if (cl.credits != null) acct.credits = cl.credits;
     if (cl.streak != null) acct.streak = cl.streak;
@@ -3825,6 +5071,7 @@ function createTokenPlatform(cfg) {
     return {
       ...base,
       state: acct.lastState,
+      verified: true,
       msg: acct.lastMsg,
       credit: cl.already ? null : cl.credit ?? null,
       credits: acct.credits ?? null,
@@ -3835,23 +5082,44 @@ function createTokenPlatform(cfg) {
   async function run(env, { force = false, id = '' } = {}) {
     const entries = await listRaw(env);
     const results = [];
+    const retryIds = [];
     for (const meta of entries) {
       if (id && meta.id !== id) continue;
       const a = await getAccount(env, meta.id).catch(() => null);
       if (!a) continue;
       try {
-        results.push(await runOne(env, a, { force }));
+        const r = await runOne(env, a, { force });
+        results.push(r);
+        if (['error', 'unverified'].includes(r.state)) retryIds.push(meta.id);
       } catch (e) {
         results.push({ id: a.id, label: a.label, platform: META.key, state: 'error', msg: e.message });
+        retryIds.push(meta.id);
       }
     }
+
+    // 同一轮内给失败/待确认的账号一次补救机会
+    if (retryIds.length) {
+      await sleep(2500);
+      for (const rid of retryIds) {
+        const a = await getAccount(env, rid).catch(() => null);
+        if (!a) continue;
+        try {
+          const r = await runOne(env, a, { force: true });
+          const idx = results.findIndex((x) => x.id === rid);
+          if (idx >= 0) results[idx] = r;
+        } catch {
+          /* 保留第一次结论 */
+        }
+      }
+    }
+
     return {
       at: SH.fmtBj(Date.now()),
       accounts: results.length,
       checked: results.filter((r) => r.state === 'checked').length,
       already: results.filter((r) => ['already', 'skipped'].includes(r.state)).length,
       failed: results.filter((r) => ['error', 'token_dead'].includes(r.state)).length,
-      cooling: results.filter((r) => ['rate', 'cooldown', 'pending'].includes(r.state)).length,
+      cooling: results.filter((r) => ['rate', 'cooldown', 'pending', 'unverified', 'blocked'].includes(r.state)).length,
       noActivity: results.filter((r) => r.state === 'no_activity').length,
       results,
     };
@@ -3900,6 +5168,8 @@ function createTokenPlatform(cfg) {
       if (st.credExp) acct.credExp = st.credExp;
       if (st.uid) acct.uid = st.uid;
       if (st.checked && st.trustworthy !== false) {
+        acct.verifiedDate = today;
+        acct.verifiedAt = now;
         acct.lastOkDate = today;
         bumpStreak(acct, today);
         acct.cooldownUntil = 0;
@@ -4927,8 +6197,558 @@ async function intlKeepalive(p) {
   return false;
 }
 /* ================================================================== */
-/* 模块五：外壳 —— 平台注册表 / 聚合接口 / 定时任务                     */
+/* 平台七～九：MiniMax Code / 百度搭子 DuMate / LobsterAI              */
+/*                                                                     */
+/* 这三个平台都是「粘贴凭证 + 多步接口」，用 cfg.checkin 完整接管：       */
+/*   - 先查状态，已签就跳过                                             */
+/*   - 领取后再查一次状态，确认到账才算成功                              */
+/*   - 令牌可续期，续期结果立刻写回账号记录                              */
 /* ================================================================== */
+
+/* ---------------- MiniMax Code ---------------- */
+
+const MINIMAX_HOSTS = ['https://agent.minimax.cn', 'https://agent.minimaxi.com'];
+const MINIMAX_OAUTH = 'https://account.minimax.cn/oauth2/token';
+const MINIMAX_DEVICE_ORDER = [
+  'device_platform', 'biz_id', 'app_id', 'version_code', 'unix',
+  'timezone_offset', 'is_desktop', 'desktop_version', 'sys_language',
+  'lang', 'uuid', 'device_id', 'os_name', 'browser_name', 'device_memory',
+  'cpu_core_num', 'browser_language', 'browser_platform', 'user_id',
+  'op_ticket', 'screen_width', 'screen_height',
+];
+
+function minimaxEnc(v) {
+  return encodeURIComponent(String(v));
+}
+
+function minimaxSign(pathWithQuery, bodyStr, nowMs) {
+  const sec = Math.floor(nowMs / 1000);
+  const inner = SH.md5(String(nowMs));
+  return {
+    signature: SH.md5(`${sec}I*7Cf%WZ#S&%1RlZJ&C2${bodyStr}`),
+    yy: SH.md5(`${minimaxEnc(pathWithQuery)}_${'{}'}${inner}ooui`),
+    sec,
+  };
+}
+
+function minimaxEnvelopeOk(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  const br = payload.base_resp;
+  if (br && typeof br === 'object' && Number(br.status_code) === 0) return true;
+  const code = Number(payload.code);
+  if (Number.isFinite(code) && (code === 0 || code === 200)) return true;
+  return payload.success === true || String(payload.status || '').toLowerCase() === 'success';
+}
+
+async function minimaxOauthRefresh(creds) {
+  if (!creds.refresh_token) return null;
+  const form = new URLSearchParams({
+    grant_type: 'refresh_token',
+    refresh_token: creds.refresh_token,
+    client_id: 'mcode-public',
+    scope: 'agent.default',
+    audience: 'agent-backend',
+  }).toString();
+  const r = await SH.httpJson(MINIMAX_OAUTH, {
+    method: 'POST',
+    headers: { Accept: 'application/json', 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form,
+  });
+  const d = r.json || {};
+  const at = String(d.access_token || '');
+  if (!at) return null;
+  return {
+    access_token: at,
+    refresh_token: String(d.refresh_token || creds.refresh_token || ''),
+    expires_at: Date.now() + (Number(d.expires_in) || 3600) * 1000,
+  };
+}
+
+function minimaxParams(prepared, nowMs) {
+  const claims = SH.jwtClaims(prepared.access_token);
+  const seed = String(prepared.device_id || prepared.uuid || claims.device_id || prepared.access_token || '');
+  const hash = SH.md5('minimax:' + seed);
+  return {
+    device_platform: 'web',
+    biz_id: '3',
+    app_id: '3001',
+    version_code: String(prepared.version_code || '22201'),
+    unix: String(nowMs),
+    timezone_offset: '28800',
+    is_desktop: '1',
+    desktop_version: String(prepared.desktop_version || '3.1.4'),
+    sys_language: 'zh',
+    lang: 'zh',
+    uuid: String(prepared.uuid || (hash.slice(0, 8) + '-' + hash.slice(8, 12) + '-4' + hash.slice(13, 16) + '-a' + hash.slice(17, 20) + '-' + hash.slice(20, 32))),
+    device_id: String(prepared.device_id || hash.slice(0, 16)),
+    os_name: 'Windows',
+    browser_name: 'Chrome',
+    device_memory: '16',
+    cpu_core_num: '4',
+    browser_language: 'zh-CN',
+    browser_platform: 'Win32',
+    user_id: String(prepared.user_id || claims.user_id || claims.uid || claims.sub || ''),
+    op_ticket: 'undefined',
+    screen_width: '1366',
+    screen_height: '768',
+  };
+}
+
+async function minimaxCall(prepared, path, method, body = {}) {
+  const nowMs = Date.now();
+  const params = minimaxParams(prepared, nowMs);
+  params.client = 'desktop';
+  const qs = MINIMAX_DEVICE_ORDER.concat(['client'])
+    .map((k) => `${k}=${encodeURIComponent(params[k] ?? '')}`)
+    .join('&');
+  const bodyStr = method === 'GET' ? '' : JSON.stringify(body);
+  const full = `${path}?${qs}`;
+  const { signature, yy, sec } = minimaxSign(full, bodyStr, nowMs);
+  const headers = {
+    yy,
+    'x-timestamp': String(sec),
+    'x-signature': signature,
+    origin: 'https://agent.minimax.cn',
+    referer: 'https://agent.minimax.cn/',
+    accept: 'application/json, text/plain, */*',
+    'user-agent': 'MiniMaxAgent Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.7778.280 Safari/537.36 MiniMax/3.1.4',
+  };
+  if (prepared.access_token.startsWith('mmoat_') || prepared.refresh_token || prepared.expires_at) headers.Authorization = 'Bearer ' + prepared.access_token;
+  else headers.token = prepared.access_token;
+  if (method !== 'GET') headers['content-type'] = 'application/json';
+
+  let last = null;
+  for (const host of MINIMAX_HOSTS) {
+    try {
+      last = await SH.httpJson(host + full, { method, headers, body: bodyStr || undefined, timeout: 20000 });
+      if (last.status !== 404) return last;
+    } catch {
+      /* 换下一个 host */
+    }
+  }
+  return last || { status: 0, json: null, text: '' };
+}
+
+async function minimaxBalance(prepared) {
+  const r = await minimaxCall(prepared, '/matrix/api/v1/commerce/get_membership_info', 'POST', {});
+  if (!minimaxEnvelopeOk(r.json)) return null;
+  const raw = r.json?.op_credit_summary?.total_remaining_amount;
+  return SH.num(raw);
+}
+
+const MiniMax = createTokenPlatform({
+  keyInfo: 'minimax-signin/v1/account',
+  meta: {
+    key: 'minimax',
+    label: 'MiniMax Code',
+    accent: 'amber',
+    verified: false,
+    verifiedNote: '接口与签名按桌面端 3.1.4 复刻；如换版本可用字段覆盖 version_code / desktop_version',
+    addMode: 'token',
+    defaultHost: 'agent.minimax.cn',
+    supportsRefresh: true,
+    credKind: 'access',
+    fields: [
+      { name: 'access_token', label: 'access_token', required: true, secret: true, placeholder: 'mmoat_… 或 local-runtime 里的 JWT' },
+      { name: 'refresh_token', label: 'refresh_token', optional: true, secret: true, placeholder: 'mmort_…（OAuth 令牌建议填，1 小时自动续期）' },
+      { name: 'device_id', label: 'device_id', optional: true, placeholder: '可留空；从客户端日志里取更稳' },
+      { name: 'uuid', label: 'uuid', optional: true, placeholder: '可留空' },
+      { name: 'user_id', label: 'user_id', optional: true, placeholder: '可留空；JWT 里有就用 JWT 的' },
+    ],
+    hint: '从 ~/.minimax/auth/prod/cn/mcode-public/auth.json 取 accessToken / refreshToken；device_id 可留空自动派生。',
+    note: '签到是每日 OP 积分（默认 400/天，第 4/7 天有额外奖励）。',
+  },
+  primaryFields: ['access_token'],
+  normalize: (c) => ({
+    access_token: SH.stripBearer(c.access_token),
+    refresh_token: String(c.refresh_token || '').trim(),
+    device_id: String(c.device_id || '').trim(),
+    uuid: String(c.uuid || '').trim(),
+    user_id: String(c.user_id || '').trim(),
+    version_code: String(c.version_code || '').trim(),
+    desktop_version: String(c.desktop_version || '').trim(),
+  }),
+  identity: (c) => {
+    const claims = SH.jwtClaims(c.access_token);
+    if (!claims || !Object.keys(claims).length) return {};
+    return {
+      uid: String(claims.uid || claims.user_id || claims.sub || ''),
+      label: String(claims.nickname || claims.name || claims.email || '').trim(),
+      credExp: SH.num(claims.exp) ? SH.num(claims.exp) * 1000 : null,
+    };
+  },
+  hasCredential: (c) => !!c.access_token || !!c.refresh_token,
+  probe: async (env, c) => {
+    const r = await minimaxCall(c, '/minimax-cloud/api/v1/signin/status', 'GET');
+    if (r.status === 401 || r.status === 403) return { ok: false, authFailed: true, message: 'access_token 已失效' };
+    if (!minimaxEnvelopeOk(r.json)) {
+      return { ok: false, message: `状态查询失败（HTTP ${r.status}）${r.json?.base_resp?.status_msg || ''}` };
+    }
+    const t = (r.json?.data?.days || []).find((d) => d && d.is_today);
+    return {
+      ok: true,
+      checked: !!t && Number(t.status) === 3,
+      trustworthy: true,
+      streak: t?.day_no ?? null,
+      credits: await minimaxBalance(c).catch(() => null),
+      message: t && Number(t.status) === 3 ? '服务端显示今日已签' : '',
+    };
+  },
+  prepare: async (env, c, acct) => {
+    if (!c.access_token && !c.refresh_token) throw new PlatformAuthError('未配置 access_token / refresh_token');
+    const exp = Number(c.expires_at || 0) || SH.jwtExp(c.access_token) * 1000;
+    if (c.refresh_token && (!c.access_token || (exp && exp - Date.now() < 5 * 60000))) {
+      const got = await minimaxOauthRefresh(c).catch(() => null);
+      if (got) {
+        Object.assign(c, got);
+        if (acct) acct.creds = { ...c };
+      }
+    }
+    if (!c.access_token) throw new PlatformAuthError('MiniMax access_token 为空，且续期失败，请重新粘贴');
+    return { ...c };
+  },
+  checkin: async (env, c) => {
+    const statusRes = await minimaxCall(c, '/minimax-cloud/api/v1/signin/status', 'GET');
+    if (statusRes.status === 401 || statusRes.status === 403) {
+      const got = await minimaxOauthRefresh(c).catch(() => null);
+      if (!got) return { auth: true, msg: 'access_token 已失效，请重新粘贴（建议同时填 refresh_token）' };
+      Object.assign(c, got);
+      return { state: 'unverified', creds: { ...c }, msg: '令牌已续期，本轮未完成，下一轮自动继续' };
+    }
+    if (!minimaxEnvelopeOk(statusRes.json)) {
+      return { state: 'error', msg: `状态查询失败（HTTP ${statusRes.status}）${statusRes.json?.base_resp?.status_msg || ''}` };
+    }
+    const days = statusRes.json?.data?.days || [];
+    const today = days.find((d) => d && d.is_today) || null;
+    const dayNo = today?.day_no ?? null;
+    if (today && Number(today.status) === 3) {
+      return { state: 'already', msg: `今日已签到${dayNo ? `（第 ${dayNo} 天）` : ''}`, credits: await minimaxBalance(c).catch(() => null) };
+    }
+
+    const claimRes = await minimaxCall(c, '/minimax-cloud/api/v1/signin/claim', 'POST', {});
+    if (claimRes.status === 401 || claimRes.status === 403) {
+      return { auth: true, msg: '领取时被拒绝：access_token 失效' };
+    }
+    if (!minimaxEnvelopeOk(claimRes.json)) {
+      return { state: 'error', msg: `领取失败（HTTP ${claimRes.status}）${claimRes.json?.base_resp?.status_msg || ''}` };
+    }
+    const cdata = claimRes.json?.data || {};
+    if (Number(cdata.claim_result) === 2) {
+      return { state: 'already', msg: '今日已签到（服务端返回已领取）', credits: await minimaxBalance(c).catch(() => null) };
+    }
+
+    // 回查确认
+    let confirmed = null;
+    for (let i = 0; i < 3; i++) {
+      if (i) await sleep(1000 * i);
+      const again = await minimaxCall(c, '/minimax-cloud/api/v1/signin/status', 'GET').catch(() => null);
+      const d = again?.json?.data?.days || [];
+      const t = d.find((x) => x && x.is_today);
+      if (t && Number(t.status) === 3) { confirmed = t; break; }
+    }
+    const points = SH.num(cdata.points);
+    const credits = await minimaxBalance(c).catch(() => null);
+    if (!confirmed) {
+      return { state: 'unverified', msg: '领取接口已返回，服务端签到状态尚未确认，稍后自动复查', credits };
+    }
+    return {
+      state: 'checked',
+      credit: points,
+      streak: dayNo,
+      credits,
+      msg: `签到成功${points != null ? ` +${points} 积分` : ''}${dayNo ? `（第 ${dayNo} 天）` : ''}（已复核）`,
+    };
+  },
+});
+
+/* ---------------- 百度搭子 DuMate ---------------- */
+
+const DUMATE_API = 'https://console.bce.baidu.com';
+
+function dumateHeaders(c) {
+  const cookie = String(c.cookie || '').trim();
+  const h = {
+    Accept: 'application/json, text/plain, */*',
+    'Content-Type': 'application/json',
+    'X-Requested-With': 'XMLHttpRequest',
+    Origin: DUMATE_API,
+    Referer: DUMATE_API + '/',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36',
+    Cookie: cookie,
+  };
+  let csrf = String(c.csrftoken || '').trim();
+  if (!csrf) {
+    const m = /(?:^|;\s*)bce-user-info=([^;]+)/.exec(cookie);
+    if (m) csrf = decodeURIComponent(m[1].replace(/^"|"$/g, ''));
+  }
+  if (csrf) h.csrftoken = csrf;
+  return h;
+}
+
+function dumateUnwrap(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  if (Number(payload.code) === 0 || payload.success === true) {
+    return payload.result && typeof payload.result === 'object' ? payload.result : (payload.data && typeof payload.data === 'object' ? payload.data : {});
+  }
+  return null;
+}
+
+function dumateChecked(payload) {
+  const d = dumateUnwrap(payload);
+  if (!d) return null;
+  const days = d.signInDays || d.sign_in_days || [];
+  const today = SH.bjDay(Date.now());
+  return days.some((x) => String(x).startsWith(today));
+}
+
+const DuMate = createTokenPlatform({
+  keyInfo: 'dumate-signin/v1/account',
+  meta: {
+    key: 'dumate',
+    label: '百度搭子 DuMate',
+    accent: 'blue',
+    verified: false,
+    verifiedNote: '接口按桌面端整理；Cookie 过期后需重新粘贴',
+    addMode: 'token',
+    defaultHost: 'console.bce.baidu.com',
+    supportsRefresh: false,
+    credKind: 'static',
+    fields: [
+      { name: 'cookie', label: 'Cookie', required: true, secret: true, placeholder: '登录 console.bce.baidu.com 后复制完整 Cookie', multiline: true },
+      { name: 'csrftoken', label: 'csrftoken', optional: true, secret: true, placeholder: '可留空，自动从 bce-user-info 取' },
+    ],
+    hint: '浏览器登录 console.bce.baidu.com → F12 → Network → 任意请求的 Cookie 整段复制。',
+    note: '每日登录奖励 500 积分；BDUSS / bce-user-info 过期后需要重新粘贴。',
+  },
+  primaryFields: ['cookie'],
+  normalize: (c) => ({
+    cookie: String(c.cookie || '').trim().replace(/^cookie:\s*/i, ''),
+    csrftoken: String(c.csrftoken || '').trim(),
+  }),
+  hasCredential: (c) => !!c.cookie,
+  probe: async (env, c) => {
+    const r = await SH.httpJson(DUMATE_API + '/api/dumate/points/loginBonusInfo', {
+      method: 'GET',
+      headers: dumateHeaders(c),
+    });
+    if (r.status === 401 || r.status === 403) return { ok: false, authFailed: true, message: 'Cookie 已失效' };
+    const d = dumateUnwrap(r.json);
+    if (!d) return { ok: false, message: `登录奖励信息读取失败（HTTP ${r.status}）` };
+    return {
+      ok: true,
+      checked: dumateChecked(r.json) === true,
+      trustworthy: true,
+      credits: await dumateBalance(c).catch(() => null),
+      message: dumateChecked(r.json) ? '服务端显示今日已签' : '',
+    };
+  },
+  prepare: async (env, c) => {
+    if (!c.cookie) throw new PlatformAuthError('未配置 Cookie');
+    if (!/(?:^|;\s*)(BDUSS|bce-user-info)=/.test(c.cookie)) {
+      throw new PlatformAuthError('Cookie 里没有 BDUSS / bce-user-info，请复制完整 Cookie');
+    }
+    return { ...c };
+  },
+  checkin: async (env, c) => {
+    const info = await SH.httpJson(DUMATE_API + '/api/dumate/points/loginBonusInfo', {
+      method: 'GET',
+      headers: dumateHeaders(c),
+    });
+    if (info.status === 401 || info.status === 403) return { auth: true, msg: 'Cookie 已失效，请重新粘贴' };
+    const infoData = dumateUnwrap(info.json);
+    if (!infoData) return { state: 'error', msg: `登录奖励信息读取失败（HTTP ${info.status}）` };
+    if (dumateChecked(info.json)) {
+      return { state: 'already', msg: '今日已签到', credits: await dumateBalance(c).catch(() => null) };
+    }
+
+    const claim = await SH.httpJson(DUMATE_API + '/api/dumate/points/loginBonus', {
+      method: 'POST',
+      headers: dumateHeaders(c),
+      body: '{}',
+    });
+    if (claim.status === 401 || claim.status === 403) return { auth: true, msg: 'Cookie 已失效，请重新粘贴' };
+    const claimData = dumateOr(claim.json);
+    const claimed = dumateChecked(claim.json) || claimData?.success === true || Number(claim.json?.code) === 0;
+
+    // 回查确认
+    let confirmed = false;
+    for (let i = 0; i < 3; i++) {
+      if (i) await sleep(1000 * i);
+      const again = await SH.httpJson(DUMATE_API + '/api/dumate/points/loginBonusInfo', {
+        method: 'GET',
+        headers: dumateHeaders(c),
+      }).catch(() => null);
+      if (again && dumateChecked(again.json)) { confirmed = true; break; }
+    }
+    const credits = await dumateBalance(c).catch(() => null);
+    if (confirmed) return { state: 'checked', credit: 500, credits, msg: '签到成功 +500 积分（已复核）' };
+    if (claimed) return { state: 'unverified', msg: '领取接口已返回，服务端签到状态尚未确认，稍后自动复查', credits };
+    return { state: 'error', msg: claim.json?.message || claim.json?.msg || '领取失败' };
+  },
+});
+
+function dumateOr(payload) {
+  const d = dumateUnwrap(payload);
+  return d || (payload && typeof payload === 'object' ? payload : {});
+}
+
+async function dumateBalance(c) {
+  const r = await SH.httpJson(
+    DUMATE_API + '/api/dumate/points/quota_overview?timezone=Asia/Shanghai&clientType=desktop&ignoreLoginBonus=true',
+    { method: 'GET', headers: dumateHeaders(c) }
+  );
+  const d = dumateUnwrap(r.json);
+  if (!d) return null;
+  const total = SH.num(d.totalPoints);
+  const used = SH.num(d.usedPoints) || 0;
+  return total == null ? null : Math.round((total - used) * 100) / 100;
+}
+
+/* ---------------- LobsterAI（网易有道） ---------------- */
+
+const LOBSTER_API = 'https://lobsterai-server.youdao.com';
+const LOBSTER_VERSION = '2026.9.4';
+
+function lobsterHeaders(c) {
+  return {
+    Authorization: 'Bearer ' + c.access_token,
+    'Content-Type': 'application/json',
+    Accept: 'application/json',
+    'User-Agent': `Mozilla/5.0 LobsterAI/${String(c.client_version || LOBSTER_VERSION)}`,
+  };
+}
+
+async function lobsterProfile(c) {
+  const r = await SH.httpJson(LOBSTER_API + '/api/user/profile-summary?firstKeyfrom=official', {
+    method: 'GET',
+    headers: lobsterHeaders(c),
+  });
+  if (Number(r.json?.code) !== 0) return null;
+  const d = r.json.data || {};
+  return { credits: SH.num(d.totalCreditsRemaining), total: SH.num(d.totalCreditsRemaining) };
+}
+
+async function lobsterSlot(c) {
+  const ver = String(c.client_version || LOBSTER_VERSION);
+  const qs = `?placement=desktop_sidebar&clientVersion=${encodeURIComponent(ver)}&containerApiVersion=2&platform=win32`;
+  return SH.httpJson(LOBSTER_API + '/api/client-activities/slot' + qs, {
+    method: 'GET',
+    headers: lobsterHeaders(c),
+  });
+}
+
+async function lobsterContext(c, code, revision) {
+  const qs = `?configRevision=${encodeURIComponent(revision ?? '')}`;
+  return SH.httpJson(LOBSTER_API + `/api/client-activities/${encodeURIComponent(code)}/context${qs}`, {
+    method: 'GET',
+    headers: lobsterHeaders(c),
+  });
+}
+
+const Lobster = createTokenPlatform({
+  keyInfo: 'lobster-signin/v1/account',
+  meta: {
+    key: 'lobster',
+    label: 'LobsterAI',
+    accent: 'rose',
+    verified: false,
+    verifiedNote: '接口按桌面端 2026.9.4 整理；版本升级可用字段覆盖 client_version',
+    addMode: 'token',
+    defaultHost: 'lobsterai-server.youdao.com',
+    supportsRefresh: false,
+    credKind: 'static',
+    fields: [
+      { name: 'access_token', label: 'accessToken', required: true, secret: true, placeholder: 'LobsterAI 数据库 kv.auth_tokens 里的 accessToken' },
+      { name: 'client_version', label: '客户端版本', optional: true, placeholder: '默认 2026.9.4' },
+    ],
+    hint: '从 %APPDATA%\\LobsterAI\\lobsterai.sqlite 的 kv 表里取 auth_tokens.accessToken。',
+    note: '每日积分礼 100 积分；错误码 51104 = 今日已领。',
+  },
+  primaryFields: ['access_token'],
+  normalize: (c) => ({
+    access_token: SH.stripBearer(c.access_token),
+    client_version: String(c.client_version || '').trim(),
+  }),
+  identity: (c) => {
+    const claims = SH.jwtClaims(c.access_token);
+    if (!claims || !Object.keys(claims).length) return {};
+    return {
+      uid: String(claims.uid || claims.user_id || claims.sub || ''),
+      label: String(claims.nickname || claims.name || '').trim(),
+      credExp: SH.num(claims.exp) ? SH.num(claims.exp) * 1000 : null,
+    };
+  },
+  hasCredential: (c) => !!c.access_token,
+  probe: async (env, c) => {
+    const slot = await lobsterSlot(c);
+    if (slot.status === 401 || slot.status === 403) return { ok: false, authFailed: true, message: 'accessToken 已失效' };
+    if (Number(slot.json?.code) !== 0) {
+      return { ok: false, message: `活动信息读取失败：${slot.json?.message || 'code=' + slot.json?.code}` };
+    }
+    const sd = slot.json.data || {};
+    const activity = sd.activity || {};
+    const balance = (await lobsterProfile(c).catch(() => null))?.credits ?? null;
+    if (!activity.activityCode || sd.slotState !== 'available') {
+      return { ok: true, checked: false, trustworthy: true, credits: balance, message: '当前没有每日积分礼活动' };
+    }
+    const ctx = await lobsterContext(c, activity.activityCode, activity.configRevision);
+    const checked = isTrue(ctx.json?.data?.state?.claimedToday);
+    return { ok: true, checked, trustworthy: true, credits: balance, message: checked ? '服务端显示今日已签' : '' };
+  },
+  prepare: async (env, c) => {
+    if (!c.access_token) throw new PlatformAuthError('未配置 accessToken');
+    return { ...c };
+  },
+  checkin: async (env, c) => {
+    const slot = await lobsterSlot(c);
+    if (slot.status === 401 || slot.status === 403) return { auth: true, msg: 'accessToken 已失效' };
+    if (Number(slot.json?.code) !== 0) {
+      return { state: 'error', msg: `活动信息读取失败：${slot.json?.message || slot.json?.error || 'code=' + slot.json?.code}` };
+    }
+    const sd = slot.json.data || {};
+    const activity = sd.activity || {};
+    const code = activity.activityCode;
+    const revision = activity.configRevision;
+    if (!code || sd.slotState !== 'available') {
+      return { state: 'no_activity', msg: '当前没有每日积分礼活动', credits: (await lobsterProfile(c).catch(() => null))?.credits };
+    }
+
+    const ctx = await lobsterContext(c, code, revision);
+    const state = ctx.json?.data?.state || {};
+    const balance = (await lobsterProfile(c).catch(() => null))?.credits ?? null;
+    if (isTrue(state.claimedToday)) return { state: 'already', msg: '今日已签到', credits: balance };
+
+    const act = await SH.httpJson(LOBSTER_API + `/api/client-activities/${encodeURIComponent(code)}/actions/check_in`, {
+      method: 'POST',
+      headers: lobsterHeaders(c),
+      body: JSON.stringify({
+        configRevision: revision,
+        idempotencyKey: `daily-check-in-${crypto.randomUUID()}`,
+        payload: {},
+      }),
+    });
+    const errCode = Number(act.json?.code);
+    if (errCode === 51104) return { state: 'already', msg: '今日已签到', credits: balance };
+    if (errCode === 51102) return { auth: true, msg: 'accessToken 已失效' };
+    if (errCode === 51100 || errCode === 51101) return { state: 'no_activity', msg: `活动不可用（code=${errCode}）` };
+    if (errCode !== 0) {
+      return { state: 'error', msg: act.json?.message || act.json?.error || `签到失败（HTTP ${act.status}）` };
+    }
+
+    // 回查确认
+    let confirmed = false;
+    for (let i = 0; i < 3; i++) {
+      if (i) await sleep(1000 * i);
+      const again = await lobsterContext(c, code, revision).catch(() => null);
+      if (isTrue(again?.json?.data?.state?.claimedToday)) { confirmed = true; break; }
+    }
+    const reward = SH.num(state.rewardCredits) ?? 100;
+    if (confirmed) return { state: 'checked', credit: reward, credits: balance, msg: `签到成功 +${reward} 积分（已复核）` };
+    return { state: 'unverified', msg: '签到接口已返回，服务端状态尚未确认，稍后自动复查', credits: balance };
+  },
+});
+
+
 
 /* ---------------- 绑定适配 ---------------- */
 
@@ -5036,8 +6856,8 @@ const QODER_META = {
   defaultHost: 'openapi.qoder.com.cn',
   supportsRefresh: true,
   fields: [],
-  hint: '点「添加账号」打开官方授权页，登录并确认后自动入库。',
-  note: '国内版签到档期已结束；每日 credits 在国际版，每天 10:00 开窗，一窗一次。',
+  hint: '点「添加账号」打开官方授权页，登录并确认后自动入库；也可以粘贴 Personal Access Token。',
+  note: '同时走「旧版每日签到」和「活动平台」两条通道，领取后会回查确认。',
 };
 
 const PLATFORMS = [
@@ -5045,6 +6865,9 @@ const PLATFORMS = [
   { key: 'workbuddy', meta: WB_META, mod: WorkBuddy, env: wbEnv, prefix: 'wb:' },
   { key: 'qoder', meta: QODER_META, mod: Qoder, env: (env) => platformEnv(env, 'qoder:'), prefix: 'qoder:' },
   { key: 'workbuddy_intl', meta: WorkBuddyIntl.meta, mod: WorkBuddyIntl, env: (env) => platformEnv(env, 'wbi:'), prefix: 'wbi:' },
+  { key: 'minimax', meta: MiniMax.meta, mod: MiniMax, env: (env) => platformEnv(env, 'minimax:'), prefix: 'minimax:' },
+  { key: 'dumate', meta: DuMate.meta, mod: DuMate, env: (env) => platformEnv(env, 'dumate:'), prefix: 'dumate:' },
+  { key: 'lobster', meta: Lobster.meta, mod: Lobster, env: (env) => platformEnv(env, 'lobster:'), prefix: 'lobster:' },
   { key: 'zhipu', meta: Zhipu.meta, mod: Zhipu, env: (env) => platformEnv(env, 'zhipu:'), prefix: 'zhipu:' },
   { key: 'loomy', meta: Loomy.meta, mod: Loomy, env: (env) => platformEnv(env, 'loomy:'), prefix: 'loomy:' },
   { key: 'astudio', meta: AStudio.meta, mod: AStudio, env: (env) => platformEnv(env, 'astudio:'), prefix: 'astudio:' },
@@ -5059,6 +6882,9 @@ const NS_MAP = {
   qoder: PLATFORM_MAP.qoder,
   wbi: PLATFORM_MAP.workbuddy_intl,
   workbuddy_intl: PLATFORM_MAP.workbuddy_intl,
+  minimax: PLATFORM_MAP.minimax,
+  dumate: PLATFORM_MAP.dumate,
+  lobster: PLATFORM_MAP.lobster,
   zhipu: PLATFORM_MAP.zhipu,
   loomy: PLATFORM_MAP.loomy,
   astudio: PLATFORM_MAP.astudio,
@@ -5307,6 +7133,7 @@ async function recordHistory(env, platform, results, action) {
       id: r.id || '',
       label: r.label || '',
       state: r.state || 'error',
+      verified: r.verified === true,
       msg: r.msg || '',
       credit: typeof r.credit === 'number' ? r.credit : (typeof r.points === 'number' ? r.points : null),
       action,
@@ -5352,7 +7179,9 @@ async function overview(env) {
   const todayCredit = signed.reduce((sum, a) => sum + (typeof a.lastCredit === 'number' ? a.lastCredit : 0), 0);
   const totalSigned = accounts.reduce((sum, a) => sum + (Number(a.totalSigned) || 0), 0);
   const counts = {};
+  const states = {};
   for (const entry of PLATFORMS) counts[entry.key] = accounts.filter((a) => a.platform === entry.key).length;
+  for (const a of enabled) states[a.lastState || 'new'] = (states[a.lastState || 'new'] || 0) + 1;
 
   const crons = await readCrons(env);
   const cron = cronInfo(env, crons);
@@ -5368,10 +7197,16 @@ async function overview(env) {
       total: accounts.length,
       enabled: enabled.length,
       signed: signed.length,
+      verified: enabled.filter((a) => a.verified === true).length,
+      unverified: enabled.filter((a) => a.lastState === 'unverified').length,
+      failed: enabled.filter((a) => ['error', 'token_dead'].includes(a.lastState)).length,
+      blocked: enabled.filter((a) => a.lastState === 'blocked').length,
+      noActivity: enabled.filter((a) => a.lastState === 'no_activity').length,
+      pending: enabled.filter((a) => !a.signedToday && !['unverified', 'error', 'token_dead', 'no_activity', 'blocked', 'rate', 'cooldown'].includes(a.lastState)).length,
       todayCredit: Math.round(todayCredit * 100) / 100,
       totalSigned,
-      noActivity: accounts.filter((a) => a.lastState === 'no_activity').length,
     },
+    stateCounts: states,
     platformCounts: counts,
     platforms: PLATFORMS.map((p) => metaOf(p, env)),
     accounts,
@@ -5393,17 +7228,26 @@ async function runPlatform(entry, env, { force = false, id = '', action = 'run' 
   }
 }
 
-async function runAll(env, { force = false, action = 'cron' } = {}) {
+async function runAll(env, { force = false, action = 'cron', notify = null } = {}) {
   const out = { at: SH.fmtBj(Date.now()) };
   for (const entry of PLATFORMS) {
     out[entry.key] = await runPlatform(entry, env, { force, action });
     // 兼容旧版 /cron 响应里的 wb 键
     if (entry.key === 'workbuddy') out.wb = out[entry.key];
   }
-  try {
-    out.notify = await notifyRun(env, out);
-  } catch (e) {
-    out.notify = { error: e.message };
+
+  // 多次 Cron 重试时默认不重复推送：只在「本轮确有新结果」时通知
+  const counts = Object.values(out).filter((x) => x && Array.isArray(x.results));
+  const hasWork = counts.some(
+    (s) => s.checked > 0 || s.failed > 0 || (s.results || []).some((r) => ['checked', 'error', 'token_dead', 'blocked'].includes(r.state))
+  );
+  const shouldNotify = notify === true || (notify !== false && hasWork);
+  if (shouldNotify) {
+    try {
+      out.notify = await notifyRun(env, out);
+    } catch (e) {
+      out.notify = { error: e.message };
+    }
   }
   return out;
 }
@@ -5758,7 +7602,7 @@ const __worker = {
         const entry = NS_MAP[ns];
         return await entry.mod.fetch(repath(request, path.slice(ns.length + 1) || '/'), entry.env(env), ctx);
       }
-      if (path === '/trae' || path === '/wb' || path === '/wbi' || path === '/qoder' || path === '/zhipu' || path === '/loomy' || path === '/astudio') {
+      if (path === '/trae' || path === '/wb' || path === '/wbi' || path === '/qoder' || path === '/minimax' || path === '/dumate' || path === '/lobster' || path === '/zhipu' || path === '/loomy' || path === '/astudio') {
         return Response.redirect(url.origin + '/', 302);
       }
 
@@ -5822,6 +7666,23 @@ const __worker = {
       if (path === '/api/accounts/rename' && method === 'POST') return handleRenameAccount(request, env);
       if (path === '/api/accounts/enable' && method === 'POST') return handleEnableAccount(request, env);
       if (path === '/api/accounts/refresh' && method === 'POST') return handleRefreshAccount(request, env);
+      if (path === '/api/accounts/travel' && method === 'POST') {
+        const body = await readBody(request);
+        const entry = platformOf(body);
+        if (!entry) return jsonResponse({ error: '未知平台' }, 400);
+        if (typeof entry.mod.travel !== 'function') {
+          return jsonResponse({ error: `${entry.meta.label} 没有成长中心旅行` }, 400);
+        }
+        try {
+          const result = await entry.mod.travel(entry.env(env), {
+            id: String(body.id || '').trim(),
+            action: String(body.action || 'sync').trim(),
+          });
+          return jsonResponse({ platform: entry.key, ...result });
+        } catch (e) {
+          return jsonResponse({ error: e.message }, 400);
+        }
+      }
       if (path === '/api/refresh-all' && method === 'POST') return jsonResponse(await refreshAll(env));
 
       if (path === '/api/notify' && method === 'GET') {
@@ -5880,7 +7741,9 @@ const __worker = {
     }
   },
 
-  /** Cloudflare Cron Trigger：所有平台依次签到，互不影响 */
+  /** Cloudflare Cron Trigger：所有平台依次签到，互不影响
+   *  推荐配置多条 Cron（如 08:10 / 12:10 / 20:10）：已验证的账号会自动跳过，
+   *  失败/待确认的账号在后续触发里继续重试，避免一次抖动就断签。 */
   async scheduled(event, env, ctx) {
     ctx.waitUntil(
       (async () => {
@@ -5889,7 +7752,9 @@ const __worker = {
         } catch {
           /* cron 记录失败不影响签到 */
         }
-        await runAll(env, { force: false, action: 'cron' });
+        const hour = SH.bjHour();
+        // 早班固定推一条日报；其余触发只在确有新结果/失败时才推
+        await runAll(env, { force: false, action: 'cron', notify: hour === 8 ? true : null });
       })().catch(() => {})
     );
   },
@@ -5897,1707 +7762,2075 @@ const __worker = {
 /* ================================================================== */
 /* 模块六：控制台页面                                                   */
 /*                                                                     */
-/* 视觉参考「签到台」：黑白灰 + 单一强调色，用排版和 1px 分割线建立     */
-/* 层次；平台用色条/标签区分，账号用首字头像区分。                      */
+/* 视觉：Apple 设计语言——浅色优先、系统蓝强调色、白色卡片与柔和     */
+/* 阴影，1px 发丝线建立层次；深色模式使用纯黑底与 #1c1c1e 卡片。      */
+/* 平台用系统色渐变的圆角图标区分，账号用首字头像区分。                */
 /* ================================================================== */
 
 const PAGE = `<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="day">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="theme-color" content="#e9edec" media="(prefers-color-scheme:light)">
-<meta name="theme-color" content="#0a0e10" media="(prefers-color-scheme:dark)">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' fill='%230a0e10'/%3E%3Cpath d='M14 17 L31 32 L14 47' fill='none' stroke='%233fd699' stroke-width='7' stroke-linecap='round' stroke-linejoin='round'/%3E%3Crect x='33' y='41' width='18' height='7' fill='%233fd699'/%3E%3C/svg%3E">
-<title>签到值班台 · checkin-hub</title>
-<script>(function(){try{if(localStorage.getItem("checkin-theme")==="light")document.documentElement.setAttribute("data-theme","light");}catch(e){}}());</script>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>签到塔 · SIGN-IN TOWER</title>
+<meta name="description" content="十个 AI 工具的每日签到与 WorkBuddy 自动旅行，一个安静、清晰的控制台。">
+<script>try{if(localStorage.getItem('tower.theme')==='night')document.documentElement.setAttribute('data-theme','night');}catch(e){}</script>
 <style>
-/*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */
-@layer properties{@supports (((-webkit-hyphens:none)) and (not (margin-trim:inline))) or ((-moz-orient:inline) and (not (color:rgb(from red r g b)))){*,:before,:after,::backdrop{--tw-translate-x:0;--tw-translate-y:0;--tw-translate-z:0;--tw-border-style:solid;--tw-blur:initial;--tw-brightness:initial;--tw-contrast:initial;--tw-grayscale:initial;--tw-hue-rotate:initial;--tw-invert:initial;--tw-opacity:initial;--tw-saturate:initial;--tw-sepia:initial;--tw-drop-shadow:initial;--tw-drop-shadow-color:initial;--tw-drop-shadow-alpha:100%;--tw-drop-shadow-size:initial;--tw-font-weight:initial;--tw-tracking:initial;--tw-leading:initial;--tw-space-y-reverse:0}}}@layer theme{:root,:host{--font-sans:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";--font-mono:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;--spacing:.25rem;--font-weight-normal:400;--font-weight-medium:500;--font-weight-semibold:600;--tracking-tight:-.025em;--leading-tight:1.25;--leading-relaxed:1.625;--default-transition-duration:.15s;--default-transition-timing-function:cubic-bezier(.4, 0, .2, 1);--default-font-family:var(--font-sans);--default-mono-font-family:var(--font-mono);--font-display:ui-monospace, "Cascadia Mono", Menlo, Consolas, "PingFang SC", "Microsoft YaHei", monospace;--font-body:ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", "PingFang SC", "Microsoft YaHei", monospace;--font-num:ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, "Liberation Mono", monospace}}@layer base{*,:after,:before,::backdrop{box-sizing:border-box;border:0 solid;margin:0;padding:0}::file-selector-button{box-sizing:border-box;border:0 solid;margin:0;padding:0}html,:host{-webkit-text-size-adjust:100%;tab-size:4;line-height:1.5;font-family:var(--default-font-family,-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", "Noto Sans", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji");font-feature-settings:var(--default-font-feature-settings,normal);font-variation-settings:var(--default-font-variation-settings,normal);-webkit-tap-highlight-color:transparent}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;-webkit-text-decoration:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,samp,pre{font-family:var(--default-mono-font-family,ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace);font-feature-settings:var(--default-mono-font-feature-settings,normal);font-variation-settings:var(--default-mono-font-variation-settings,normal);font-size:1em}small{font-size:80%}sub,sup{vertical-align:baseline;font-size:75%;line-height:0;position:relative}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}:-moz-focusring:where(:not(iframe)){outline:auto}progress{vertical-align:baseline}summary{display:list-item}ol,ul,menu{list-style:none}img,svg,video,canvas,audio,iframe,embed,object{vertical-align:middle;display:block}img,video{max-width:100%;height:auto}button,input,select,optgroup,textarea{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}::file-selector-button{font:inherit;font-feature-settings:inherit;font-variation-settings:inherit;letter-spacing:inherit;color:inherit;opacity:1;background-color:#0000;border-radius:0}:where(select:is([multiple],[size])) optgroup{font-weight:bolder}:where(select:is([multiple],[size])) optgroup option{padding-inline-start:20px}::file-selector-button{margin-inline-end:4px}::placeholder{opacity:1}@supports (not ((-webkit-appearance:-apple-pay-button))) or (contain-intrinsic-size:1px){::placeholder{color:currentColor}@supports (color:color-mix(in lab, red, red)){::placeholder{color:color-mix(in oklab, currentcolor 50%, transparent)}}}textarea{resize:vertical}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-date-and-time-value{min-height:1lh;text-align:inherit}::-webkit-datetime-edit{display:inline-flex}::-webkit-datetime-edit-fields-wrapper{padding:0}::-webkit-datetime-edit{padding-block:0}::-webkit-datetime-edit-year-field{padding-block:0}::-webkit-datetime-edit-month-field{padding-block:0}::-webkit-datetime-edit-day-field{padding-block:0}::-webkit-datetime-edit-hour-field{padding-block:0}::-webkit-datetime-edit-minute-field{padding-block:0}::-webkit-datetime-edit-second-field{padding-block:0}::-webkit-datetime-edit-millisecond-field{padding-block:0}::-webkit-datetime-edit-meridiem-field{padding-block:0}::-webkit-calendar-picker-indicator{line-height:1}:-moz-ui-invalid{box-shadow:none}button,input:where([type=button],[type=reset],[type=submit]){appearance:button}::file-selector-button{appearance:button}::-webkit-inner-spin-button{height:auto}::-webkit-outer-spin-button{height:auto}[hidden]:where(:not([hidden=until-found])){display:none!important}html{background:var(--c-bg)}body{background-color:var(--c-bg);color:var(--c-ink);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,PingFang SC,Microsoft YaHei,monospace;font-size:13px;line-height:1.55}::selection{background:var(--c-signed);color:var(--c-bg)}:focus-visible{outline:2px solid var(--c-focus);outline-offset:1px}input,button,select,textarea{font:inherit;color:inherit}h1,h2,h3{--tw-font-weight:var(--font-weight-normal);font-weight:var(--font-weight-normal)}code{white-space:nowrap;color:var(--c-ink);background:var(--c-panel2);border:1px solid var(--c-rule);padding:0 4px;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:.95em}@media (prefers-reduced-motion:reduce){*{transition-duration:.001ms!important;animation-duration:.001ms!important}}}@layer components{.panel{display:none}.panel.active{display:block}.guide-panel{display:none}.guide-panel.active{display:block}.shell{width:100%;padding-inline:calc(var(--spacing) * 3);padding-bottom:calc(var(--spacing) * 16);margin-inline:auto}@media (min-width:40rem){.shell{padding-inline:calc(var(--spacing) * 5)}}.shell{max-width:1180px}.topbar{align-items:center;gap:calc(var(--spacing) * 3);border-bottom:1px solid var(--c-rule2);flex-wrap:wrap;padding:11px 0 10px;display:flex}.brand{align-items:center;gap:calc(var(--spacing) * 2);--tw-tracking:var(--tracking-tight);letter-spacing:var(--tracking-tight);font-size:15px;display:inline-flex}.brand .caret{background:var(--c-signed);flex-shrink:0;width:8px;height:15px;display:inline-block}.scope{color:var(--c-ink3);font-size:12px}.topbar-right{align-items:center;gap:calc(var(--spacing) * 1.5);flex-wrap:wrap;margin-left:auto;display:flex}.statusline{margin-top:calc(var(--spacing) * 2.5);background:var(--c-panel);border:1px solid var(--c-rule);border-left:3px solid var(--c-signed);flex-wrap:wrap;display:flex}.sl-cell{min-width:116px;padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2.5);border-right:1px solid var(--c-rule);flex-grow:1}.sl-cell:last-child{border-right:0}.sl-label{color:var(--c-ink3);letter-spacing:.09em;font-size:10.5px;display:block}.sl-value{--tw-leading:var(--leading-tight);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:18px;line-height:var(--leading-tight);display:block}.sl-sub{color:var(--c-ink4);font-size:11px;display:block}.sl-bar{margin-top:calc(var(--spacing) * 1.5);background:var(--c-rule);height:3px;display:block}.sl-bar i{background:var(--c-signed);width:0;height:100%;transition:width .25s linear;display:block}.today-date{--tw-leading:var(--leading-tight);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:18px;line-height:var(--leading-tight);display:block}.today-frac{color:var(--c-ink4);font-size:13px}.today-rule{display:none}.kpi-label{margin-bottom:var(--spacing);color:var(--c-ink3);letter-spacing:.09em;font-size:10.5px;display:block}.kpi-value{--tw-leading:1;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:18px;line-height:1;display:block}.punch{flex-wrap:wrap;align-items:flex-end;gap:3px;display:flex}.punch i{background:var(--c-rule2);width:6px;height:14px;display:inline-block}.punch i.done{background:var(--c-signed)}.punch i.part{background:var(--c-pending)}.punch i.bad{background:var(--c-failed)}.punch i.offd{background:var(--c-off);opacity:.5}.tabs{margin-top:calc(var(--spacing) * 4);border-bottom:1px solid var(--c-rule);align-items:center;gap:0;display:flex;overflow-x:auto}.tab{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 1.5);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2);white-space:nowrap;color:var(--c-ink3);background:0 0;border:0;border-bottom:2px solid #0000;font-size:12.5px;display:inline-flex;position:relative}.tab .key{color:var(--c-ink4);font-size:11px}.tab:hover{color:var(--c-ink)}.tab.on{color:var(--c-ink);border-bottom-color:var(--c-signed)}.tab.on .key{color:var(--c-signed)}.tab .cnt{min-width:20px;padding-inline:var(--spacing);text-align:center;background:var(--c-panel2);border:1px solid var(--c-rule);color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11px;display:inline-block}.tab.on .cnt{border-color:var(--c-rule2);color:var(--c-ink)}.btn-ghost{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 1.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 2.5);padding-block:calc(var(--spacing) * 1.5);white-space:nowrap;color:var(--c-ink2);font-size:12px;transition:background-color .12s,border-color .12s,color .12s;display:inline-flex}.btn-ghost:hover:not(:disabled){border-color:var(--c-ink2);background-color:var(--c-ink2);color:var(--c-bg)}.btn-ghost:disabled{cursor:not-allowed;border-color:var(--c-rule);color:var(--c-ink4)}.btn-primary{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 1.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-ink);background-color:var(--c-ink);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 1.5);white-space:nowrap;color:var(--c-bg);font-size:12px;transition:background-color .12s,border-color .12s,color .12s;display:inline-flex}.btn-primary:hover:not(:disabled){border-color:var(--c-signed);background-color:var(--c-signed)}.btn-primary:disabled{cursor:not-allowed;border-color:var(--c-rule);background-color:var(--c-panel2);color:var(--c-ink4)}.btn-sm{padding-inline:calc(var(--spacing) * 2);padding-block:var(--spacing);font-size:11.5px}.btn-danger{border-color:var(--c-failed);color:var(--c-failed);background-color:#0000}.btn-danger:hover:not(:disabled){border-color:var(--c-failed);background-color:var(--c-failed);color:var(--c-bg)}.badge{align-items:center;gap:calc(var(--spacing) * 1.5);height:20px;padding-inline:calc(var(--spacing) * 1.5);--tw-leading:1;white-space:nowrap;border:1px solid var(--c-rule2);color:var(--c-ink2);background:var(--c-panel);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11.5px;line-height:1;display:inline-flex}.badge:before{content:"";background:var(--c-ink4);width:7px;height:7px;display:inline-block}.badge.nodot:before{display:none}.badge.ok{color:var(--c-signed);background:var(--c-signed-weak);border-color:var(--c-signed)}@supports (color:color-mix(in lab, red, red)){.badge.ok{border-color:color-mix(in oklab,var(--c-signed) 50%,transparent)}}.badge.ok:before{background:var(--c-signed)}.badge.warn{color:var(--c-pending);background:var(--c-pending-weak);border-color:var(--c-pending)}@supports (color:color-mix(in lab, red, red)){.badge.warn{border-color:color-mix(in oklab,var(--c-pending) 50%,transparent)}}.badge.warn:before{background:var(--c-pending)}.badge.err{color:var(--c-failed);background:var(--c-failed-weak);border-color:var(--c-failed)}@supports (color:color-mix(in lab, red, red)){.badge.err{border-color:color-mix(in oklab,var(--c-failed) 50%,transparent)}}.badge.err:before{background:var(--c-failed)}.badge.off{color:var(--c-ink3);background:var(--c-off-weak)}.badge.off:before{background:var(--c-off)}.badge.idle{color:var(--c-ink3);background:0 0}.badge.none{color:var(--c-ink4);background:0 0;border-style:dashed}.field{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);width:100%;padding-inline:calc(var(--spacing) * 2);padding-block:calc(var(--spacing) * 1.5);color:var(--c-ink)}.field::placeholder{color:var(--c-ink4)}.field{font-family:var(--font-num);font-size:12.5px}.field:focus{border-color:var(--c-signed);--tw-outline-style:none;background:var(--c-bg);outline-style:none}textarea.field{padding-block:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);line-height:var(--leading-relaxed)}.lb{margin-bottom:var(--spacing);color:var(--c-ink2);font-size:11.5px;display:block}.lb .hint{margin-left:calc(var(--spacing) * 1.5);color:var(--c-ink4);letter-spacing:0;display:inline}.fields{gap:calc(var(--spacing) * 2.5);display:grid}.field-row{gap:var(--spacing);display:grid}.inline-edit{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-signed);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 1.5);padding-block:var(--spacing);color:var(--c-ink);width:min(220px,60%);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13px}.hint{--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink3)}.scroll-tip{display:none}.tip{--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink2);background:var(--c-panel2);border-left:3px solid var(--c-rule2);padding:8px 10px}.tip b{color:var(--c-ink)}.errbox{padding:calc(var(--spacing) * 2);color:var(--c-failed);background:var(--c-failed-weak);border-left:3px solid var(--c-failed);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12px;display:block}.errbox:empty{display:none}.num{font-family:var(--font-num);font-variant-numeric:tabular-nums}.card{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel)}.divider{margin-block:calc(var(--spacing) * 3.5);align-items:center;gap:calc(var(--spacing) * 2.5);color:var(--c-ink4);font-size:11.5px;display:flex}.divider:before,.divider:after{content:"";background-color:var(--c-rule);flex:1;height:1px}.empty{padding-block:calc(var(--spacing) * 10);text-align:center;color:var(--c-ink3);font-size:12.5px}.sec-head{margin-bottom:calc(var(--spacing) * 2.5);justify-content:space-between;align-items:flex-end;gap:calc(var(--spacing) * 3);flex-wrap:wrap;display:flex}.sec-title{color:var(--c-ink);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13.5px}.sec-title .auto-tip{margin-left:calc(var(--spacing) * 2);color:var(--c-ink4);font-size:11px}.sec-acts{align-items:center;gap:calc(var(--spacing) * 1.5);flex-wrap:wrap;display:flex}.act-div{margin-inline:calc(var(--spacing) * .5);height:calc(var(--spacing) * 4);background-color:var(--c-rule);width:1px}.sec-mini{margin-bottom:calc(var(--spacing) * 1.5);color:var(--c-ink3);letter-spacing:.09em;font-size:10.5px}.panel-h{color:var(--c-ink);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13px}.at-wrap{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel);overflow-x:auto}.at{border-collapse:collapse;width:100%;font-size:13px}.at.acct{min-width:940px}.at thead th{text-align:left;white-space:nowrap;color:var(--c-ink3);letter-spacing:.09em;border-bottom:1px solid var(--c-rule2);background:var(--c-panel2);padding:6px 10px 5px;font-size:10.5px}.at thead th.num,.at thead th.act{text-align:right}.at tbody td{white-space:nowrap;text-overflow:ellipsis;padding:8px 10px;overflow:hidden}.at tbody tr.ar{cursor:pointer;vertical-align:middle;border-bottom:1px solid var(--c-rule);border-left:3px solid var(--pc,transparent);transition:background-color .12s}.at tbody tr.ar:last-of-type{border-bottom:0}.at tbody tr.ar:hover,.at tbody tr.ar.open{background:var(--c-panel2)}.at td.num,.at th.num{text-align:right}.at td.empty{text-align:center;white-space:normal}.at tbody tr.ar.st-off{border-left-color:var(--c-rule2);color:var(--c-ink4)}.at tbody tr.ar.st-off .avatar{opacity:.4}.at tbody tr.ar.st-off .plat-tag{color:var(--c-ink4)}.at .cell-acct{align-items:center;gap:calc(var(--spacing) * 2.5);white-space:nowrap;min-width:0;display:flex}.at .nm2{text-overflow:ellipsis;white-space:nowrap;min-width:0;color:var(--c-ink);flex:1;overflow:hidden}.at .col-act{justify-content:flex-end;align-items:center;gap:calc(var(--spacing) * 1.5);display:flex}.at .chev2{width:calc(var(--spacing) * 3);--tw-leading:1;color:var(--c-ink4);-webkit-user-select:none;user-select:none;font-size:15px;line-height:1;display:inline-block}.at tr.ar.open .chev2{color:var(--c-signed);transform:rotate(90deg)}.at.acct th:first-child{width:24%}.at.acct th:nth-child(2),.at.acct th:nth-child(3){width:9%}.at.acct th:nth-child(4){width:8%}.at.acct th:nth-child(5),.at.acct th:nth-child(6){width:11%}.at.acct th:nth-child(7){width:12%}.at.acct th:nth-child(8){width:16%}.at .v-cred{color:var(--c-ink);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .v-up{color:var(--c-signed);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .v-none{color:var(--c-ink4);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .v-day{color:var(--c-ink2);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .v-date{color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .v-warn{color:var(--c-pending);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .v-bad{color:var(--c-failed);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12.5px}.at .btn-sign{cursor:pointer;border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);padding-inline:calc(var(--spacing) * 2.5);padding-block:var(--spacing);white-space:nowrap;color:var(--c-ink2);background-color:#0000;align-items:center;font-size:12px;transition:background-color .12s,color .12s,border-color .12s;display:inline-flex}.at .btn-sign:hover:not(:disabled){border-color:var(--c-ink);background-color:var(--c-ink);color:var(--c-bg)}.at .btn-sign:disabled{cursor:not-allowed;border-color:var(--c-rule);color:var(--c-ink4)}.week{--tw-leading:1;align-items:center;gap:2px;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11px;line-height:1;display:inline-flex}.week b{--tw-font-weight:var(--font-weight-normal);font-weight:var(--font-weight-normal);color:var(--c-rule2);display:inline-block}.week b.on{color:var(--c-signed)}.week b.warn{color:var(--c-pending)}.week b.bad{color:var(--c-failed)}.week b.mute{color:var(--c-off)}.p-purple{--pc:var(--a-purple);--pbg:var(--a-purple)}@supports (color:color-mix(in lab, red, red)){.p-purple{--pbg:color-mix(in srgb, var(--a-purple) 13%, transparent)}}.p-purple{--pbd:var(--a-purple)}@supports (color:color-mix(in lab, red, red)){.p-purple{--pbd:color-mix(in srgb, var(--a-purple) 40%, transparent)}}.p-blue{--pc:var(--a-blue);--pbg:var(--a-blue)}@supports (color:color-mix(in lab, red, red)){.p-blue{--pbg:color-mix(in srgb, var(--a-blue) 13%, transparent)}}.p-blue{--pbd:var(--a-blue)}@supports (color:color-mix(in lab, red, red)){.p-blue{--pbd:color-mix(in srgb, var(--a-blue) 40%, transparent)}}.p-green{--pc:var(--a-green);--pbg:var(--a-green)}@supports (color:color-mix(in lab, red, red)){.p-green{--pbg:color-mix(in srgb, var(--a-green) 13%, transparent)}}.p-green{--pbd:var(--a-green)}@supports (color:color-mix(in lab, red, red)){.p-green{--pbd:color-mix(in srgb, var(--a-green) 40%, transparent)}}.p-amber{--pc:var(--a-amber);--pbg:var(--a-amber)}@supports (color:color-mix(in lab, red, red)){.p-amber{--pbg:color-mix(in srgb, var(--a-amber) 13%, transparent)}}.p-amber{--pbd:var(--a-amber)}@supports (color:color-mix(in lab, red, red)){.p-amber{--pbd:color-mix(in srgb, var(--a-amber) 40%, transparent)}}.p-cyan{--pc:var(--a-cyan);--pbg:var(--a-cyan)}@supports (color:color-mix(in lab, red, red)){.p-cyan{--pbg:color-mix(in srgb, var(--a-cyan) 13%, transparent)}}.p-cyan{--pbd:var(--a-cyan)}@supports (color:color-mix(in lab, red, red)){.p-cyan{--pbd:color-mix(in srgb, var(--a-cyan) 40%, transparent)}}.p-rose{--pc:var(--a-rose);--pbg:var(--a-rose)}@supports (color:color-mix(in lab, red, red)){.p-rose{--pbg:color-mix(in srgb, var(--a-rose) 13%, transparent)}}.p-rose{--pbd:var(--a-rose)}@supports (color:color-mix(in lab, red, red)){.p-rose{--pbd:color-mix(in srgb, var(--a-rose) 40%, transparent)}}.p-gray{--pc:var(--a-gray);--pbg:var(--a-gray)}.p-lime{--pc:var(--a-lime);--pbg:var(--a-lime)}@supports (color:color-mix(in lab, red, red)){.p-gray{--pbg:color-mix(in srgb, var(--a-gray) 13%, transparent)}.p-lime{--pbg:color-mix(in srgb, var(--a-lime) 13%, transparent)}}.p-gray{--pbd:var(--a-gray)}.p-lime{--pbd:var(--a-lime)}@supports (color:color-mix(in lab, red, red)){.p-gray{--pbd:color-mix(in srgb, var(--a-gray) 40%, transparent)}.p-lime{--pbd:color-mix(in srgb, var(--a-lime) 40%, transparent)}}.st-off{--pc:var(--c-rule2)}.plat-tag{height:18px;padding-inline:calc(var(--spacing) * 1.5);white-space:nowrap;color:var(--pc,var(--c-ink2));border:1px solid var(--pbd,var(--c-rule));background:var(--pbg,transparent);align-items:center;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11px;display:inline-flex}.avatar{-webkit-user-select:none;user-select:none;border:1px solid var(--pbd,var(--c-rule2));background:var(--pbg,var(--c-panel2));width:24px;height:24px;color:var(--pc,var(--c-ink2));flex-shrink:0;place-items:center;font-size:13px;line-height:1;display:inline-grid;position:relative}.avatar .dot{background:var(--pc,var(--c-rule2));width:6px;height:6px;box-shadow:0 0 0 2px var(--c-panel);position:absolute;bottom:-3px;right:-3px}.switch{cursor:pointer;flex-shrink:0;align-items:center;display:inline-flex}.switch input{clip-path:inset(50%);white-space:nowrap;border-width:0;width:1px;height:1px;margin:-1px;padding:0;position:absolute;overflow:hidden}.switch .track{background:var(--c-panel2);border:1px solid var(--c-rule2);width:32px;height:16px;transition:background-color .12s,border-color .12s;display:inline-block;position:relative}.switch .track:after{content:"";background:var(--c-ink4);width:10px;height:10px;transition:transform .12s linear,background-color .12s;position:absolute;top:2px;left:2px}.switch input:checked+.track{background:var(--c-signed-weak);border-color:var(--c-signed)}.switch input:checked+.track:after{background:var(--c-signed);transform:translate(16px)}.switch input:disabled+.track{opacity:.4}.at tr.ar-detail{display:none}.at tr.ar-detail>td{background:var(--c-bg);border-left:3px solid var(--pc,transparent);white-space:normal;padding:0 10px;overflow:visible}.at tr.ar-detail.show{display:table-row}.at tr.ar-detail.show>td{padding:11px 12px 14px 14px}.qa{margin-bottom:calc(var(--spacing) * 2);align-items:center;gap:calc(var(--spacing) * 1.5);flex-wrap:wrap;display:flex}.qbtn{cursor:pointer;border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 2.5);padding-block:var(--spacing);white-space:nowrap;color:var(--c-ink2);align-items:center;font-size:12px;transition:border-color .12s,color .12s,background-color .12s;display:inline-flex}.qbtn:hover:not(:disabled){border-color:var(--c-ink);background-color:var(--c-ink);color:var(--c-bg)}.qbtn:disabled{cursor:not-allowed;color:var(--c-ink4)}.qbtn.danger{color:var(--c-failed);border-color:var(--c-failed)}@supports (color:color-mix(in lab, red, red)){.qbtn.danger{border-color:color-mix(in srgb, var(--c-failed) 45%, transparent)}}.qbtn.danger:hover:not(:disabled){border-color:var(--c-failed);background-color:var(--c-failed);color:var(--c-bg)}.qa-tip{text-align:right;color:var(--c-ink4);margin-left:auto;font-size:11px}.acct-hint{margin-bottom:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.acct-sec{margin-top:calc(var(--spacing) * 2.5);padding-top:calc(var(--spacing) * 2.5);border-top:1px solid var(--c-rule)}.task-list{max-height:240px;overflow:auto}.task{align-items:baseline;gap:calc(var(--spacing) * 2);padding-block:var(--spacing);color:var(--c-ink2);font-size:12px;font-family:var(--font-num);border-bottom:1px solid var(--c-rule);display:flex}.task:last-child{border-bottom:0}.task .t-state{width:calc(var(--spacing) * 3);text-align:center;flex-shrink:0;display:inline-block}.task.ok .t-state{color:var(--c-signed)}.task.bad .t-state{color:var(--c-failed)}.task.warn .t-state{color:var(--c-pending)}.task.mut .t-state{color:var(--c-ink4)}.task b{color:var(--c-ink);flex-shrink:0}.task span{text-overflow:ellipsis;white-space:nowrap;color:var(--c-ink3);overflow:hidden}.run-empty{padding-block:var(--spacing);color:var(--c-ink4);font-size:12px}.at.no-click tbody tr.ar{cursor:default}.at .t-ts{color:var(--c-ink3);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12px}.at .t-name{text-overflow:ellipsis;white-space:nowrap;max-width:150px;color:var(--c-ink);overflow:hidden}.at .t-msg{text-overflow:ellipsis;white-space:nowrap;max-width:300px;color:var(--c-ink3);font-size:12px;overflow:hidden}.at .credit-cell{color:var(--c-signed);font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace}.at .credit-cell.none{color:var(--c-ink4)}.modal-mask{z-index:100;padding:calc(var(--spacing) * 4);justify-content:center;align-items:flex-start;display:none;position:fixed;inset:0}@media (min-width:40rem){.modal-mask{padding:calc(var(--spacing) * 8)}}.modal-mask{background:var(--c-bg)}@supports (color:color-mix(in lab, red, red)){.modal-mask{background:color-mix(in srgb, var(--c-bg) 72%, transparent)}}.modal-mask{overflow:auto}.modal-mask.show{display:flex}.modal{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);width:100%;max-width:560px;box-shadow:var(--shadow-pop);margin-block:auto}.modal.xl{max-width:760px}.modal-head{padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3);border-bottom:1px solid var(--c-rule2);background:var(--c-panel2);justify-content:space-between;align-items:center;display:flex}.modal-head h3{font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13.5px}.modal-x{height:calc(var(--spacing) * 7);width:calc(var(--spacing) * 7);cursor:pointer;color:var(--c-ink3);place-items:center;display:grid}@media (hover:hover){.modal-x:hover{color:var(--c-ink)}}.modal-x{background:0 0;border:0}.modal-body{max-height:70vh;padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3.5);overflow:auto}.modal-foot{justify-content:flex-end;align-items:center;gap:calc(var(--spacing) * 2);padding-inline:calc(var(--spacing) * 4);padding-block:calc(var(--spacing) * 3);border-top:1px solid var(--c-rule2);background:var(--c-panel2);display:flex}.step{margin-bottom:calc(var(--spacing) * 4);gap:calc(var(--spacing) * 3);display:flex}.step:last-child{margin-bottom:0}.step-n{width:22px;height:22px;color:var(--c-signed);border:1px solid var(--c-rule2);background:var(--c-panel2);flex-shrink:0;place-items:center;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:11px;display:grid}.step-b{flex:1;min-width:0}.step-t{margin-bottom:var(--spacing);color:var(--c-ink);font-size:13px}.step-b p{margin-bottom:calc(var(--spacing) * 1.5);--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.step-b p:last-child{margin-bottom:0}.step-b h4{margin-bottom:var(--spacing);color:var(--c-ink);font-size:13px}.body-copy p{margin-bottom:calc(var(--spacing) * 1.5);--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.body-copy p:last-child{margin-bottom:0}.body-copy h4{margin-bottom:var(--spacing);color:var(--c-ink);font-size:13px}.body-copy ul,ul.body-copy{list-style-type:disc}:where(:is(.body-copy ul,ul.body-copy)>:not(:last-child)){--tw-space-y-reverse:0;margin-block-start:calc(var(--spacing) * var(--tw-space-y-reverse));margin-block-end:calc(var(--spacing) * calc(1 - var(--tw-space-y-reverse)))}.body-copy ul,ul.body-copy{padding-left:calc(var(--spacing) * 4)}.body-copy li{--tw-leading:var(--leading-relaxed);font-size:12.5px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.plat-card{cursor:pointer;align-items:center;gap:calc(var(--spacing) * 2.5);border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule2);background-color:var(--c-panel);min-width:0;padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2.5);transition:border-color .12s,background-color .12s;display:flex}.plat-card:hover{border-color:var(--c-ink4)}.plat-card.on{border-color:var(--c-ink);background:var(--c-panel2);box-shadow:inset 3px 0 0 var(--pc,var(--c-ink))}.plat-card.off{cursor:not-allowed;opacity:.5}.plat-card .ic{width:26px;height:26px;color:var(--pc,var(--c-ink2));background:var(--pbg,transparent);border:1px solid var(--pbd,var(--c-rule));flex-shrink:0;place-items:center;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:13px;line-height:1;display:grid}.plat-card .tt{text-overflow:ellipsis;white-space:nowrap;color:var(--c-ink);font-size:13px;overflow:hidden}.plat-card .dd{text-overflow:ellipsis;white-space:nowrap;color:var(--c-ink3);font-size:11px;overflow:hidden}.rs-card{border-style:var(--tw-border-style);border-width:1px;border-color:var(--c-rule);background-color:var(--c-panel2);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 3)}.rs-h{margin-bottom:var(--spacing);color:var(--c-ink);font-size:13px}.auth-status{margin-top:calc(var(--spacing) * 2);--tw-leading:var(--leading-relaxed);font-size:12px;line-height:var(--leading-relaxed);color:var(--c-ink2)}.auth-status a{color:var(--c-ink);text-decoration-line:underline}.login-card{width:100%;padding:calc(var(--spacing) * 5);background:var(--c-panel);border:1px solid var(--c-rule2);max-width:380px;box-shadow:var(--shadow-pop)}.toast-item{pointer-events:auto;background-color:var(--c-panel);padding-inline:calc(var(--spacing) * 3);padding-block:calc(var(--spacing) * 2);color:var(--c-ink);border:1px solid var(--c-rule2);box-shadow:var(--shadow-pop);opacity:0;font-family:ui-monospace,Cascadia Mono,SF Mono,Menlo,Consolas,Liberation Mono,monospace;font-size:12px;transition:opacity .16s,transform .16s;transform:translateY(6px)}.toast-item.show{opacity:1;transform:none}.toast-item.err{color:var(--c-failed);border-color:var(--c-failed)}.toast-item.ok{color:var(--c-signed);border-color:var(--c-signed)}.toast-item.warn{color:var(--c-pending);border-color:var(--c-pending)}}@layer utilities{.pointer-events-none{pointer-events:none}.fixed{position:fixed}.bottom-6{bottom:calc(var(--spacing) * 6)}.left-1{left:var(--spacing)}.left-1\\/2{left:50%}.z-\\[200\\]{z-index:200}.mt-0\\.5{margin-top:calc(var(--spacing) * .5)}.mt-1\\.5{margin-top:calc(var(--spacing) * 1.5)}.mt-2{margin-top:calc(var(--spacing) * 2)}.mt-2\\.5{margin-top:calc(var(--spacing) * 2.5)}.mt-3{margin-top:calc(var(--spacing) * 3)}.mt-5{margin-top:calc(var(--spacing) * 5)}.mb-1{margin-bottom:var(--spacing)}.mb-2{margin-bottom:calc(var(--spacing) * 2)}.mb-2\\.5{margin-bottom:calc(var(--spacing) * 2.5)}.mb-3{margin-bottom:calc(var(--spacing) * 3)}.mb-4{margin-bottom:calc(var(--spacing) * 4)}.mb-5{margin-bottom:calc(var(--spacing) * 5)}.block{display:block}.flex{display:flex}.grid{display:grid}.hidden{display:none}.min-h-dvh{min-height:100dvh}.w-max{width:max-content}.max-w-\\[80vw\\]{max-width:80vw}.max-w-\\[1060px\\]{max-width:1060px}.shrink-0{flex-shrink:0}.-translate-x-1\\/2{--tw-translate-x:calc(calc(1 / 2 * 100%) * -1);translate:var(--tw-translate-x) var(--tw-translate-y)}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.place-items-center{place-items:center}.items-baseline{align-items:baseline}.items-center{align-items:center}.justify-between{justify-content:space-between}.gap-1\\.5{gap:calc(var(--spacing) * 1.5)}.gap-2{gap:calc(var(--spacing) * 2)}.gap-3{gap:calc(var(--spacing) * 3)}.gap-4{gap:calc(var(--spacing) * 4)}.overflow-x-auto{overflow-x:auto}.border-b{border-bottom-style:var(--tw-border-style);border-bottom-width:1px}.border-rule{border-color:var(--c-rule)}.px-4{padding-inline:calc(var(--spacing) * 4)}.py-3{padding-block:calc(var(--spacing) * 3)}.py-10{padding-block:calc(var(--spacing) * 10)}.text-\\[11px\\]{font-size:11px}.whitespace-nowrap{white-space:nowrap}.text-ink{color:var(--c-ink)}.text-ink4{color:var(--c-ink4)}.blur{--tw-blur:blur(8px);filter:var(--tw-blur,) var(--tw-brightness,) var(--tw-contrast,) var(--tw-grayscale,) var(--tw-hue-rotate,) var(--tw-invert,) var(--tw-saturate,) var(--tw-sepia,) var(--tw-drop-shadow,)}@media (min-width:40rem){.sm\\:col-span-2{grid-column:span 2/span 2}.sm\\:grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}}}:root{--c-bg:#0a0e10;--c-panel:#0e1417;--c-panel2:#131b1f;--c-raise:#182228;--c-rule:#1d2930;--c-rule2:#2c3d47;--c-ink:#d3e3e8;--c-ink2:#9db2bc;--c-ink3:#6b8290;--c-ink4:#4a5f6a;--c-signed:#3fd699;--c-signed-weak:#0c2119;--c-pending:#e7b44a;--c-pending-weak:#231b0d;--c-failed:#ff7d76;--c-failed-weak:#26100f;--c-info:#5fb6e8;--c-off:#465861;--c-off-weak:#141c20;--c-focus:#3fd699;--a-purple:#9d8bf2;--a-blue:#5aaee8;--a-green:#41cf9a;--a-amber:#e3a94f;--a-cyan:#57c2cf;--a-rose:#ea8ba0;--a-gray:#8fa3ac;--a-lime:#b8e05c;--shadow-pop:6px 6px 0 #00000073;color-scheme:dark}[data-theme=light]{--c-bg:#e9edec;--c-panel:#f6f8f7;--c-panel2:#eef2f1;--c-raise:#e2e8e6;--c-rule:#c6d1cd;--c-rule2:#a4b4af;--c-ink:#0f1c1a;--c-ink2:#3f5350;--c-ink3:#677976;--c-ink4:#8d9c99;--c-signed:#0d6b45;--c-signed-weak:#d9eee5;--c-pending:#7a5310;--c-pending-weak:#f3e8d3;--c-failed:#96291f;--c-failed-weak:#f6dfdc;--c-info:#1c5c7d;--c-off:#6d7c79;--c-off-weak:#e3e7e6;--c-focus:#0d6b45;--a-purple:#4a4390;--a-blue:#1c5c88;--a-green:#0f6b45;--a-amber:#7d5310;--a-cyan:#17656e;--a-rose:#87364d;--a-gray:#4f5d5b;--a-lime:#5c7d10;--shadow-pop:6px 6px 0 #0f1c1a21;color-scheme:light}@media (max-width:700px){.shell{padding-inline:calc(var(--spacing) * 2);padding-bottom:calc(var(--spacing) * 14)}.sl-cell{border-right:0;border-bottom:1px solid var(--c-rule);flex-grow:0;flex-basis:46%;min-width:46%}.sl-cell:last-child{border-bottom:0}.scroll-tip{display:inline}.at{min-width:760px}.qa .qa-tip{text-align:left;width:100%;margin-left:0}.at .t-msg{max-width:40vw}}@property --tw-translate-x{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-y{syntax:"*";inherits:false;initial-value:0}@property --tw-translate-z{syntax:"*";inherits:false;initial-value:0}@property --tw-border-style{syntax:"*";inherits:false;initial-value:solid}@property --tw-blur{syntax:"*";inherits:false}@property --tw-brightness{syntax:"*";inherits:false}@property --tw-contrast{syntax:"*";inherits:false}@property --tw-grayscale{syntax:"*";inherits:false}@property --tw-hue-rotate{syntax:"*";inherits:false}@property --tw-invert{syntax:"*";inherits:false}@property --tw-opacity{syntax:"*";inherits:false}@property --tw-saturate{syntax:"*";inherits:false}@property --tw-sepia{syntax:"*";inherits:false}@property --tw-drop-shadow{syntax:"*";inherits:false}@property --tw-drop-shadow-color{syntax:"*";inherits:false}@property --tw-drop-shadow-alpha{syntax:"<percentage>";inherits:false;initial-value:100%}@property --tw-drop-shadow-size{syntax:"*";inherits:false}@property --tw-font-weight{syntax:"*";inherits:false}@property --tw-tracking{syntax:"*";inherits:false}@property --tw-leading{syntax:"*";inherits:false}@property --tw-space-y-reverse{syntax:"*";inherits:false;initial-value:0}
-/* ===== 视觉层：柔和卡片风 ===== */
 :root{
-  --c-bg:#070a0e;--c-panel:#101822;--c-panel2:#0c131b;--c-raise:#141d28;
-  --c-rule:rgba(232,238,245,.08);--c-rule2:rgba(232,238,245,.16);
-  --c-ink:#e8eef5;--c-ink2:#b6c2ce;--c-ink3:#8b98a7;--c-ink4:#5f6b78;
-  --c-signed:#2fd07e;--c-signed-weak:rgba(47,208,126,.12);
-  --c-pending:#e6ae4a;--c-pending-weak:rgba(230,174,74,.12);
-  --c-failed:#ff7d6e;--c-failed-weak:rgba(255,125,110,.12);
-  --c-info:#6cb6ef;--c-off:#4a5b69;--c-off-weak:rgba(232,238,245,.06);--c-focus:#2fd07e;
-  --a-purple:#a99cf5;--a-blue:#6cb6ef;--a-green:#3ddc97;--a-amber:#e6ae4a;--a-cyan:#63cbd8;--a-rose:#f392a7;--a-gray:#8b98a7;--a-lime:#c2e46a;
-  --shadow-pop:0 18px 44px -22px rgba(0,0,0,.65);
-  color-scheme:dark;
-}
-[data-theme=light]{
-  --c-bg:#eef1f5;--c-panel:#fff;--c-panel2:#f6f8fa;--c-raise:#fff;
-  --c-rule:rgba(15,23,42,.09);--c-rule2:rgba(15,23,42,.16);
-  --c-ink:#0c141d;--c-ink2:#33404d;--c-ink3:#5e6a78;--c-ink4:#8b98a7;
-  --c-signed:#0d8a61;--c-signed-weak:rgba(13,138,97,.10);
-  --c-pending:#9a6407;--c-pending-weak:rgba(190,124,15,.13);
-  --c-failed:#bf3529;--c-failed-weak:rgba(191,53,41,.10);
-  --c-info:#2d7fc0;--c-off:#8b98a7;--c-off-weak:rgba(15,23,42,.055);--c-focus:#0d8a61;
-  --a-purple:#6f5fd0;--a-blue:#2d7fc0;--a-green:#0d8a61;--a-amber:#9a6407;--a-cyan:#17656e;--a-rose:#b8455f;--a-gray:#5e6a78;--a-lime:#5c7d10;
-  --shadow-pop:0 18px 44px -22px rgba(15,23,42,.35);
   color-scheme:light;
+  --bg:#f5f5f7; --bg-soft:#fbfbfd;
+  --surface:#ffffff; --surface-2:#f2f2f7; --surface-3:#e8e8ed;
+  --line:rgba(60,60,67,.10); --line-2:rgba(60,60,67,.18);
+  --text:#1d1d1f; --text-2:#3c3c43; --muted:#6e6e73; --dim:#8e8e93;
+  --accent:#007aff; --accent-2:#0a84ff; --accent-soft:rgba(0,122,255,.10); --accent-line:rgba(0,122,255,.26);
+  --ok:#34c759; --warn:#ff9f0a; --bad:#ff3b30;
+  --ok-soft:rgba(52,199,89,.12); --warn-soft:rgba(255,159,10,.13); --bad-soft:rgba(255,59,48,.11);
+  --on-accent:#ffffff;
+  --radius:24px;
+  --shadow-xs:0 1px 2px rgba(0,0,0,.04);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.04),0 2px 8px -2px rgba(0,0,0,.06);
+  --shadow-md:0 2px 6px rgba(0,0,0,.04),0 12px 28px -12px rgba(0,0,0,.12);
+  --shadow-lg:0 18px 48px -16px rgba(0,0,0,.22),0 4px 12px -4px rgba(0,0,0,.08);
+  --ring-track:rgba(0,0,0,.07);
+  --topbar:rgba(251,251,253,.78);
+  --toast-bg:#1d1d1f;
+  --sans:-apple-system,BlinkMacSystemFont,"SF Pro Display","SF Pro Text","PingFang SC","HarmonyOS Sans SC","Microsoft YaHei",system-ui,sans-serif;
+  --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,"JetBrains Mono",Consolas,monospace;
+  --display:var(--sans);
 }
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue","Noto Sans","PingFang SC","Microsoft YaHei",sans-serif;font-size:14px;line-height:1.6}
-body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background:radial-gradient(900px 500px at 12% -10%,rgba(16,160,110,.11),transparent 70%),radial-gradient(700px 420px at 92% 0,rgba(56,110,220,.09),transparent 70%)}
-body::after{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;opacity:.55;background-image:linear-gradient(rgba(15,23,42,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(15,23,42,.035) 1px,transparent 1px);background-size:46px 46px;-webkit-mask-image:radial-gradient(ellipse at 50% 0%,#000 35%,transparent 75%);mask-image:radial-gradient(ellipse at 50% 0%,#000 35%,transparent 75%)}
-[data-theme=light] body::after{background-image:linear-gradient(rgba(15,23,42,.05) 1px,transparent 1px),linear-gradient(90deg,rgba(15,23,42,.05) 1px,transparent 1px)}
-.shell{position:relative;z-index:1;max-width:1440px;padding-inline:24px}
-.topbar{position:sticky;top:0;z-index:30;padding:12px 0;border-bottom:1px solid var(--c-rule);background:color-mix(in srgb,var(--c-bg) 78%,transparent);-webkit-backdrop-filter:blur(10px);backdrop-filter:blur(10px)}
-.brand{font-family:var(--font-num);font-size:16px;letter-spacing:-.01em}
-.brand .caret{width:9px;height:17px}
-.statusline{margin-top:18px;overflow:hidden;border:1px solid var(--c-rule);border-left:0;border-radius:16px;background:var(--c-panel);box-shadow:0 1px 2px rgba(15,23,42,.04),0 10px 26px -16px rgba(15,23,42,.22)}
-.sl-cell{padding:16px 18px;border-right:1px solid var(--c-rule)}
-.sl-label{font-family:var(--font-num);font-size:10.5px;letter-spacing:.16em;text-transform:uppercase}
-.sl-value,.today-date{font-family:var(--font-num);font-size:20px}
-.punch i{border-radius:2px}
-.tabs{width:fit-content;margin-top:22px;padding:4px;gap:4px;border:0;border-radius:14px;background:var(--c-panel2)}
-.tab{padding:9px 18px;border:0;border-radius:10px;font-size:13px}
-.tab.on{border:0;background:var(--c-signed);color:var(--c-bg);box-shadow:0 6px 16px var(--c-signed-weak)}
-.tab.on .key,.tab.on .cnt,.tab.on .cnt{border-color:transparent;color:inherit}
-.btn-ghost,.btn-primary,.qbtn{padding:9px 16px;border-radius:12px;font-size:13px;transition:transform .12s ease,box-shadow .18s ease,border-color .18s ease,background-color .18s ease,color .18s ease,filter .18s ease}
-.btn-ghost:hover:not(:disabled){border-color:var(--c-rule2);background:var(--c-panel2);color:var(--c-ink);box-shadow:var(--shadow-pop);transform:translateY(-1px)}
-.btn-primary{border-color:var(--c-signed);background:var(--c-signed);color:var(--c-bg);box-shadow:0 12px 26px -14px var(--c-signed)}
-.btn-primary:hover:not(:disabled){border-color:var(--c-signed);background:var(--c-signed);filter:brightness(1.06)}
-.field{padding:11px 13px;border-radius:12px;background:var(--c-panel2)}
-.field:focus{border-color:var(--c-signed);background:var(--c-panel);box-shadow:0 0 0 4px var(--c-signed-weak)}
-.at-wrap{overflow:hidden;border-radius:16px;background:var(--c-panel);box-shadow:0 1px 2px rgba(15,23,42,.04),0 10px 26px -16px rgba(15,23,42,.22)}
-.at thead th{padding:11px 12px;background:var(--c-panel2);font-family:var(--font-num);font-size:10px;letter-spacing:.12em;text-transform:uppercase}
-.at tbody td{padding:11px 12px}
-.at tbody tr.ar{transition:background-color .16s ease}
-.at tbody tr.ar:hover,.at tbody tr.ar.open{background:var(--c-panel2)}
-.at .nm2{font-weight:600}
-.badge{height:auto;padding:4px 10px;border-radius:999px;font-family:inherit;font-size:12px;font-weight:600}
-.badge:before{width:6px;height:6px;border-radius:999px}
-.plat-tag{height:auto;padding:3px 10px;border-radius:999px;font-family:inherit;font-size:11.5px}
-.avatar{border-radius:10px}
-.switch .track{width:34px;height:18px;border-radius:999px}
-.switch .track:after{width:12px;height:12px;border-radius:999px}
-.switch input:checked+.track:after{transform:translate(16px)}
-.modal,.login-card,.card{border-radius:16px;box-shadow:var(--shadow-pop)}
-.modal-mask{background:rgba(8,15,24,.42);-webkit-backdrop-filter:blur(3px);backdrop-filter:blur(3px)}
-.tip{border-left:0;border-radius:10px;padding:10px 12px}
-.statusline,.tabs,.at-wrap{animation:rise .55s cubic-bezier(.22,.9,.28,1) both}
-.tabs{animation-delay:.06s}
-.at-wrap{animation-delay:.12s}
-@keyframes rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:none}}
-@media (prefers-reduced-motion:reduce){.statusline,.tabs,.at-wrap{animation:none}.btn-ghost:hover:not(:disabled){transform:none}}
-@media (max-width:1080px){.topbar{position:static}.shell{max-width:none}}
-@media (max-width:640px){.shell{padding-inline:12px}.topbar{padding:10px 0}}
+[data-theme="night"]{
+  color-scheme:dark;
+  --bg:#000000; --bg-soft:#0a0a0a;
+  --surface:#1c1c1e; --surface-2:#2c2c2e; --surface-3:#3a3a3c;
+  --line:rgba(255,255,255,.09); --line-2:rgba(255,255,255,.18);
+  --text:#f5f5f7; --text-2:#e5e5ea; --muted:#a1a1a6; --dim:#8e8e93;
+  --accent:#0a84ff; --accent-2:#409cff; --accent-soft:rgba(10,132,255,.16); --accent-line:rgba(10,132,255,.4);
+  --ok:#30d158; --warn:#ffd60a; --bad:#ff453a;
+  --ok-soft:rgba(48,209,88,.15); --warn-soft:rgba(255,214,10,.14); --bad-soft:rgba(255,69,58,.15);
+  --shadow-xs:0 1px 2px rgba(0,0,0,.4);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.5),0 2px 8px -2px rgba(0,0,0,.4);
+  --shadow-md:0 2px 8px rgba(0,0,0,.45),0 14px 30px -14px rgba(0,0,0,.6);
+  --shadow-lg:0 24px 60px -18px rgba(0,0,0,.75),0 6px 18px -8px rgba(0,0,0,.5);
+  --ring-track:rgba(255,255,255,.09);
+  --topbar:rgba(10,10,10,.72);
+  --toast-bg:#2c2c2e;
+}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;-webkit-text-size-adjust:100%}
+body{
+  margin:0;min-height:100vh;background:var(--bg);color:var(--text);
+  font:400 14px/1.6 var(--sans);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;overflow-x:hidden;
+}
+body::before{
+  content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
+  background:radial-gradient(1100px 560px at 50% -12%,rgba(0,122,255,.07),transparent 70%);
+}
+[data-theme="night"] body::before{background:radial-gradient(1100px 560px at 50% -12%,rgba(10,132,255,.13),transparent 70%)}
+a{color:inherit;text-decoration:none}
+button,input,select,textarea{font:inherit;color:inherit}
+button{cursor:pointer;background:none;border:0;padding:0}
+button[disabled]{cursor:not-allowed;opacity:.45}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+::selection{background:var(--accent-soft);color:var(--text)}
+.skip{position:absolute;left:-9999px;top:0}
+.skip:focus{left:16px;top:14px;z-index:120;background:var(--surface);border:1px solid var(--accent);padding:10px 14px;border-radius:12px;box-shadow:var(--shadow-md)}
+.shell{width:min(1240px,calc(100% - 48px));margin:0 auto;position:relative;z-index:1}
 
-/* ===== 视觉层 v2：标签栏、表格与控件打磨 ===== */
-:root{--r-card:14px;--r-ctl:10px}
-body{font-size:13.5px;letter-spacing:.005em}
-[data-theme=light]{--c-ink3:#55636f;--c-ink4:#71808d;--c-rule:rgba(15,23,42,.08);--c-rule2:rgba(15,23,42,.14);--c-panel2:#f4f6f9}
-.topbar{gap:14px;padding:13px 0}
-.brand{font-size:15px;font-weight:600}
-.scope{padding:3px 10px;border:1px solid var(--c-rule);border-radius:999px;background:var(--c-panel2);font-size:12px}
-.statusline{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));margin-top:16px;overflow:hidden;border-left:1px solid var(--c-rule);border-radius:var(--r-card)}
-.sl-cell{min-width:0;padding:14px 16px;border-right:1px solid var(--c-rule);border-bottom:0}
-.sl-label{font-size:10px;letter-spacing:.14em}
-.sl-value,.today-date{font-size:19px;font-weight:600}
-.sl-sub{font-size:11px;color:var(--c-ink3)}
-.punch{gap:4px}
-.punch i{width:5px;height:12px;border-radius:2px}
-.tabs{display:flex;gap:2px;width:max-content;max-width:100%;margin-top:18px;padding:3px;border:1px solid var(--c-rule);border-radius:12px;background:var(--c-panel2);overflow-x:auto;-webkit-overflow-scrolling:touch}
-.tab{display:inline-flex;align-items:center;gap:7px;height:32px;padding:0 13px;border:0;border-radius:9px;background:transparent;color:var(--c-ink3);font-size:12.5px;font-weight:500;white-space:nowrap;flex:0 0 auto}
-.tab:hover{color:var(--c-ink);background:color-mix(in srgb,var(--c-ink) 6%,transparent)}
-.tab.on{background:var(--c-signed);color:#fff;box-shadow:0 6px 14px -8px var(--c-signed)}
-[data-theme=dark] .tab.on{color:#04150d}
-.tab .key{font-family:var(--font-num);font-size:10px;opacity:.6}
-.tab.on .key{opacity:.75}
-.tab .cnt{display:inline-flex;align-items:center;justify-content:center;min-width:18px;height:17px;padding:0 5px;border:1px solid var(--c-rule2);border-radius:999px;background:var(--c-panel);color:var(--c-ink3);font-family:var(--font-num);font-size:10.5px;line-height:1}
-.tab.on .cnt{border-color:currentColor;background:transparent;color:inherit;opacity:.9}
-.sec-head{margin:18px 0 10px}
-.sec-title{font-size:14px;font-weight:600}
-.sec-title .auto-tip{font-size:11px;color:var(--c-ink4);font-style:normal}
-.btn-ghost,.btn-primary,.qbtn{display:inline-flex;align-items:center;justify-content:center;height:34px;padding:0 14px;border-radius:var(--r-ctl);font-size:12.5px;font-weight:500}
-.btn-primary{color:#fff;box-shadow:0 8px 18px -10px var(--c-signed)}
-[data-theme=dark] .btn-primary{color:#04150d}
-.btn-ghost{background:var(--c-panel)}
-.btn-ghost:hover:not(:disabled){background:var(--c-panel2);border-color:var(--c-rule2);color:var(--c-ink);box-shadow:none;transform:none}
-.at-wrap{border-radius:var(--r-card);border:1px solid var(--c-rule);box-shadow:0 1px 2px rgba(15,23,42,.03),0 12px 28px -22px rgba(15,23,42,.28)}
-.at.acct{min-width:1040px;table-layout:fixed}
-.at thead th{height:38px;padding:0 14px;background:var(--c-panel2);color:var(--c-ink4);font-size:9.5px;letter-spacing:.14em;border-bottom:1px solid var(--c-rule)}
-.at tbody td{height:56px;padding:0 14px;border-bottom:1px solid var(--c-rule);vertical-align:middle}
-.at tbody tr.ar:last-of-type td{border-bottom:0}
-.at tbody tr.ar:hover{background:color-mix(in srgb,var(--c-ink) 4%,transparent)}
-.at.acct th:first-child{width:24%}
-.at.acct th:nth-child(2){width:10%}
-.at.acct th:nth-child(3){width:8%}
-.at.acct th:nth-child(4){width:8%}
-.at.acct th:nth-child(5){width:11%}
-.at.acct th:nth-child(6){width:12%}
-.at.acct th:nth-child(7){width:12%}
-.at.acct th:nth-child(8){width:15%}
-.at .cell-acct{gap:10px}
-.at .avatar{width:26px;height:26px;border-radius:8px;font-size:12px;font-weight:600}
-.at .nm2{flex:0 1 auto;max-width:46%;font-size:13px;font-weight:600}
-.at .plat-tag{margin-left:2px;flex:0 0 auto}
-.at .v-cred{font-size:13.5px;font-weight:600;font-variant-numeric:tabular-nums}
-.at .v-up{font-size:12.5px;font-weight:600;font-variant-numeric:tabular-nums}
-.at .v-date{font-size:12px;color:var(--c-ink3);font-variant-numeric:tabular-nums}
-.badge{height:22px;padding:0 10px;font-size:11.5px}
-.at .btn-sign{height:28px;padding:0 12px;border-radius:8px;font-size:12px}
-.switch .track{width:32px;height:17px}
-.switch .track:after{width:11px;height:11px}
-.switch input:checked+.track:after{transform:translate(15px)}
-.at .chev2{width:14px;font-size:14px;opacity:.5}
-.week{display:inline-flex;align-items:center;gap:3px}
-.week b{display:inline-block;width:6px;height:14px;border-radius:2px;background:var(--c-rule);color:transparent;font-size:0;line-height:0;overflow:hidden}
-.week b.on{background:var(--c-signed)}
-.week b.warn{background:var(--c-pending)}
-.week b.bad{background:var(--c-failed)}
-.week b.mute{background:color-mix(in srgb,var(--c-ink4) 50%,transparent)}
-.at tr.ar-detail.show>td{padding:14px 16px;background:var(--c-panel2)}
-@media (max-width:1100px){.topbar{position:static}}
-@media (max-width:900px){.statusline{grid-template-columns:repeat(2,minmax(0,1fr))}.sl-cell:nth-child(2n){border-right:0}.sl-cell:nth-child(-n+3){border-bottom:1px solid var(--c-rule)}}
-@media (max-width:640px){.shell{padding-inline:12px}.sec-acts{width:100%}.btn-ghost,.btn-primary{height:32px}}
+/* ---------- top bar ---------- */
+.topbar{position:sticky;top:0;z-index:40;border-bottom:1px solid var(--line);background:var(--topbar);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px)}
+.topbarIn{display:flex;align-items:center;gap:22px;height:64px}
+.brand{display:flex;align-items:center;gap:10px;flex:none}
+.brandOrb{
+  width:30px;height:30px;border-radius:9px;display:grid;place-items:center;
+  background:linear-gradient(160deg,#2e9bff,#0064d6);
+  box-shadow:0 4px 12px -4px rgba(0,122,255,.55),inset 0 1px 0 rgba(255,255,255,.35);
+}
+.brandOrb svg{width:16px;height:16px;fill:none;stroke:#fff;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
+.brandText b{display:block;font-size:14.5px;font-weight:650;letter-spacing:-.01em;line-height:1.2;white-space:nowrap}
+.brandText em{display:block;font:500 9px/1.5 var(--mono);font-style:normal;letter-spacing:.16em;color:var(--muted)}
+.topTabs{display:flex;gap:2px;padding:3px;border-radius:999px;background:var(--surface-2)}
+.topTabs button{padding:7px 14px;border-radius:999px;font-size:12px;font-weight:500;color:var(--muted);transition:color .18s,background .18s,box-shadow .18s}
+.topTabs button:hover{color:var(--text)}
+.topTabs button.on{background:var(--surface);color:var(--text);box-shadow:var(--shadow-xs),0 0 0 .5px var(--line)}
+.topRight{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none}
+.livePill{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;font:11px var(--mono);color:var(--muted);white-space:nowrap}
+.livePill i{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3.5px var(--ok-soft);animation:pulse 2.4s infinite}
+.iconBtn{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;color:var(--muted);transition:color .18s,background .18s}
+.iconBtn:hover{color:var(--text);background:var(--surface-2)}
+.iconBtn svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.iMoon{display:none}
+[data-theme="night"] .iSun{display:none}
+[data-theme="night"] .iMoon{display:block}
+.primaryBtn{
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:9px 16px;border-radius:999px;
+  background:var(--accent);color:var(--on-accent);font-size:12.5px;font-weight:600;
+  box-shadow:0 1px 2px rgba(0,122,255,.28),0 6px 16px -8px rgba(0,122,255,.5);
+  transition:transform .18s,filter .18s,box-shadow .18s;white-space:nowrap;
+}
+.primaryBtn:hover{filter:brightness(1.06);box-shadow:0 1px 2px rgba(0,122,255,.3),0 10px 22px -10px rgba(0,122,255,.55)}
+.primaryBtn:active{transform:scale(.98)}
+.primaryBtn .spark{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite}
+.primaryBtn .spark.spin{animation:spin 1s linear infinite}
+
+/* ---------- hero ---------- */
+.hero{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.08fr);gap:56px;padding:66px 0 12px;align-items:center}
+.heroLead{display:flex;flex-direction:column;justify-content:center;min-width:0}
+.eyebrow{display:inline-flex;align-items:center;gap:9px;font:11.5px var(--mono);letter-spacing:.03em;color:var(--muted);margin:0}
+.eyebrow i{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft);animation:pulse 2.4s infinite}
+.hero h1{font:650 clamp(40px,4.9vw,62px)/1.06 var(--display);letter-spacing:-.035em;margin:18px 0 0;color:var(--text)}
+.hero h1 .grad{background:linear-gradient(96deg,#0071e3 8%,#32ade6 92%);-webkit-background-clip:text;background-clip:text;color:transparent}
+.heroSub{margin:20px 0 0;max-width:46ch;color:var(--muted);font-size:15px;line-height:1.75}
+.heroActions{display:flex;gap:10px;margin-top:30px;flex-wrap:wrap}
+.ghostBtn{
+  display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:999px;
+  background:var(--surface);border:1px solid var(--line);color:var(--text-2);font-size:12.5px;font-weight:500;
+  box-shadow:var(--shadow-xs);transition:background .18s,border-color .18s,transform .18s;
+}
+.ghostBtn:hover{background:var(--surface-2);border-color:var(--line-2)}
+.ghostBtn:active{transform:scale(.98)}
+.heroGrid{display:grid;grid-template-columns:1.2fr .92fr;grid-template-rows:auto auto;gap:16px;min-width:0}
+.glass{position:relative;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow-sm);overflow:hidden}
+.statusCard{grid-row:1/3;padding:24px;display:flex;flex-direction:column;align-items:center;justify-content:space-between;gap:20px;min-width:0}
+.statusHead{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%}
+.statusBadge{display:inline-flex;align-items:center;gap:5px;font:10.5px var(--mono);color:var(--ok);background:var(--ok-soft);padding:3px 8px;border-radius:999px}
+.statusBadge::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}
+.ringWrap{position:relative;width:178px;height:178px;flex:none}
+.ringWrap svg{width:100%;height:100%;transform:rotate(-90deg)}
+.ringTrack{stroke:var(--ring-track)}
+.ringFg{transition:stroke-dashoffset .9s cubic-bezier(.2,.7,.2,1)}
+.ringCenter{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
+.ringCenter b{font:650 46px/1 var(--display);letter-spacing:-.05em;font-variant-numeric:tabular-nums}
+.ringCenter small{font:12px var(--mono);color:var(--muted);margin-top:3px}
+.ringCenter em{font:500 9.5px var(--sans);font-style:normal;letter-spacing:.14em;color:var(--dim);margin-top:8px}
+.statusMeta{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%}
+.statusMeta div{padding:11px 13px;border-radius:14px;background:var(--surface-2);min-width:0}
+.statusMeta b{display:block;font-size:20px;font-weight:600;line-height:1.2;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.statusMeta span{display:block;font-size:10.5px;color:var(--muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.nextCard{padding:22px 24px;display:flex;flex-direction:column;justify-content:center;min-width:0}
+.cardKicker{margin:0 0 9px;font:500 10px var(--mono);letter-spacing:.1em;color:var(--dim)}
+.nextTime{font:600 36px/1 var(--display);letter-spacing:-.035em;font-variant-numeric:tabular-nums}
+.nextDate{font:11px var(--mono);color:var(--muted);margin-top:6px}
+.nextNote{font-size:11.5px;color:var(--muted);margin:8px 0 13px;line-height:1.55}
+.cronPills{display:flex;gap:5px;flex-wrap:wrap}
+.cronPills span{font:10.5px var(--mono);padding:3px 8px;border-radius:7px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
+.travelCard{padding:22px 24px;display:flex;flex-direction:column;justify-content:space-between;min-width:0}
+.travelTop{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.travelState{font:500 10px var(--sans);letter-spacing:.01em;padding:4px 8px;border-radius:999px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
+.travelState.s-traveling{color:var(--accent);background:var(--accent-soft)}
+.travelState.s-arrived,.travelState.s-finished{color:var(--ok);background:var(--ok-soft)}
+.travelState.s-error{color:var(--bad);background:var(--bad-soft)}
+.travelWho{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:8px}
+.travelMeta{font:11px/1.65 var(--mono);color:var(--muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.travelRoute{position:relative;height:24px;margin:8px 0 6px}
+.travelRoute .track{position:absolute;left:4px;right:4px;top:50%;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--accent-line),var(--accent))}
+.travelRoute .dot{position:absolute;top:50%;left:6%;width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft);transform:translate(-50%,-50%);animation:route 5.5s ease-in-out infinite}
+.travelRoute .dot.still{animation:none;left:92%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
+.travelFoot{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.travelFoot .reward{font:600 15px/1 var(--display);color:var(--accent);font-variant-numeric:tabular-nums}
+.travelFoot button{margin-left:auto;font-size:11.5px;font-weight:500;padding:5px 2px;color:var(--accent)}
+.travelFoot button:hover{opacity:.7}
+.travelEmpty{font-size:12px;line-height:1.7;color:var(--muted);padding:6px 0}
+
+/* ---------- sections ---------- */
+.section{padding:60px 0 0}
+section[id],#activity{scroll-margin-top:84px}
+.sectionHead{display:flex;align-items:flex-end;justify-content:space-between;gap:22px;margin-bottom:22px;flex-wrap:wrap}
+.sectionHead h2{font-size:clamp(24px,2.4vw,30px);font-weight:650;line-height:1.15;letter-spacing:-.025em;margin:0}
+.sectionHead p{margin:6px 0 0;font-size:13px;color:var(--muted)}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted)}
+.legend span{display:inline-flex;align-items:center;gap:6px}
+.legend i{width:6px;height:6px;border-radius:50%;background:currentColor}
+.legend .ok{color:var(--ok)} .legend .warn{color:var(--warn)} .legend .bad{color:var(--bad)} .legend .idle{color:var(--dim)}
+
+/* ---------- platform matrix ---------- */
+.platformGrid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;min-width:0}
+.platformGrid>*{min-width:0}
+.pTile{
+  position:relative;padding:16px;border-radius:20px;border:1px solid var(--line);
+  background:var(--surface);cursor:pointer;text-align:left;overflow:hidden;box-shadow:var(--shadow-xs);min-width:0;
+  transition:transform .2s,border-color .2s,box-shadow .2s;
+}
+.pTile:hover{transform:translateY(-2px);border-color:var(--line-2);box-shadow:var(--shadow-md)}
+.pTile.on{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),var(--shadow-sm)}
+.pOrb{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;font-size:13px;font-weight:650;color:#fff;background:linear-gradient(160deg,var(--c1),var(--c2));margin-bottom:12px;box-shadow:0 4px 10px -4px rgba(0,0,0,.3);text-shadow:0 1px 2px rgba(0,0,0,.18)}
+.pTile b{display:block;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pTile small{display:block;font-size:11px;color:var(--muted);margin-top:3px}
+.pBar{display:block;height:4px;border-radius:999px;background:var(--surface-2);margin-top:14px;overflow:hidden}
+.pBar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--c1),var(--c2));transition:width .6s}
+.pDots{display:flex;gap:3px;margin-top:8px;height:6px}
+.pDots i{width:6px;height:6px;border-radius:50%;background:var(--surface-3)}
+.pDots i.ok{background:var(--ok)}
+.pDots i.bad{background:var(--bad)}
+.pDots i.warn{background:var(--warn)}
+.pDots i.off{background:transparent;border:1px solid var(--line-2)}
+
+/* ---------- account matrix ---------- */
+.accountTools{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.filterRow{display:flex;gap:4px;flex-wrap:wrap;padding:3px;border-radius:999px;background:var(--surface-2)}
+.pill{padding:6px 13px;border-radius:999px;font-size:11.5px;font-weight:500;color:var(--muted);transition:color .18s,background .18s,box-shadow .18s}
+.pill:hover{color:var(--text)}
+.pill.on{background:var(--surface);color:var(--text);box-shadow:var(--shadow-xs),0 0 0 .5px var(--line)}
+.searchBox{display:flex;align-items:center;gap:7px;padding:8px 13px;border-radius:999px;background:var(--surface-2);border:1px solid transparent;transition:background .18s,border-color .18s,box-shadow .18s}
+.searchBox:focus-within{background:var(--surface);border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+.searchBox svg{width:14px;height:14px;fill:none;stroke:var(--dim);stroke-width:1.8;stroke-linecap:round}
+.searchBox input{width:132px;border:0;background:transparent;outline:0;font-size:12px;color:var(--text)}
+.searchBox input::placeholder{color:var(--dim)}
+.acctGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(326px,1fr));gap:14px;min-width:0}
+.acctGrid>*{min-width:0}
+.aCard{
+  position:relative;padding:20px;border-radius:22px;border:1px solid var(--line);
+  background:var(--surface);cursor:pointer;overflow:hidden;box-shadow:var(--shadow-xs);
+  transition:transform .22s,border-color .22s,box-shadow .22s;
+  animation:rise .5s both;animation-delay:calc(var(--i,0)*20ms);
+}
+.aCard:hover{transform:translateY(-2px);border-color:var(--line-2);box-shadow:var(--shadow-md)}
+.aCard.off{opacity:.56}
+.aTop{display:flex;align-items:center;gap:10px;min-width:0}
+.aOrb{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;font-size:12px;font-weight:650;color:#fff;background:linear-gradient(160deg,var(--c1),var(--c2));flex:none;text-shadow:0 1px 2px rgba(0,0,0,.18)}
+.aNames{min-width:0}
+.aNames b{display:block;font-size:13.5px;font-weight:600;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.aNames small{display:block;font:10.5px var(--mono);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.aStatus{margin-left:auto;display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:999px;background:var(--surface-2);font-size:10.5px;font-weight:500;color:var(--muted);white-space:nowrap;flex:none}
+.aStatus i{width:5px;height:5px;border-radius:50%;background:currentColor}
+.aStatus.ok{color:var(--ok);background:var(--ok-soft)}
+.aStatus.warn{color:var(--warn);background:var(--warn-soft)}
+.aStatus.bad{color:var(--bad);background:var(--bad-soft)}
+.aStatus.off,.aStatus.idle{color:var(--muted);background:var(--surface-2)}
+.aMsg{margin:14px 0 0;font-size:12px;line-height:1.62;color:var(--muted);min-height:39px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.aStats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:16px;padding-top:15px;border-top:1px solid var(--line)}
+.aStats b{display:block;font-size:20px;font-weight:600;line-height:1.2;letter-spacing:-.02em;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.aStats span{display:block;font-size:10.5px;color:var(--muted);margin-top:3px}
+.aTravel{margin-top:13px;padding:9px 11px;border-radius:12px;background:var(--surface-2);display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted);min-width:0}
+.aTravel .tState{font-size:9.5px;font-weight:500;padding:3px 7px;border-radius:999px;background:var(--surface);color:var(--muted);white-space:nowrap;flex:none}
+.aTravel .tState.s-traveling{color:var(--accent);background:var(--accent-soft)}
+.aTravel .tState.s-arrived,.aTravel .tState.s-finished{color:var(--ok);background:var(--ok-soft)}
+.aTravel .tState.s-error{color:var(--bad);background:var(--bad-soft)}
+.aTravel .tText{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.aActions{display:flex;gap:7px;margin-top:14px}
+.aActions button{flex:1;padding:9px;border-radius:10px;background:var(--surface-2);font-size:11.5px;font-weight:500;color:var(--text-2);transition:background .18s,color .18s,filter .18s}
+.aActions button:hover{background:var(--surface-3);color:var(--text)}
+.aActions button.primary{background:var(--accent);color:var(--on-accent)}
+.aActions button.primary:hover{filter:brightness(1.06)}
+.footNote{margin:16px 0 0;font:10.5px var(--mono);color:var(--dim)}
+
+/* ---------- travel missions ---------- */
+.missionGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px;min-width:0}
+.missionGrid>*{min-width:0}
+.mission{padding:20px 22px;border-radius:22px;border:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow-xs);position:relative;overflow:hidden;min-width:0}
+.missionTop{display:flex;align-items:center;gap:8px;min-width:0}
+.missionTop b{font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.missionTop .travelState{margin-left:auto;flex:none}
+.missionRoute{position:relative;height:46px;margin:12px 0 4px}
+.missionRoute .track{position:absolute;left:6%;right:6%;top:50%;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--accent-line),var(--accent))}
+.missionRoute .node{position:absolute;top:50%;width:7px;height:7px;border-radius:50%;border:1px solid var(--line-2);background:var(--surface);transform:translate(-50%,-50%)}
+.missionRoute .node.start{left:6%}
+.missionRoute .node.end{left:94%}
+.missionRoute .dot{position:absolute;top:50%;width:11px;height:11px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft);transform:translate(-50%,-50%);animation:route 5.8s ease-in-out infinite}
+.missionRoute .dot.arrived{animation:none;left:92%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
+.missionRoute .dot.idle{animation:none;left:6%;background:var(--dim);box-shadow:0 0 0 4px var(--surface-2)}
+.missionMeta{font:11px/1.7 var(--mono);color:var(--muted);min-height:36px}
+.missionActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:13px}
+.missionActions button{font-size:11.5px;font-weight:500;padding:5px 2px;color:var(--accent)}
+.missionActions button:hover{opacity:.7}
+.missionActions button.primary{background:var(--accent-soft);color:var(--accent);padding:5px 11px;border-radius:999px}
+.missionActions .switch{margin-left:auto}
+
+/* ---------- switch ---------- */
+.switch{display:inline-flex;align-items:center;gap:7px;font-size:10.5px;color:var(--muted);cursor:pointer;white-space:nowrap}
+.switch i{font-style:normal}
+.switch input{position:absolute;opacity:0;width:1px;height:1px}
+.switch .track{width:38px;height:23px;border-radius:999px;background:var(--surface-3);position:relative;display:inline-block;transition:background .2s}
+.switch .track::after{content:"";position:absolute;top:2px;left:2px;width:19px;height:19px;border-radius:50%;background:#fff;transition:transform .2s;box-shadow:0 1px 3px rgba(0,0,0,.18)}
+.switch input:checked+.track{background:var(--ok)}
+.switch input:checked+.track::after{transform:translateX(15px)}
+.switch input:focus-visible+.track{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---------- bottom ---------- */
+.bottomGrid{display:grid;grid-template-columns:1.3fr .9fr;gap:16px;padding-top:60px}
+.activityCard,.systemCard{padding:24px 26px}
+.systemCard{display:flex;flex-direction:column}
+.systemCard .sysActions{margin-top:auto}
+.bottomHead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}
+.bottomHead h2{font-size:20px;font-weight:650;letter-spacing:-.02em;margin:0}
+.linkBtn{font-size:12px;font-weight:500;color:var(--accent);padding:5px 0;background:none;border:0}
+.linkBtn:hover{opacity:.7}
+.activityList{display:flex;flex-direction:column}
+.actRow{display:grid;grid-template-columns:44px 7px minmax(0,1fr);gap:10px;align-items:start;padding:11px 0;border-bottom:1px solid var(--line)}
+.actRow:last-child{border-bottom:0}
+.actRow time{font:10.5px/1.7 var(--mono);color:var(--dim)}
+.actRow .dot{width:6px;height:6px;border-radius:50%;background:var(--dim);margin-top:6px}
+.actRow .dot.ok{background:var(--ok)}
+.actRow .dot.bad{background:var(--bad)}
+.actRow .dot.warn{background:var(--warn)}
+.actRow p{margin:0;font-size:12px;line-height:1.58;color:var(--muted)}
+.actRow b{font-weight:600;color:var(--text)}
+.sysGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0 0}
+dl.sysGrid{margin:10px 0 0}
+.sysItem{padding:11px 13px;border-radius:14px;background:var(--surface-2);min-width:0}
+.sysItem small{display:block;font-size:10.5px;color:var(--muted);margin-bottom:3px}
+.sysItem b{display:block;font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sysActions{display:flex;gap:4px;flex-wrap:wrap;margin-top:13px}
+.sysActions button{font-size:11.5px;font-weight:500;padding:6px 10px;border-radius:8px;color:var(--accent);background:transparent}
+.sysActions button:hover{background:var(--accent-soft)}
+
+.footer{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:32px 0 36px;margin-top:48px;border-top:1px solid var(--line);font-size:11px;color:var(--dim)}
+
+/* ---------- dialogs ---------- */
+.veil{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.32);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fade .2s ease both}
+.veil[hidden]{display:none}
+.sheet{
+  width:min(700px,100%);max-height:90vh;overflow:auto;position:relative;
+  border:1px solid var(--line);border-radius:28px;background:var(--surface);
+  box-shadow:var(--shadow-lg);animation:pop .26s cubic-bezier(.2,.7,.2,1) both;
+}
+.sheet.narrow{width:min(430px,100%)}
+.sheet.wide{width:min(800px,100%)}
+.sheetHead{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:24px 26px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:2;background:var(--surface)}
+.sheetHead h2{font-size:24px;font-weight:650;line-height:1.15;letter-spacing:-.025em;margin:0}
+.sheetHead p{margin:6px 0 0;font-size:12.5px;line-height:1.6;color:var(--muted);max-width:54ch}
+.kicker{margin:0 0 6px;font:500 10px var(--mono);letter-spacing:.1em;color:var(--dim)}
+.closeX{width:30px;height:30px;border-radius:999px;background:var(--surface-2);display:grid;place-items:center;font-size:17px;line-height:1;color:var(--muted);flex:none;transition:background .18s,color .18s}
+.closeX:hover{background:var(--surface-3);color:var(--text)}
+.sheetBody{padding:20px 26px 26px}
+.sheetFoot{display:flex;justify-content:flex-end;gap:9px;padding:15px 26px;border-top:1px solid var(--line);position:sticky;bottom:0;background:var(--surface);z-index:2}
+.secTitle{font-size:16px;font-weight:650;letter-spacing:-.01em;margin:26px 0 10px;padding-top:20px;border-top:1px solid var(--line)}
+.secTitle:first-child{margin-top:0;padding-top:0;border-top:0}
+.hint{margin:0 0 14px;font-size:12.5px;line-height:1.65;color:var(--muted)}
+.err{min-height:16px;margin:8px 0 0;font-size:12px;line-height:1.5;color:var(--bad)}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:0 16px}
+.field{display:block;margin-bottom:15px;min-width:0}
+.field label{display:block;margin-bottom:6px;font-size:11.5px;font-weight:500;color:var(--muted)}
+.field input,.field textarea,.field select{
+  width:100%;min-height:42px;padding:10px 12px;border-radius:12px;border:1px solid transparent;
+  background:var(--surface-2);font:12.5px/1.5 var(--sans);color:var(--text);
+  transition:background .18s,border-color .18s,box-shadow .18s;
+}
+.field input:focus,.field textarea:focus,.field select:focus{background:var(--surface);border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft);outline:none}
+.field textarea{resize:vertical;min-height:64px;font-family:var(--mono);font-size:11.5px}
+.field select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);background-position:calc(100% - 16px) 18px,calc(100% - 11px) 18px;background-size:5px 5px;background-repeat:no-repeat}
+.field .opt{color:var(--dim);margin-left:5px;font-weight:400}
+.check{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);min-height:42px}
+.field .check{margin-top:22px}
+.check input{width:16px;height:16px;min-height:0;accent-color:var(--accent)}
+.rowBtns{display:flex;flex-wrap:wrap;gap:8px}
+.btn{min-height:40px;padding:0 15px;border-radius:12px;background:var(--surface-2);font-size:12.5px;font-weight:500;color:var(--text-2);transition:background .18s,color .18s,filter .18s}
+.btn:hover{background:var(--surface-3);color:var(--text)}
+.btn.primary{background:var(--accent);color:var(--on-accent)}
+.btn.primary:hover{filter:brightness(1.06);color:var(--on-accent)}
+.btn.sm{min-height:34px;padding:0 12px;font-size:11.5px}
+.btn.wide{width:100%}
+.btn.danger{color:var(--bad);background:var(--bad-soft)}
+.platChips{display:flex;flex-wrap:wrap;gap:5px;margin-bottom:20px}
+.platChips button{padding:7px 11px;border-radius:999px;background:var(--surface-2);font-size:11.5px;font-weight:500;color:var(--muted);transition:background .18s,color .18s}
+.platChips button:hover{color:var(--text);background:var(--surface-3)}
+.platChips button.on{background:var(--accent);color:var(--on-accent)}
+.authBox{border-top:1px solid var(--line);padding-top:16px;margin-bottom:10px}
+.authBox h3{font-size:15px;font-weight:650;margin:0 0 5px}
+.authBox p{font-size:12px;line-height:1.65;color:var(--muted);margin:0 0 12px}
+.authMsg{min-height:16px;margin:10px 0 0;font-size:11.5px;line-height:1.55;color:var(--muted);word-break:break-all}
+.authMsg a{color:var(--accent);text-decoration:underline}
+.authMsg.ok{color:var(--ok)} .authMsg.err{color:var(--bad)}
+.divider{display:flex;align-items:center;gap:10px;margin:18px 0;font-size:10.5px;color:var(--dim)}
+.divider::before,.divider::after{content:"";height:1px;background:var(--line);flex:1}
+.modeTabs{display:flex;gap:4px;margin-bottom:16px;border-bottom:1px solid var(--line)}
+.modeTabs button{padding:9px 10px;font-size:12px;font-weight:500;color:var(--muted);border-bottom:2px solid transparent;margin-bottom:-1px}
+.modeTabs button.on{color:var(--text);border-color:var(--accent)}
+.code{margin:0;padding:12px 13px;border-radius:12px;background:var(--surface-2);font:11px/1.7 var(--mono);color:var(--muted);overflow:auto;white-space:pre-wrap;word-break:break-all}
+
+/* ---------- account modal ---------- */
+.acctModalTop{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.acctModalOrb{width:46px;height:46px;border-radius:12px;display:grid;place-items:center;font-size:17px;font-weight:650;color:#fff;background:linear-gradient(160deg,var(--c1),var(--c2));flex:none;text-shadow:0 1px 2px rgba(0,0,0,.18)}
+.acctModalMeta{min-width:0}
+.acctModalMeta b{display:block;font-size:13.5px;font-weight:600;line-height:1.35}
+.acctModalMeta small{display:block;font:10.5px var(--mono);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.modalStatus{margin-left:auto}
+.modalMsg{margin:18px 0 0;font-size:13px;line-height:1.7;color:var(--text-2)}
+.modalGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:18px 0}
+.modalGrid div{padding:11px 13px;border-radius:14px;background:var(--surface-2);min-width:0}
+.modalGrid small{display:block;font-size:10.5px;color:var(--muted);margin-bottom:3px}
+.modalGrid b{display:block;font:600 12px/1.4 var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.modalBlock{margin-top:18px;padding-top:16px;border-top:1px solid var(--line)}
+.modalBlockHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:9px}
+.modalBlockHead b{font-size:13px;font-weight:600}
+.modalNote{font-size:12px;line-height:1.65;color:var(--muted);margin:0}
+.modalActions{display:flex;flex-wrap:wrap;gap:7px;margin-top:18px}
+.modalActions button{min-height:36px;padding:0 12px;border-radius:10px;background:var(--surface-2);font-size:11.5px;font-weight:500;color:var(--text-2)}
+.modalActions button:hover{background:var(--surface-3);color:var(--text)}
+.modalActions button.primary{background:var(--accent);color:var(--on-accent)}
+.modalActions button.danger{background:var(--bad-soft);color:var(--bad)}
+.modalTravel{margin-top:18px;padding:15px;border-radius:16px;background:var(--surface-2)}
+.modalTravel .missionRoute{margin:10px 0 8px;height:38px}
+.modalTravel .modalNote{color:var(--muted)}
+
+/* ---------- toasts ---------- */
+.toasts{position:fixed;right:22px;bottom:22px;z-index:100;display:flex;flex-direction:column;gap:7px;max-width:min(380px,calc(100vw - 44px));pointer-events:none}
+.toast{border-radius:13px;background:var(--toast-bg);padding:11px 14px;font-size:12px;line-height:1.55;color:#f5f5f7;box-shadow:0 16px 40px -12px rgba(0,0,0,.45),0 2px 8px rgba(0,0,0,.12);animation:toast .24s ease both;border-left:3px solid var(--dim)}
+.toast.ok{border-left-color:var(--ok)}
+.toast.err{border-left-color:var(--bad)}
+.toast.warn{border-left-color:var(--warn)}
+
+/* ---------- motion ---------- */
+@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes fade{from{opacity:0}to{opacity:1}}
+@keyframes pop{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
+@keyframes toast{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes spin{to{transform:rotate(360deg)}}
+@keyframes route{0%{left:6%}50%{left:92%}100%{left:6%}}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}html{scroll-behavior:auto}}
+
+/* ---------- responsive ---------- */
+@media (max-width:1120px){
+  .platformGrid{grid-template-columns:repeat(3,minmax(0,1fr))}
+  .hero{grid-template-columns:1fr;gap:30px}
+  .heroGrid{grid-template-columns:1.1fr .9fr}
+  .hero h1{font-size:clamp(40px,6.4vw,58px)}
+}
+@media (max-width:860px){
+  .topbarIn{height:auto;padding:10px 0;flex-wrap:wrap;gap:9px}
+  .topTabs{order:3;width:100%;justify-content:space-between;overflow:auto}
+  .topRight{margin-left:auto}
+  .livePill{display:none}
+  .bottomGrid{grid-template-columns:1fr}
+}
+@media (max-width:720px){
+  .shell{width:calc(100% - 32px)}
+  .hero{padding-top:38px}
+  .heroGrid{grid-template-columns:1fr;grid-template-rows:auto}
+  .statusCard{grid-row:auto;flex-direction:row;flex-wrap:wrap;justify-content:center;gap:16px;padding:20px}
+  .ringWrap{width:150px;height:150px}
+  .ringCenter b{font-size:38px}
+  .statusHead{width:100%}
+  .statusMeta{width:100%}
+  .section{padding-top:46px}
+  section[id],#activity{scroll-margin-top:112px}
+  .sectionHead{align-items:flex-start}
+  .sectionHead h2{font-size:24px}
+  .accountTools{width:100%}
+  .searchBox{flex:1}
+  .searchBox input{width:100%}
+  .platformGrid{grid-template-columns:repeat(2,minmax(0,1fr))}
+  .topTabs button{flex:1;text-align:center;padding:7px 4px}
+  .acctGrid{grid-template-columns:1fr}
+  .missionGrid{grid-template-columns:1fr}
+  .two{grid-template-columns:1fr}
+  .modalGrid{grid-template-columns:1fr}
+  .veil{padding:10px}
+  .sheet{max-height:94vh;border-radius:24px}
+  .sheetHead,.sheetBody{padding-left:18px;padding-right:18px}
+  .sheetFoot{padding:13px 18px}
+  .toasts{right:12px;left:12px;bottom:12px;max-width:none}
+  .footer{padding:24px 0}
+}
 </style>
 </head>
-<body class="min-h-dvh">
+<body>
+<a class="skip" href="#accounts">跳到账号</a>
+
+<header class="topbar">
+  <div class="shell topbarIn">
+    <a class="brand" href="#overview" aria-label="签到塔首页">
+      <span class="brandOrb" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m4.5 12.5 5 5 10-11"/></svg></span>
+      <span class="brandText"><b>签到塔</b><em>SIGN-IN TOWER</em></span>
+    </a>
+    <nav class="topTabs" aria-label="页面导航">
+      <button type="button" data-jump="overview" class="on">总览</button>
+      <button type="button" data-jump="platforms">平台</button>
+      <button type="button" data-jump="accounts">账号</button>
+      <button type="button" data-jump="travel">旅行</button>
+    </nav>
+    <div class="topRight">
+      <span class="livePill"><i aria-hidden="true"></i><span id="barClock">--:--:--</span> 北京</span>
+      <button class="iconBtn" id="themeBtn" type="button" aria-label="切换日间/夜间模式">
+        <svg class="iSun" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v2M12 19v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M3 12h2M19 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/><circle cx="12" cy="12" r="4"/></svg>
+        <svg class="iMoon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+      <button class="iconBtn" id="settingsBtn" type="button" aria-label="设置">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21h-4v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
+      </button>
+      <button class="primaryBtn" id="runAllBtn" type="button"><span class="spark" aria-hidden="true"></span>运行全部</button>
+    </div>
+  </div>
+</header>
+
+<main class="shell">
+  <section class="hero" id="overview">
+    <div class="heroLead">
+      <p class="eyebrow"><i aria-hidden="true"></i> 实时状态 · 北京时间 <span id="todayStr">—</span></p>
+      <h1>今日签到<br><span class="grad">一目了然。</span></h1>
+      <p class="heroSub" id="mastSub">正在读取今日状态…</p>
+      <div class="heroActions">
+        <button class="primaryBtn" type="button" data-act="add">＋ 添加账号</button>
+        <button class="ghostBtn" type="button" id="refreshBtn">刷新状态</button>
+      </div>
+    </div>
+    <div class="heroGrid">
+      <article class="glass statusCard" aria-label="今日完成度">
+        <div class="statusHead">
+          <p class="cardKicker" style="margin:0">TODAY · 今日完成</p>
+          <span class="statusBadge">实时</span>
+        </div>
+        <div class="ringWrap">
+          <svg width="178" height="178" viewBox="0 0 186 186" aria-hidden="true">
+            <defs>
+              <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
+                <stop offset="0%" stop-color="#007aff"/>
+                <stop offset="60%" stop-color="#32ade6"/>
+                <stop offset="100%" stop-color="#64d2ff"/>
+              </linearGradient>
+            </defs>
+            <circle class="ringTrack" cx="93" cy="93" r="78" fill="none" stroke-width="10"/>
+            <circle class="ringFg" id="ringFg" cx="93" cy="93" r="78" fill="none" stroke="url(#ringGrad)" stroke-width="10" stroke-linecap="round" stroke-dasharray="490" stroke-dashoffset="490"/>
+          </svg>
+          <div class="ringCenter">
+            <b id="heroVerified">—</b>
+            <small id="heroEnabled">/ —</small>
+            <em>已确认</em>
+          </div>
+        </div>
+        <div class="statusMeta">
+          <div><b id="heroPending">—</b><span>待确认</span></div>
+          <div><b id="heroFailed">—</b><span>失败 / 受限</span></div>
+          <div><b id="heroCredit">—</b><span>今日积分</span></div>
+          <div><b id="heroTravel">—</b><span>旅行在途</span></div>
+        </div>
+      </article>
+
+      <article class="glass nextCard" aria-label="下次自动签到">
+        <p class="cardKicker">NEXT RUN · 下次自动签到</p>
+        <b class="nextTime" id="nextRun">—</b>
+        <p class="nextDate" id="nextDate">—</p>
+        <p class="nextNote">Cloudflare Cron · 自动签到、复核与旅行</p>
+        <div class="cronPills" id="cronPills"></div>
+      </article>
+
+      <article class="glass travelCard" id="travelHero" aria-label="旅行任务">
+        <p class="cardKicker">TRAVEL · 自动旅行</p>
+        <div class="travelEmpty">正在读取旅行状态…</div>
+      </article>
+    </div>
+  </section>
+
+  <section class="section" id="platforms">
+    <div class="sectionHead">
+      <div>
+        <h2>平台</h2>
+        <p>点选一个平台，只看它的账号；再点一次取消。</p>
+      </div>
+      <div class="legend" aria-label="状态图例">
+        <span class="ok"><i aria-hidden="true"></i>已确认</span>
+        <span class="warn"><i aria-hidden="true"></i>待确认</span>
+        <span class="bad"><i aria-hidden="true"></i>失败</span>
+        <span class="idle"><i aria-hidden="true"></i>未完成</span>
+      </div>
+    </div>
+    <div class="platformGrid" id="platformGrid"></div>
+  </section>
+
+  <section class="section" id="accounts">
+    <div class="sectionHead">
+      <div>
+        <h2>账号</h2>
+        <p id="accountSub">正在读取账号…</p>
+      </div>
+      <div class="accountTools">
+        <div class="filterRow" id="filters" role="group" aria-label="筛选账号">
+          <button type="button" class="pill on" data-filter="all">全部</button>
+          <button type="button" class="pill" data-filter="attention">需关注</button>
+          <button type="button" class="pill" data-filter="done">已确认</button>
+          <button type="button" class="pill" data-filter="verify">待确认</button>
+          <button type="button" class="pill" data-filter="off">已停用</button>
+        </div>
+        <label class="searchBox">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
+          <input id="search" type="search" placeholder="搜索账号 / 平台" aria-label="搜索账号或平台">
+        </label>
+      </div>
+    </div>
+    <div class="acctGrid" id="acctGrid">
+      <div class="aCard"><p class="modalNote">正在读取账号矩阵…</p></div>
+    </div>
+    <p class="footNote" id="accountFoot"></p>
+  </section>
+
+  <section class="section" id="travel">
+    <div class="sectionHead">
+      <div>
+        <h2>自动旅行</h2>
+        <p>WorkBuddy 成长中心 · 自动派发、到点领取，每日次数用尽后停止。</p>
+      </div>
+      <button class="linkBtn" type="button" data-act="travel-run">同步全部 →</button>
+    </div>
+    <div class="missionGrid" id="missionGrid"></div>
+  </section>
+
+  <section class="bottomGrid" id="activity">
+    <article class="glass activityCard">
+      <div class="bottomHead">
+        <h2>最近活动</h2>
+        <button class="linkBtn" type="button" data-act="history">全部记录 →</button>
+      </div>
+      <div class="activityList" id="activityList"></div>
+    </article>
+
+    <article class="glass systemCard">
+      <div class="bottomHead">
+        <h2>状态</h2>
+        <span class="cardKicker" style="margin:0">SYSTEM</span>
+      </div>
+      <div class="sysGrid">
+        <div class="sysItem"><small>当前 Cron</small><b id="sysCron">—</b></div>
+        <div class="sysItem"><small>下次运行</small><b id="sysNext">—</b></div>
+        <div class="sysItem"><small>账号</small><b id="sysAccounts">—</b></div>
+        <div class="sysItem"><small>平台</small><b id="sysPlatforms">—</b></div>
+      </div>
+      <div class="sysActions">
+        <button type="button" data-act="settings">通知设置</button>
+        <button type="button" data-act="refresh-all">刷新全部</button>
+        <button type="button" data-act="history">全部记录</button>
+      </div>
+    </article>
+  </section>
+
+  <footer class="footer">
+    <span>签到塔 · SIGN-IN TOWER</span>
+    <span>Cloudflare Workers · 单文件 · 零依赖</span>
+  </footer>
+</main>
 
 <!-- 登录 -->
-<div id="loginView" class="min-h-dvh grid place-items-center px-4 py-10">
-  <div class="login-card">
-    <div class="brand mb-1"><span class="caret"></span>checkin-hub</div>
-    <div class="hint mb-5">每日签到值班台 · Cloudflare Worker</div>
-    <label class="lb" for="pwd">登录密码</label>
-    <div class="flex gap-2">
-      <input id="pwd" class="field" type="password" placeholder="ADMIN_TOKEN" autocomplete="current-password">
-      <button id="loginBtn" class="btn-primary shrink-0">登录</button>
+<div class="veil" id="loginVeil" hidden>
+  <div class="sheet narrow" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
+    <div class="sheetHead">
+      <div>
+        <p class="kicker">ACCESS</p>
+        <h2 id="loginTitle">值班口令</h2>
+        <p>输入部署时设置的 ADMIN_TOKEN 进入控制台。</p>
+      </div>
     </div>
-    <div class="hint mt-3">密码即后台的 <code>ADMIN_TOKEN</code>。登录状态只存在本机浏览器，公共电脑用完请退出。</div>
-    <div class="errbox mt-2" id="loginErr"></div>
+    <div class="sheetBody">
+      <div class="field">
+        <label for="loginToken">ADMIN_TOKEN</label>
+        <input id="loginToken" type="password" autocomplete="current-password" placeholder="部署时设置的口令">
+      </div>
+      <p class="err" id="loginErr"></p>
+      <button class="btn primary wide" id="loginBtn" type="button">进入控制台</button>
+    </div>
   </div>
 </div>
 
-<div id="appView" hidden>
-<div class="shell">
-
-  <div class="topbar">
-    <div class="brand"><span class="caret"></span>checkin-hub</div>
-    <div class="scope" id="headScope">6 平台</div>
-    <div class="topbar-right">
-      <span class="badge idle" id="schedBadge">定时 —</span>
-      <button class="btn-ghost btn-sm" id="themeBtn" onclick="toggleTheme()">浅色</button>
-      <button class="btn-ghost btn-sm" onclick="openNotify()">通知</button>
-      <button class="btn-ghost btn-sm" onclick="openGuide()">教程</button>
-      <button class="btn-ghost btn-sm" onclick="logout('')">退出</button>
+<!-- 账号详情 -->
+<div class="veil" id="acctVeil" hidden>
+  <div class="sheet wide" role="dialog" aria-modal="true" aria-labelledby="acctTitle">
+    <div class="sheetHead">
+      <div>
+        <p class="kicker" id="acctKicker">ACCOUNT</p>
+        <h2 id="acctTitle">账号</h2>
+        <p id="acctSub"></p>
+      </div>
+      <button class="closeX" type="button" data-close="acctVeil" aria-label="关闭">×</button>
     </div>
+    <div class="sheetBody" id="acctBody"></div>
   </div>
-
-  <div class="statusline">
-    <div class="sl-cell">
-      <span class="sl-label">今天</span>
-      <span class="today-date" id="stampDate">--</span>
-      <span class="sl-sub" id="stampWeek">—</span>
-      <span class="punch mt-1.5" id="punchStrip" aria-hidden="true"></span>
-    </div>
-    <div class="sl-cell">
-      <span class="sl-label">今日已签</span>
-      <span class="sl-value"><span id="kpiToday">0</span><span class="today-frac" id="kpiTotal">/0</span></span>
-      <span class="sl-sub mt-0.5" id="kpiEnabled">—</span>
-      <span class="sl-bar"><i id="kpiBar"></i></span>
-    </div>
-    <div class="sl-cell">
-      <span class="sl-label">今日积分</span>
-      <span class="sl-value" id="kpiCredit">—</span>
-      <span class="sl-sub">各平台合计</span>
-    </div>
-    <div class="sl-cell">
-      <span class="sl-label">累计签到</span>
-      <span class="sl-value" id="kpiSigned">—</span>
-      <span class="sl-sub">次</span>
-    </div>
-    <div class="sl-cell">
-      <span class="sl-label">下次自动签到</span>
-      <span class="sl-value" id="kpiNext">—</span>
-      <span class="sl-sub num" id="kpiCron">—</span>
-    </div>
-  </div>
-
-  <nav class="tabs">
-    <button class="tab on" data-tab="accounts" title="快捷键 1" onclick="switchTab('accounts',this)"><span class="key">1</span>账号 <span class="cnt" id="tabCnt">0</span></button>
-    <button class="tab" data-tab="history" title="快捷键 2" onclick="switchTab('history',this)"><span class="key">2</span>运行历史 <span class="cnt" id="tabHist">0</span></button>
-    <button class="tab" data-tab="about" title="快捷键 3" onclick="switchTab('about',this)"><span class="key">3</span>关于</button>
-  </nav>
-
-  <section class="panel active" id="panel-accounts">
-    <div class="sec-head mt-5">
-      <div class="sec-title">签到队列<i class="auto-tip">每分钟自动刷新</i></div>
-      <div class="sec-acts">
-        <button class="btn-ghost btn-sm" onclick="openAdd()">添加账号</button>
-        <span class="act-div"></span>
-        <button class="btn-ghost btn-sm" id="refreshAllBtn" onclick="refreshAll(this)">刷新</button>
-        <button class="btn-primary btn-sm" id="runAllBtn" onclick="runAll(this)">全部签到</button>
-      </div>
-    </div>
-    <div class="errbox mb-2" id="runMsg"></div>
-    <div id="acctList"><div class="empty">加载中…</div></div>
-    <div class="hint mt-3"><span class="scroll-tip">表格可横向滑动 · </span>点账号行展开详情：刷新积分、重命名、删除、最近执行记录都在里面。凭证只支持重新登录或重新粘贴，不支持直接查看。按 1 / 2 / 3 切换标签页。</div>
-  </section>
-
-  <section class="panel" id="panel-history">
-    <div class="sec-head mt-5">
-      <div class="sec-title">运行历史<i class="auto-tip">每次签到与定时任务的结果</i></div>
-      <div class="sec-acts">
-        <span class="hint" id="histHint">—</span>
-        <button class="btn-ghost btn-sm" onclick="clearHistory()">清空</button>
-      </div>
-    </div>
-    <div class="overflow-x-auto">
-      <table class="at no-click">
-        <thead><tr><th>时间</th><th>账号</th><th>平台</th><th>触发</th><th>结果</th><th class="num">积分</th><th>说明</th></tr></thead>
-        <tbody id="histBody"><tr><td colspan="7" class="empty">加载中…</td></tr></tbody>
-      </table>
-    </div>
-    <div class="flex items-center justify-between gap-3 mt-3 flex-wrap">
-      <span class="hint num" id="histRange">—</span>
-      <div class="flex items-center gap-1.5">
-        <button class="btn-ghost btn-sm" id="histPrev" onclick="histPage(-1)">上一页</button>
-        <button class="btn-ghost btn-sm" id="histNext" onclick="histPage(1)">下一页</button>
-      </div>
-    </div>
-  </section>
-
-  <section class="panel" id="panel-about">
-    <div class="grid gap-4 sm:grid-cols-2 mt-5">
-      <div class="card sm:col-span-2">
-        <div class="px-4 py-3 flex items-baseline justify-between gap-3 border-b border-rule">
-          <h3 class="panel-h">支持平台</h3><span class="hint">接口按官方客户端/网页整理</span>
-        </div>
-        <div class="px-4 py-3 overflow-x-auto">
-          <table class="at no-click">
-            <thead><tr><th>平台</th><th>签到</th><th>积分口径</th><th>添加方式</th><th>状态</th></tr></thead>
-            <tbody>
-              <tr class="ar"><td>Trae</td><td>每日积分</td><td class="num">余额 / 本次</td><td>抖音扫码 + 粘贴回调</td><td><span class="badge ok">已实测</span></td></tr>
-              <tr class="ar"><td>WorkBuddy</td><td>每日签到</td><td class="num">连签 / 本期</td><td>微信扫码</td><td><span class="badge ok">已实测</span></td></tr>
-              <tr class="ar"><td>Qoder</td><td>每日活动领取</td><td class="num">本次 / 累计</td><td>官网设备授权</td><td><span class="badge warn">未验证</span></td></tr>
-              <tr class="ar"><td>WorkBuddy 国际版</td><td>活动档期内</td><td class="num">余额 / 套餐</td><td>网页授权或粘贴 token</td><td><span class="badge warn">未验证</span></td></tr>
-              <tr class="ar"><td>智谱清言</td><td>每日登录积分</td><td class="num">积分余额</td><td>粘贴 chatglm_token</td><td><span class="badge warn">未验证</span></td></tr>
-              <tr class="ar"><td>讯飞 Loomy</td><td>每日额度池</td><td class="num">可用额度</td><td>粘贴 token</td><td><span class="badge warn">未验证</span></td></tr>
-              <tr class="ar"><td>讯飞 AStudio</td><td>登录积分</td><td class="num">通用 / 星火</td><td>Cookie 或手机号密码</td><td><span class="badge warn">未验证</span></td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-      <div class="card">
-        <div class="px-4 py-3 flex items-baseline justify-between gap-3 border-b border-rule">
-          <h3 class="panel-h">部署绑定</h3><span class="hint">Cloudflare Worker</span>
-        </div>
-        <div class="px-4 py-3">
-          <table class="at no-click">
-            <tbody>
-              <tr class="ar"><td class="num whitespace-nowrap">KV</td><td>KV 命名空间，所有平台按前缀隔离</td></tr>
-              <tr class="ar"><td class="num whitespace-nowrap">MASTER_KEY</td><td>32 字节随机值的 base64，所有平台共用</td></tr>
-              <tr class="ar"><td class="num whitespace-nowrap">ADMIN_TOKEN</td><td>控制台登录密码</td></tr>
-              <tr class="ar"><td class="num whitespace-nowrap">CRON_SECRET</td><td>可选，/cron 独立口令</td></tr>
-              <tr class="ar"><td class="num whitespace-nowrap">CHATGLM_SIGN_SECRET</td><td>可选，覆盖内置的智谱签名盐</td></tr>
-              <tr class="ar"><td class="num whitespace-nowrap">CHECKIN_CRON</td><td>可选，首次 Cron 触发前的展示占位</td></tr>
-            </tbody>
-          </table>
-          <div class="hint mt-3">Cron 在 Cloudflare 控制台 <b class="text-ink">Settings → Triggers → Cron Triggers</b> 配置，推荐 <code>10 0 * * *</code>（UTC）= 北京 08:10。Worker 读不到控制台里的 Cron 列表，所以第一次自动唤醒之前角标显示「待触发」；被唤醒一次之后会永久变成「已同步」。</div>
-        </div>
-      </div>
-      <div class="card">
-        <div class="px-4 py-3 border-b border-rule"><h3 class="panel-h">安全设计</h3></div>
-        <div class="px-4 py-3">
-          <ul class="body-copy">
-            <li>KV 里存的是 AES-256-GCM 密文，每条记录随机 salt 与 IV，密钥由 MASTER_KEY 经 HKDF-SHA256 派生。</li>
-            <li>接口响应永远不返回令牌、Cookie、私钥，连前缀都不给。</li>
-            <li>登录密码与账号凭证分离；口令比较走定长比较。</li>
-            <li>登录密码只存在浏览器 localStorage；Worker 侧不落盘、不下发 Cookie。</li>
-            <li>页面零外部资源引用，样式在部署时已编译进 Worker，不加载任何第三方脚本或字体。</li>
-          </ul>
-          <div class="tip mt-3"><b>边界：</b>令牌在 Worker 内存里必然有一刻是明文。云端能看到什么取决于你是否信任它——介意就部署到自己的账号下。</div>
-        </div>
-      </div>
-      <div class="card sm:col-span-2">
-        <div class="px-4 py-3 border-b border-rule"><h3 class="panel-h">已知限制</h3></div>
-        <div class="px-4 py-3">
-          <ul class="body-copy">
-            <li>除 Trae / WorkBuddy 外，新平台协议按官方客户端/网页调用整理，接口可能随客户端升级变化。</li>
-            <li>智谱签名盐默认已内置；如官方客户端更新导致签名失败，可用 <code>CHATGLM_SIGN_SECRET</code> 覆盖。</li>
-            <li>WorkBuddy 国际版活动按档期开放，没档期时显示「无活动」，不是凭证失效。</li>
-            <li>Trae 授权回调只认 127.0.0.1，添加账号的最后一步需要手动粘贴一次回调链接。</li>
-            <li>签到接口本身幂等；重复点「签到」或「全部签到」不会重复加分。</li>
-          </ul>
-        </div>
-      </div>
-    </div>
-  </section>
-</div>
 </div>
 
 <!-- 添加账号 -->
-<div class="modal-mask" id="addModal">
-  <div class="modal xl">
-    <div class="modal-head">
-      <h3>添加账号</h3>
-      <button class="modal-x" onclick="closeAdd()" title="关闭">✕</button>
-    </div>
-    <div class="modal-body">
-      <div class="step">
-        <div class="step-n">1</div>
-        <div class="step-b">
-          <div class="step-t">选择平台</div>
-          <div class="grid gap-2 sm:grid-cols-2" id="platPick"></div>
-        </div>
+<div class="veil" id="addVeil" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="addTitle">
+    <div class="sheetHead">
+      <div>
+        <p class="kicker">NEW ACCOUNT</p>
+        <h2 id="addTitle">添加账号</h2>
+        <p id="addHint"></p>
       </div>
-      <div class="step">
-        <div class="step-n">2</div>
-        <div class="step-b">
-          <div class="step-t" id="addTitle">添加账号</div>
-          <div class="hint mb-2.5" id="addHint"></div>
-          <div id="addBody"></div>
-          <div class="errbox mt-2.5" id="addErr"></div>
-        </div>
-      </div>
-      <div class="tip mt-3"><b>昵称、域名会自动识别</b>，无需手动填写。只解析展示用信息，不读取手机号等隐私字段。</div>
+      <button class="closeX" type="button" data-close="addVeil" aria-label="关闭">×</button>
     </div>
-    <div class="modal-foot">
-      <button class="btn-ghost" id="addCancel" onclick="closeAdd()">取消</button>
-      <button class="btn-primary" id="addConfirm" onclick="submitAdd()">确认添加</button>
+    <div class="sheetBody">
+      <div class="platChips" id="platChips"></div>
+      <div id="addBody"></div>
+      <p class="err" id="addErr"></p>
+    </div>
+    <div class="sheetFoot">
+      <button class="btn" type="button" data-close="addVeil">取消</button>
+      <button class="btn primary" id="addConfirm" type="button">确认添加</button>
     </div>
   </div>
 </div>
 
-<!-- 签到结果通知 -->
-<div class="modal-mask" id="notifyModal">
-  <div class="modal">
-    <div class="modal-head">
-      <h3>签到结果通知</h3>
-      <button class="modal-x" onclick="closeNotify()" title="关闭">✕</button>
-    </div>
-    <div class="modal-body">
-      <div class="tip mb-3">每轮全量签到跑完推一条汇总。两个渠道各自独立，都没配就静默跳过；发送失败不影响签到结果。</div>
-      <div class="sec-mini">Telegram</div>
-      <div class="fields mb-3">
-        <div class="field-row"><label class="lb">Bot Token</label><input id="tgToken" class="field" placeholder="123456:ABC..." autocomplete="off"></div>
-        <div class="field-row"><label class="lb">Chat ID</label><input id="tgChat" class="field" placeholder="123456789" autocomplete="off"></div>
+<!-- 设置 -->
+<div class="veil" id="setVeil" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="setTitle">
+    <div class="sheetHead">
+      <div>
+        <p class="kicker">CONFIG</p>
+        <h2 id="setTitle">设置</h2>
+        <p>通知通道、定时信息与数据维护。</p>
       </div>
-      <div class="sec-mini">QQ 官方机器人</div>
-      <div class="fields">
-        <div class="field-row"><label class="lb">AppID</label><input id="qqAppId" class="field" placeholder="102xxxxxx" autocomplete="off"></div>
-        <div class="field-row"><label class="lb">AppSecret</label><input id="qqSecret" class="field" type="password" placeholder="AppSecret" autocomplete="off"></div>
-        <div class="field-row"><label class="lb">OpenID <span class="hint">用下面的脚本取</span></label><input id="qqOpenid" class="field" placeholder="user_openid" autocomplete="off"></div>
-        <label class="lb flex items-center gap-2"><input id="qqSandbox" type="checkbox"> 沙箱环境（sandbox.api.sgroup.qq.com）</label>
+      <button class="closeX" type="button" data-close="setVeil" aria-label="关闭">×</button>
+    </div>
+    <div class="sheetBody">
+      <h3 class="secTitle">通知通道</h3>
+      <p class="hint">每轮 Cron 有实际结果时推送一条汇总；通道失败不影响签到。</p>
+      <div class="two">
+        <div class="field"><label for="tgToken">Telegram Bot Token</label><input id="tgToken" type="password" autocomplete="off" placeholder="123456:ABC..."></div>
+        <div class="field"><label for="tgChat">Telegram Chat ID</label><input id="tgChat" autocomplete="off" placeholder="123456789"></div>
+        <div class="field"><label for="qqAppId">QQ AppID</label><input id="qqAppId" autocomplete="off" placeholder="102xxxxxx"></div>
+        <div class="field"><label for="qqSecret">QQ AppSecret</label><input id="qqSecret" type="password" autocomplete="off" placeholder="AppSecret"></div>
+        <div class="field"><label for="qqOpenid">QQ 用户 OpenID</label><input id="qqOpenid" autocomplete="off" placeholder="私聊机器人后打印的 openid"></div>
+        <div class="field"><label class="check"><input id="qqSandbox" type="checkbox"> 使用 QQ 沙箱环境</label></div>
       </div>
-      <div class="tip mt-3">
-        取 OpenID：先把命令里的 AppID / AppSecret 换成你的，运行后在 60 秒内用手机 QQ 私聊机器人一次。
-        <div class="mt-1.5">Windows（cmd）：</div>
-        <div class="mt-1.5"><code id="oidCmdWin"></code></div>
-        <div class="mt-1.5">macOS / Linux：</div>
-        <div class="mt-1.5"><code id="oidCmdNix"></code></div>
-      </div>
-      <div class="errbox mt-2.5" id="notifyErr"></div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn-ghost" id="notifyTestBtn" onclick="testNotify(this)">发测试</button>
-      <button class="btn-primary" id="notifySaveBtn" onclick="saveNotify(this)">保存</button>
-    </div>
-  </div>
-</div>
-
-<!-- 使用教程 -->
-<div class="modal-mask" id="guideModal">
-  <div class="modal xl">
-    <div class="modal-head">
-      <h3>使用说明</h3>
-      <button class="modal-x" onclick="closeGuide()" title="关闭">✕</button>
-    </div>
-    <div class="modal-body">
-      <div class="tabs mb-4" id="guideTabs">
-        <button class="tab on" onclick="switchGuide('start',this)">快速开始</button>
-        <button class="tab" onclick="switchGuide('trae',this)">Trae / WorkBuddy</button>
-        <button class="tab" onclick="switchGuide('more',this)">国际版 / 智谱 / 讯飞</button>
-        <button class="tab" onclick="switchGuide('safe',this)">隐私与安全</button>
+      <p class="err" id="setErr"></p>
+      <div class="rowBtns">
+        <button class="btn sm" id="notifyTest" type="button">发送测试</button>
+        <button class="btn primary sm" id="notifySave" type="button">保存通知</button>
       </div>
 
-      <div id="guide-start" class="guide-panel active">
-        <div class="step"><div class="step-n">1</div><div class="step-b"><div class="step-t">添加账号</div><p>点队列上方的「添加账号」，选择平台后按提示扫码或粘贴凭证。昵称和域名会自动识别。</p></div></div>
-        <div class="step"><div class="step-n">2</div><div class="step-b"><div class="step-t">设置定时</div><p>在 Cloudflare 控制台给 Worker 加 Cron Trigger：<code>10 0 * * *</code>（UTC）= 北京时间每天 08:10。所有平台会在一次触发里依次跑完。</p></div></div>
-        <div class="step"><div class="step-n">3</div><div class="step-b"><div class="step-t">看结果</div><p>顶部状态条的日期、方块进度和账号状态都是按北京时间当天现算的。点账号行可以展开最近执行记录。</p></div></div>
-        <div class="tip mt-3"><b>不用一直开页面</b>　定时任务跑在 Cloudflare，关掉浏览器照样执行；页面只用来查看和管理。</div>
+      <h3 class="secTitle">定时与维护</h3>
+      <dl class="sysGrid" id="setSys"></dl>
+      <p class="hint" id="cronTip"></p>
+      <div class="rowBtns">
+        <button class="btn sm" id="refreshAllBtn" type="button">刷新全部账号</button>
+        <button class="btn sm" id="clearHistBtn" type="button">清空运行记录</button>
+        <button class="btn sm" id="forgetBtn" type="button">更换口令</button>
       </div>
 
-      <div id="guide-trae" class="guide-panel">
-        <div class="step"><div class="step-n">1</div><div class="step-b"><div class="step-t">Trae：抖音扫码</div><p>点「添加账号」→ 选 Trae → 打开官方授权页，用抖音扫码并确认。浏览器会跳到一个打不开的 <code>127.0.0.1</code> 地址，这是正常的。</p><p>把那个页面的地址栏整段复制，粘回控制台，立即自动绑定。授权码 15 分钟内有效，只能用一次。</p></div></div>
-        <div class="step"><div class="step-n">2</div><div class="step-b"><div class="step-t">WorkBuddy：微信扫码</div><p>点「添加账号」→ 选 WorkBuddy → 新窗口打开官方登录页，用微信扫码确认。账号会自动保存，登录窗口自动关闭。</p></div></div>
-        <div class="tip mt-3"><b>为什么 Trae 要手动粘一次？</b>　Trae 只把授权码回送到你电脑的 <code>127.0.0.1</code>，云端 Worker 访问不到你电脑的端口，也读不到弹窗地址栏，所以最后一步只能由浏览器里的人完成。</div>
-        <div class="tip mt-2"><b>设备密钥是 Worker 现场生成的</b>　Trae 账号由 Worker 生成 P-256 设备密钥并加密保存，续期时的设备证明也由自己签名，不需要安装 Trae 客户端。</div>
-      </div>
-
-      <div id="guide-more" class="guide-panel">
-        <div class="body-copy">
-          <div><h4>WorkBuddy 国际版</h4><p>与国内版登录态不通用，账号是 Google / GitHub / X 授权的。点「用 Google / GitHub / X 登录」打开官方授权页，登录完自动入库；也可以粘贴 <code>access_token</code>。</p><p>活动按档期开放。没有档期时领取接口返回 10001，页面显示「无活动」，不是凭证失效。</p></div>
-          <div><h4>智谱清言</h4><p>浏览器登录 <code>chatglm.cn</code> 后，从 Cookie 里取 <code>chatglm_token</code> 粘贴。签名盐已内置，开箱即用。</p></div>
-          <div><h4>讯飞 Loomy</h4><p>登录 Loomy 客户端或网页后，从请求头 / Cookie 里取 <code>token</code> 粘贴。签到是「每日额度池重置」，不是直接加积分。</p></div>
-          <div><h4>讯飞 AStudio</h4><p>两种方式：① 手机号 + 密码走讯飞 SSO 换会话（密码只用一次，不保存；若被要求滑块请改用 Cookie）；② 登录后 F12 复制完整 Cookie 粘贴。</p></div>
-        </div>
-        <div class="tip mt-3"><b>未验证标记</b>　智谱、Loomy、AStudio 按官方客户端/网页调用整理，尚未在 Worker 环境用真实账号跑通，页面上会标「未验证」。接口变动时可能需要跟进适配。</div>
-      </div>
-
-      <div id="guide-safe" class="guide-panel">
-        <div class="body-copy">
-          <div><h4>处理哪些信息</h4><p>仅处理完成签到所需的平台登录凭证、账号昵称 / ID，以及每次执行的时间、结果与获得积分。</p></div>
-          <div><h4>怎么保存</h4><p>全部保存在你自己的 Cloudflare KV 中，凭证用 AES-256-GCM 加密；不经过开发者或任何第三方服务器，也不提供对外数据输出通道。</p></div>
-          <div><h4>不会做什么</h4><ul><li>不收集账号密码（AStudio 密码只在单次请求内存里换会话，不落盘）。</li><li>不读取聊天内容、通讯录、文件或平台上的其它业务数据。</li><li>不出售、共享、转让凭证或数据。</li></ul></div>
-          <div><h4>使用边界</h4><p>仅限本人账号，用于自动化完成本应手动完成的签到。请勿用于代签、账号共享、批量注册或违反平台服务条款的用途。</p></div>
-        </div>
-      </div>
-    </div>
-    <div class="modal-foot">
-      <button class="btn-ghost" onclick="closeGuide()">关闭</button>
-      <button class="btn-primary" onclick="closeGuide();openAdd()">去添加账号</button>
+      <h3 class="secTitle">QQ OpenID 助手</h3>
+      <p class="hint">在电脑上执行下面的命令，然后私聊机器人一次，终端会打印 openid。</p>
+      <pre class="code" id="oidCmd"></pre>
     </div>
   </div>
 </div>
 
-<div id="toast" class="fixed left-1/2 bottom-6 -translate-x-1/2 z-[200] flex flex-col items-center gap-2 pointer-events-none w-max max-w-[80vw]"></div>
+<!-- 运行记录 -->
+<div class="veil" id="histVeil" hidden>
+  <div class="sheet" role="dialog" aria-modal="true" aria-labelledby="histTitle">
+    <div class="sheetHead">
+      <div>
+        <p class="kicker">RUN LOG</p>
+        <h2 id="histTitle">运行记录</h2>
+        <p>最近 300 条签到结果，新的在上面。</p>
+      </div>
+      <button class="closeX" type="button" data-close="histVeil" aria-label="关闭">×</button>
+    </div>
+    <div class="sheetBody" id="histBody"></div>
+  </div>
+</div>
+
+<!-- 通用确认 / 输入 -->
+<div class="veil" id="askVeil" hidden>
+  <div class="sheet narrow" role="dialog" aria-modal="true" aria-labelledby="askTitle">
+    <div class="sheetHead">
+      <div>
+        <p class="kicker" id="askKicker">CONFIRM</p>
+        <h2 id="askTitle">确认</h2>
+        <p id="askDesc"></p>
+      </div>
+    </div>
+    <div class="sheetBody">
+      <div class="field" id="askField">
+        <label for="askInput" id="askLabel">值</label>
+        <input id="askInput" autocomplete="off">
+      </div>
+      <p class="err" id="askErr"></p>
+    </div>
+    <div class="sheetFoot">
+      <button class="btn" id="askCancel" type="button">取消</button>
+      <button class="btn primary" id="askOk" type="button">确认</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
 <script>
 (function(){
   'use strict';
-  var $ = function(sel){ return document.querySelector(sel); };
-  var TOKEN_KEY = 'checkin-admin-token';
-  var THEME_KEY = 'checkin-theme';
-  var TOKEN = '';
-  var META = { platforms: [], cron: '08:10', nextRun: '' };
-  var DATA = { accounts: [], stats: {}, platforms: [], errors: [] };
-  var HISTORY = [];
-  var HIST_PAGE = 1;
-  var HIST_PER = 20;
-  var ADD_PLATFORM = '';
-  var TIMER = null;
-  var WB_TIMER = null;
-  var INTL_TIMER = null;
-  var QODER_TIMER = null;
 
-  function esc(s){
-    return String(s == null ? '' : s).replace(/[&<>"]/g, function(c){
-      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+  var TOKEN_KEY = 'tower.token';
+  var THEME_KEY = 'tower.theme';
+  var token = '';
+  var S = { meta:null, data:null, history:[], filter:'all', platform:'', search:'', acct:null };
+  var ADD = { pf:'', timer:null };
+  var askResolve = null;
+
+  function el(id){ return document.getElementById(id); }
+  function esc(v){
+    return String(v == null ? '' : v).replace(/[&<>"']/g, function(c){
+      if(c === '&') return '&amp;';
+      if(c === '<') return '&lt;';
+      if(c === '>') return '&gt;';
+      if(c === '"') return '&quot;';
+      return '&#39;';
     });
   }
-  function firstChar(s){
-    var t = String(s == null ? '' : s).trim();
-    if (!t) return '?';
-    var chars = Array.from ? Array.from(t) : t.split('');
-    return chars[0] || '?';
+  function pad(n){ return n < 10 ? '0' + n : String(n); }
+  function bj(){ return new Date(Date.now() + 28800000); }
+  function fmtClock(sec){
+    var d = bj();
+    return pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + (sec ? ':' + pad(d.getUTCSeconds()) : '');
   }
-  function fmtNum(n){
-    if (n == null || n === '') return '—';
-    var v = Number(n);
-    if (!isFinite(v)) return '—';
-    if (Math.abs(v - Math.round(v)) < 0.0001) return String(Math.round(v));
-    return String(Math.round(v * 100) / 100);
+  function weekdayName(d){
+    return ['星期日','星期一','星期二','星期三','星期四','星期五','星期六'][d.getUTCDay()];
   }
-  function shortTime(s){
-    if (!s) return '';
-    return String(s).slice(0, 16).replace('T', ' ');
+  function fmtDateLong(){
+    var d = bj();
+    return d.getUTCFullYear() + '-' + pad(d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) + ' · ' + weekdayName(d);
   }
-  function dateText(ms){
-    if (!ms) return '';
-    var d = new Date(Number(ms) + 8 * 3600e3);
-    return d.toISOString().slice(0, 10);
+  function fmtDateTime(ms){
+    if(!ms) return '—';
+    var d = new Date(Number(ms) + 28800000);
+    return (d.getUTCMonth() + 1) + '-' + pad(d.getUTCDate()) + ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes());
   }
-  function beijingNow(){ return new Date(Date.now() + 8 * 3600e3); }
-  function pad2(n){ return n < 10 ? '0' + n : String(n); }
-  var WEEK_CN = ['星期日', '星期一', '星期二', '星期三', '星期四', '星期五', '星期六'];
-  function themeApply(mode){
-    var root = document.documentElement;
-    if (mode === 'light') root.setAttribute('data-theme', 'light');
-    else root.removeAttribute('data-theme');
-    var btn = $('#themeBtn');
-    if (btn){
-      btn.textContent = mode === 'light' ? '夜间' : '浅色';
-      btn.title = mode === 'light' ? '切回深色值班台' : '切到浅色白日班';
-    }
-  }
-  function themeCurrent(){
-    return document.documentElement.getAttribute('data-theme') === 'light' ? 'light' : 'dark';
-  }
-  function toggleTheme(){
-    var next = themeCurrent() === 'light' ? 'dark' : 'light';
-    themeApply(next);
-    try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
-  }
-  (function themeBoot(){
-    var saved = null;
-    try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
-    if (saved === 'light' || saved === 'dark'){ themeApply(saved); return; }
-    /* 无本地选择：沿用头部内联脚本按系统偏好定下的调，只补按钮文案 */
-    themeApply(themeCurrent());
-  })();
-  function accentClass(a){
-    return 'p-' + ((a && a.accent) || 'gray');
-  }
-  function platformLabel(key){
-    var aliases = { wb: 'workbuddy', wbi: 'workbuddy_intl' };
-    var k = aliases[key] || key;
-    for (var i = 0; i < META.platforms.length; i++){
-      if (META.platforms[i].key === k) return META.platforms[i].label;
-    }
-    for (var j = 0; j < DATA.platforms.length; j++){
-      if (DATA.platforms[j].key === k) return DATA.platforms[j].label;
-    }
-    return k || '';
+  function show(v){ return v == null || v === '' ? '—' : String(v); }
+  function compact(v){
+    var n = Number(v);
+    if(!isFinite(n)) return v == null ? '—' : String(v);
+    if(Math.abs(n) >= 10000) return (n / 1000).toFixed(1) + 'k';
+    return String(Math.round(n * 10) / 10);
   }
 
-  function platHint(key, field){
-    var aliases = { wb: 'workbuddy', wbi: 'workbuddy_intl' };
-    var k = aliases[key] || key;
-    for (var i = 0; i < META.platforms.length; i++){
-      if (META.platforms[i].key === k) return META.platforms[i][field] || '';
-    }
-    return '';
+  var ACCENTS = {
+    purple:['#bf5af2','#8944ab'], blue:['#0a84ff','#0060df'], lime:['#a3e635','#4d7c0f'],
+    orange:['#ff9f0a','#c93400'], green:['#34c759','#1f7a33'], pink:['#ff375f','#c9184a'],
+    cyan:['#64d2ff','#0071a4'], red:['#ff453a','#c41e1a'], yellow:['#ffd60a','#b25000'],
+    gray:['#aeaeb2','#636366']
+  };
+  function grad(name){ return ACCENTS[name] || ACCENTS.gray; }
+  function orbStyle(name){
+    var g = grad(name);
+    return '--c1:' + g[0] + ';--c2:' + g[1];
   }
-  /** 积分列：有真余额显示余额，否则退回本期累计并说明口径 */
-  function balanceCell(a){
-    if (typeof a.credits === 'number') return { text: fmtNum(a.credits), tip: platHint(a.platform, 'creditHint') || '当前余额' };
-    if (typeof a.total === 'number') return { text: fmtNum(a.total), tip: platHint(a.platform, 'totalHint') || '本期累计，不是余额' };
-    return { text: '—', tip: '该平台不返回余额，只看今日一列' };
-  }
-
-  function api(path, opts){
-    opts = opts || {};
-    return fetch(path, {
-      method: opts.method || 'GET',
-      headers: { 'Content-Type': 'application/json', 'X-Admin-Token': TOKEN },
-      body: opts.body
-    }).then(function(res){
-      return res.text().then(function(text){
-        var data = {};
-        try { data = text ? JSON.parse(text) : {}; }
-        catch (e) { data = { error: text ? text.slice(0, 200) : ('HTTP ' + res.status) }; }
-        if (res.status === 401){
-          logout(data.error || '登录已失效，请重新登录');
-          throw new Error(data.error || '登录已失效');
-        }
-        if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
-        return data;
-      });
-    });
+  function initial(label){
+    var s = String(label || '?').trim();
+    return s ? s.slice(0, 1).toUpperCase() : '?';
   }
 
   function toast(msg, type){
-    var box = $('#toast');
-    var el = document.createElement('div');
-    el.className = 'toast-item ' + (type || '');
-    el.textContent = String(msg == null ? '' : msg);
-    box.appendChild(el);
-    requestAnimationFrame(function(){ el.classList.add('show'); });
+    var box = el('toasts');
+    if(!box) return;
+    var div = document.createElement('div');
+    div.className = 'toast ' + (type || '');
+    div.textContent = msg;
+    box.appendChild(div);
     setTimeout(function(){
-      el.classList.remove('show');
-      setTimeout(function(){ if (el.parentNode) el.parentNode.removeChild(el); }, 220);
-    }, 3200);
-  }
-  function setLoginErr(msg){ $('#loginErr').textContent = msg ? String(msg) : ''; }
-  function showRunMsg(msg){
-    $('#runMsg').textContent = msg ? String(msg) : '';
+      if(div.parentNode) div.parentNode.removeChild(div);
+    }, 4200);
   }
 
-  /* ---------------- 登录 / 登出 ---------------- */
-  function login(password, silent){
-    var v = String(password == null ? '' : password).trim();
-    if (!v){ setLoginErr('请输入登录密码'); return; }
-    var btn = $('#loginBtn');
-    btn.disabled = true; btn.textContent = '登录中…';
+  /* ---------- api ---------- */
+  function api(path, opt){
+    opt = opt || {};
+    var headers = { 'X-Admin-Token': token };
+    if(opt.body) headers['Content-Type'] = 'application/json';
+    return fetch(path, {
+      method: opt.method || 'GET',
+      headers: headers,
+      body: opt.body,
+      credentials: 'same-origin'
+    }).then(function(res){
+      return res.text().then(function(txt){
+        var data = null;
+        try { data = JSON.parse(txt); } catch(e) { data = { error: txt || ('HTTP ' + res.status) }; }
+        if(res.status === 401){
+          showLogin('口令不正确或已失效');
+          throw new Error((data && data.error) || '未授权');
+        }
+        if(!res.ok || (data && data.error)) throw new Error((data && data.error) || ('HTTP ' + res.status));
+        return data || {};
+      });
+    });
+  }
+
+  /* ---------- login ---------- */
+  function showLogin(msg){
+    el('loginVeil').hidden = false;
+    el('loginErr').textContent = msg || '';
+    var input = el('loginToken');
+    if(input){ input.value = token; input.focus(); input.select(); }
+  }
+  function tryLogin(){
+    var v = el('loginToken').value.trim();
+    if(!v){ el('loginErr').textContent = '请输入口令'; return; }
+    var btn = el('loginBtn');
+    btn.disabled = true; btn.textContent = '验证中…';
     fetch('/api/ping', { headers: { 'X-Admin-Token': v } })
       .then(function(res){
-        return res.json().catch(function(){ return { error: '响应无法解析' }; }).then(function(d){
-          if (!res.ok) throw new Error(d.error || ('HTTP ' + res.status));
-          TOKEN = v;
-          localStorage.setItem(TOKEN_KEY, v);
-          setLoginErr('');
-          $('#loginView').hidden = true;
-          $('#appView').hidden = false;
-          loadAll();
-          startTimer();
+        return res.text().then(function(txt){
+          var data = null;
+          try { data = JSON.parse(txt); } catch(e) { data = {}; }
+          return { ok: res.ok, data: data || {} };
         });
       })
-      .catch(function(e){
-        localStorage.removeItem(TOKEN_KEY);
-        TOKEN = '';
-        if (!silent) setLoginErr(e.message || e);
-        else { $('#loginView').hidden = false; $('#appView').hidden = true; }
+      .then(function(r){
+        if(!r.ok) throw new Error(r.data.error || '口令不正确');
+        token = v;
+        try { localStorage.setItem(TOKEN_KEY, v); } catch(e) {}
+        el('loginVeil').hidden = true;
+        el('loginErr').textContent = '';
+        loadAll();
       })
-      .then(function(){ btn.disabled = false; btn.textContent = '登录'; });
-  }
-  function logout(msg){
-    TOKEN = '';
-    localStorage.removeItem(TOKEN_KEY);
-    stopTimer();
-    $('#appView').hidden = true;
-    $('#loginView').hidden = false;
-    $('#pwd').value = '';
-    setLoginErr(msg || '');
-  }
-  function startTimer(){
-    stopTimer();
-    TIMER = setInterval(function(){
-      if (TOKEN) loadOverview().catch(function(){});
-    }, 60000);
-  }
-  function stopTimer(){
-    if (TIMER){ clearInterval(TIMER); TIMER = null; }
+      .catch(function(e){ el('loginErr').textContent = e.message; })
+      .then(function(){ btn.disabled = false; btn.textContent = '进入控制台'; });
   }
 
-  /* ---------------- 数据加载 ---------------- */
-  function loadAll(){
-    return Promise.all([loadMeta(), loadOverview(), loadHistory()])
-      .catch(function(e){ toast(e.message || e, 'err'); });
-  }
-  function loadMeta(){
-    return api('/api/meta').then(function(d){
-      META = d || { platforms: [] };
-      renderStats();
-    });
-  }
-  function loadOverview(){
-    return api('/api/overview').then(function(d){
-      DATA = d || { accounts: [], stats: {} };
-      if (DATA.platforms && DATA.platforms.length) META.platforms = DATA.platforms;
-      if (DATA.errors && DATA.errors.length){
-        showRunMsg(DATA.errors.map(function(e){ return platformLabel(e.platform) + ': ' + e.error; }).join('；'));
-      }
-      renderStats();
-      if (!document.querySelector('.inline-edit')) renderAccounts();
-    });
-  }
-  function loadHistory(){
-    return api('/api/history?limit=200').then(function(d){
-      HISTORY = (d && d.entries) || [];
-      HIST_PAGE = 1;
-      renderHistory();
-      renderStats();
-    });
-  }
-
-  /* ---------------- 值班状态条 ---------------- */
-  function renderStamp(){
-    var d = beijingNow();
-    $('#stampDate').textContent = d.getUTCFullYear() + '-' + pad2(d.getUTCMonth() + 1) + '-' + pad2(d.getUTCDate());
-    $('#stampWeek').textContent = WEEK_CN[d.getUTCDay()] + ' · 北京时间';
-  }
-  function renderPunch(list, now){
-    var box = $('#punchStrip');
-    if (!list.length){ box.innerHTML = '<i class="offd"></i>'; return; }
-    var html = '';
-    var shown = Math.min(list.length, 80);
-    for (var i = 0; i < shown; i++){
-      var st = statusOf(list[i], now);
-      var cls = st.cls === 'ok' ? 'done'
-        : (st.cls === 'err' ? 'bad'
-        : (st.cls === 'warn' ? 'part'
-        : (st.cls === 'off' ? 'offd' : '')));
-      html += '<i' + (cls ? ' class="' + cls + '"' : '') + ' title="' + esc((list[i].label || list[i].id) + ' · ' + st.text) + '"></i>';
-    }
-    if (list.length > shown) html += '<span class="text-ink4 text-[11px] num">+' + (list.length - shown) + '</span>';
-    box.innerHTML = html;
-  }
-  function renderStats(){
-    var s = DATA.stats || {};
-    var list = DATA.accounts || [];
-    var now = Date.now();
-    $('#kpiToday').textContent = String(s.signed || 0);
-    $('#kpiTotal').textContent = '/' + String(s.enabled || 0);
-    $('#kpiEnabled').textContent = (s.total || 0) === (s.enabled || 0)
-      ? (s.total || 0) + ' 个账号全部启用'
-      : ((s.total || 0) + ' 个账号 · 启用 ' + (s.enabled || 0) + ' 个');
-    var pct = s.enabled ? Math.round((s.signed || 0) * 100 / s.enabled) : 0;
-    $('#kpiBar').style.width = pct + '%';
-    $('#kpiCredit').textContent = fmtNum(s.todayCredit || 0);
-    $('#kpiSigned').textContent = fmtNum(s.totalSigned || 0);
-    var crons = DATA.crons || META.crons || [];
-    var cronText = DATA.cron || META.cron || '08:10';
-    var cronConfigured = DATA.cronConfigured != null ? DATA.cronConfigured : (META.cronConfigured != null ? META.cronConfigured : null);
-    $('#kpiNext').textContent = DATA.nextRun || META.nextRun || '—';
-    $('#kpiCron').textContent = crons.length
-      ? ('Cron Trigger · UTC ' + crons.join(' / '))
-      : (cronConfigured === false ? '未声明排班' : ('CHECKIN_CRON · 每天 ' + cronText));
-    var badge = $('#schedBadge');
-    if (crons.length){
-      badge.className = 'badge ok';
-      badge.textContent = '定时 ' + (crons.length > 1 ? crons.length + ' 条' : '已同步');
-      badge.title = 'Worker 已被 Cloudflare 唤醒过，识别到的 Cron（UTC）：' + crons.join(' / ');
-    } else if (cronConfigured === false){
-      badge.className = 'badge err';
-      badge.textContent = '定时 未配置';
-      badge.title = '后台既没有 Cron Triggers，也没有 CHECKIN_CRON 变量：签到只能手动触发。';
-    } else {
-      badge.className = 'badge warn';
-      badge.textContent = '定时 待触发 ' + cronText;
-      badge.title = '排班已声明（CHECKIN_CRON=' + cronText + '），但 Worker 读不到 Cloudflare 的 Cron 列表；'
-        + '第一次自动唤醒后这里会自动变成「已同步」。北京时间 ' + cronText + ' 前后打开本页即可确认。';
-    }
-    var plats = {};
-    list.forEach(function(a){ plats[a.platform] = 1; });
-    var pn = Object.keys(plats).length;
-    $('#headScope').textContent = pn
-      ? (pn + ' 平台 · ' + list.length + ' 个账号')
-      : ((META.platforms || []).length + ' 平台 · 尚未添加账号');
-    $('#tabCnt').textContent = list.length;
-    $('#tabHist').textContent = HISTORY.length;
-    renderStamp();
-    renderPunch(list, now);
-  }
-
-  /* ---------------- 账号队列 ---------------- */
-  function statusOf(a, now){
-    if (a.enabled === false) return { cls: 'off', text: '已停用', tip: '开关关掉了，定时任务会跳过这个账号' };
-    if (a.signedToday) return { cls: 'ok', text: '今日已签', tip: '今天已经签到成功，重复点不会多领' };
-    if (a.cooldownUntil && a.cooldownUntil > now){
-      return { cls: 'warn', text: '限流 ' + Math.ceil((a.cooldownUntil - now) / 60000) + ' 分钟', tip: '平台返回过频，冷却结束后自动恢复' };
-    }
-    if (a.lastState === 'token_dead') return { cls: 'err', text: '令牌失效', tip: '需要重新扫码或重新粘贴凭证，自动签到救不回来' };
-    if (a.lastState === 'no_activity' && a.ranToday) return { cls: 'idle', text: '无活动', tip: '今天跑过：本期没有可签的活动，属于正常状态' };
-    if (a.lastState === 'pending' && a.ranToday) return { cls: 'warn', text: '待确认', tip: '平台返回了不确定的结果，下一次运行会重新判定' };
-    if (a.lastState === 'error' && a.ranToday) return { cls: 'err', text: '失败', tip: a.lastMsg ? String(a.lastMsg) : '今天执行失败，详情见展开的最近执行' };
-    if (a.lastState === 'rate') return { cls: 'warn', text: '限流', tip: '平台侧限流，稍后自动重试' };
-    return { cls: 'idle', text: '待签', tip: a.ranToday ? '今天已尝试，未成功' : '今天还没有执行，到点自动签到' };
-  }
-  function todayGain(a){
-    if (a.signedToday){
-      if (typeof a.lastCredit === 'number'){
-        return { text: '+' + fmtNum(a.lastCredit), cls: 'v-up', tip: '今天已签到，本次到手 ' + fmtNum(a.lastCredit) + ' 分' };
-      }
-      return { text: '已领', cls: 'v-up', tip: '今天已签到；这个平台的接口不回传本次积分，所以只记状态不记数字' };
-    }
-    if (a.lastState === 'no_activity' && a.ranToday){
-      return { text: '无活动', cls: 'v-none', tip: '今天跑过：本期没有可领的积分，不是失败' };
-    }
-    if (a.lastState === 'token_dead'){
-      return { text: '需重登', cls: 'v-bad', tip: '令牌已失效，重新授权后才能领今天的积分' };
-    }
-    return { text: '—', cls: 'v-none', tip: a.ranToday ? '今天跑过，没有拿到积分' : '今天还没执行' };
-  }
-  function streakCell(a){
-    if (a.streak != null){
-      return { text: fmtNum(a.streak) + ' 天', cls: 'v-day', tip: '连续成功签到天数，中断一天会重新开始' };
-    }
-    if (a.lastOkDate){
-      return { text: '—', cls: 'v-none', tip: '最近成功：' + esc(a.lastOkDate) + '；该平台不返回连续天数，本地统计从下一次签到开始累计' };
-    }
-    return { text: '—', cls: 'v-none', tip: '还没有成功签到过' };
-  }
-  function credCell(ms, now, kind){
-    if (!ms) return { text: '未上报', cls: 'v-none', tip: '这类凭证不带过期时间：除非平台强制下线或你重新粘贴，一直可用' };
-    var t = Number(ms);
-    if (!isFinite(t) || t <= 0) return { text: '未上报', cls: 'v-none', tip: '这类凭证不带过期时间：除非平台强制下线或你重新粘贴，一直可用' };
-    if (t < now){
-      return kind === 'access'
-        ? { text: '可续期', cls: 'v-warn', tip: dateText(t) + ' 访问令牌到期；刷新令牌还在，重新扫码或重新授权即可续期' }
-        : { text: '已过期', cls: 'v-bad', tip: dateText(t) + ' 凭证到期，签到会失败，需要重新添加' };
-    }
-    if (t - now < 7 * 86400e3){
-      return { text: Math.max(1, Math.ceil((t - now) / 86400e3)) + ' 天后', cls: 'v-warn', tip: '凭证将在 ' + dateText(t) + ' 到期，提前重新授权' };
-    }
-    return { text: esc(dateText(t)), cls: 'v-date', tip: '凭证到期日 ' + dateText(t) };
-  }
-  /* 最近 7 次执行结果：一格一次，左旧右新 */
-  function runStrip(a){
-    var rows = [];
-    for (var i = 0; i < HISTORY.length && rows.length < 7; i++){
-      var h = HISTORY[i];
-      if (h.platform === a.platform && h.id === a.id) rows.push(h);
-    }
-    var cells = rows.map(function(h){
-      var st = histState(h.state);
-      var cls = st[0] === 'ok' ? 'on' : (st[0] === 'err' ? 'bad' : (st[0] === 'warn' ? 'warn' : (st[0] === 'idle' ? 'mute' : '')));
-      var tip = shortTime(h.at) + ' · ' + st[1] + (h.msg ? ' · ' + h.msg : '');
-      return '<b' + (cls ? ' class="' + cls + '"' : '') + ' title="' + esc(tip) + '">█</b>';
-    }).reverse();
-    var pad = '';
-    for (var k = cells.length; k < 7; k++) pad += '<b>·</b>';
-    return '<span class="week">' + pad + cells.join('') + '</span>';
-  }
-
-  function detailHtml(a, st){
-    var recent = [];
-    for (var i = 0; i < HISTORY.length && recent.length < 6; i++){
-      var h = HISTORY[i];
-      if (h.platform === a.platform && h.id === a.id) recent.push(h);
-    }
-    var runs = recent.length
-      ? recent.map(function(h){
-          var cls = h.state === 'checked' ? 'ok'
-            : ((h.state === 'error' || h.state === 'token_dead') ? 'bad'
-            : ((h.state === 'rate' || h.state === 'cooldown' || h.state === 'pending') ? 'warn' : 'mut'));
-          var icon = cls === 'ok' ? '✓' : (cls === 'bad' ? '✕' : (cls === 'warn' ? '!' : '·'));
-          var msg = h.msg || histState(h.state)[1];
-          var gain = (typeof h.credit === 'number' && h.credit > 0) ? ' +' + fmtNum(h.credit) : '';
-          if (gain && msg.indexOf(String(h.credit)) === -1) msg += gain;
-          return '<div class="task ' + cls + '"><span class="t-state">' + icon + '</span><b>' + esc(shortTime(h.at)) + '</b><span>' + esc(msg) + '</span></div>';
-        }).join('')
-      : '<div class="run-empty">还没有执行记录，签到后这里会留下痕迹。</div>';
-
-    return '<div class="qa">'
-      + '<button class="qbtn" onclick="signOne(\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\',this)">立即签到</button>'
-      + '<button class="qbtn" onclick="refreshOne(\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\',this)">刷新积分</button>'
-      + '<button class="qbtn" data-label="' + esc(a.label) + '" onclick="startRename(this,\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\')">重命名</button>'
-      + '<button class="qbtn danger" onclick="removeOne(\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\')">删除</button>'
-      + '<span class="qa-tip">最近运行 ' + (a.lastRun ? esc(shortTime(a.lastRun)) : '—') + '</span>'
-      + '</div>'
-      + (a.lastMsg ? '<div class="acct-hint">' + esc(a.lastMsg) + '</div>' : '')
-      + (a.metaNote ? '<div class="hint mb-2">' + esc(a.metaNote) + '</div>' : '')
-      + '<div class="acct-sec"><div class="sec-mini">最近执行</div><div class="task-list">' + runs + '</div></div>';
-  }
-
-  function renderAccounts(){
-    var box = $('#acctList');
-    var list = DATA.accounts || [];
-    var openKeys = {};
-    document.querySelectorAll('tr.ar.open').forEach(function(r){
-      openKeys[r.getAttribute('data-platform') + '|' + r.getAttribute('data-id')] = true;
-    });
-    if (!list.length){
-      box.innerHTML = '<div class="at-wrap"><div class="empty">队列还是空的。点上方「添加账号」，扫码或粘一次凭证就能托管。</div></div>';
-      return;
-    }
-    var now = Date.now();
-    var html = '<div class="at-wrap"><table class="at acct">'
-      + '<thead><tr><th>账号</th><th class="num">积分</th><th class="num">今日</th><th class="num">连续</th>'
-      + '<th title="最近 7 次执行，一格一次，左边最早：绿=拿到积分 灰=执行但无变化 黄=限流/冷却 红=失败 ·=未执行">近 7 次</th><th>凭证</th><th>状态</th><th class="act"></th></tr></thead><tbody>';
-    for (var i = 0; i < list.length; i++){
-      var a = list[i];
-      var st = statusOf(a, now);
-      var cls = accentClass(a);
-      var off = a.enabled === false;
-      var gain = todayGain(a);
-      var day = streakCell(a);
-      var cred = credCell(a.credExp, now, a.credKind);
-      var bal = balanceCell(a);
-      html += '<tr class="ar ' + cls + (off ? ' st-off' : '') + '" data-platform="' + esc(a.platform) + '" data-id="' + esc(a.id) + '" onclick="toggleDetail(this,event)">'
-        + '<td class="cell-acct">'
-        +   '<div class="avatar"><span>' + esc(firstChar(a.label)) + '</span><i class="dot"></i></div>'
-        +   '<div class="nm2">' + esc(a.label || '未命名') + '</div>'
-        +   '<span class="plat-tag">' + esc(a.platformLabel || platformLabel(a.platform)) + '</span>'
-        +   (a.verified ? '' : '<span class="badge none nodot" title="还没成功跑过一次，凭证有效性未知">未验证</span>')
-        + '</td>'
-        + '<td class="num v-cred" title="' + esc(bal.tip) + '">' + bal.text + '</td>'
-        + '<td class="num ' + gain.cls + '" title="' + esc(gain.tip) + '">' + gain.text + '</td>'
-        + '<td class="num ' + day.cls + '" title="' + esc(day.tip) + '">' + day.text + '</td>'
-        + '<td>' + runStrip(a) + '</td>'
-        + '<td class="' + cred.cls + '" title="' + esc(cred.tip) + '">' + cred.text + '</td>'
-        + '<td><span class="badge ' + st.cls + '" title="' + esc(st.tip) + '">' + esc(st.text) + '</span></td>'
-        + '<td class="act"><div class="col-act">'
-        +   '<label class="switch" onclick="event.stopPropagation()" title="' + (off ? '启用这个账号' : '停用这个账号') + '"><input type="checkbox" ' + (off ? '' : 'checked') + ' onchange="toggleEnable(this,\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\')"><span class="track"></span></label>'
-        +   '<button class="btn-sign" ' + (off ? 'disabled title="账号已停用"' : '') + ' onclick="event.stopPropagation();signOne(\\'' + esc(a.platform) + '\\',\\'' + esc(a.id) + '\\',this)">签到</button>'
-        +   '<span class="chev2">›</span>'
-        + '</div></td>'
-        + '</tr>'
-        + '<tr class="ar-detail ' + cls + '" data-detail="' + esc(a.platform) + '|' + esc(a.id) + '"><td colspan="8">' + detailHtml(a, st) + '</td></tr>';
-    }
-    html += '</tbody></table></div>';
-    box.innerHTML = html;
-    if (Object.keys(openKeys).length){
-      document.querySelectorAll('tr.ar').forEach(function(r){
-        var key = r.getAttribute('data-platform') + '|' + r.getAttribute('data-id');
-        if (!openKeys[key]) return;
-        r.classList.add('open');
-        var n = r.nextElementSibling;
-        if (n) n.classList.add('show');
-      });
-    }
-  }
-
-  function toggleDetail(tr, ev){
-    if (ev && ev.target && ev.target.closest && ev.target.closest('button,label,input,a')) return;
-    var next = tr.nextElementSibling;
-    if (next && next.classList.contains('ar-detail')){
-      next.classList.toggle('show');
-      tr.classList.toggle('open');
-    }
-  }
-
-  /* ---------------- 账号操作 ---------------- */
-  function toggleEnable(el, platform, id){
-    var enabled = !!el.checked;
-    api('/api/accounts/enable', { method: 'POST', body: JSON.stringify({ platform: platform, id: id, enabled: enabled }) })
-      .then(function(){
-        toast(enabled ? '账号已启用' : '账号已停用', 'ok');
-        return loadOverview();
-      })
-      .catch(function(e){
-        el.checked = !enabled;
-        toast(e.message || e, 'err');
-      });
-  }
-
-  function summarize(summary){
-    var checked = 0, failed = 0, skipped = 0, noact = 0, cooling = 0;
-    var errors = [];
-    var results = (summary && summary.results) || [];
-    results.forEach(function(r){
-      if (r.state === 'checked') checked++;
-      else if (r.state === 'already' || r.state === 'skipped') skipped++;
-      else if (r.state === 'no_activity') noact++;
-      else if (r.state === 'rate' || r.state === 'cooldown' || r.state === 'pending') cooling++;
-      else if (r.state === 'error' || r.state === 'token_dead'){
-        failed++;
-        errors.push((r.label || '') + ': ' + (r.msg || r.state));
-      }
-    });
-    var parts = [];
-    if (checked) parts.push('新签 ' + checked);
-    if (skipped) parts.push('已完成 ' + skipped);
-    if (noact) parts.push('无活动 ' + noact);
-    if (cooling) parts.push('冷却 ' + cooling);
-    if (failed) parts.push('失败 ' + failed);
-    var text = parts.join(' · ');
-    if (!text && results.length === 1) text = results[0].msg || results[0].state || '没有可执行的账号';
-    return { text: text || '没有可执行的账号', errors: errors, failed: failed, cooling: cooling };
-  }
-
-  function signOne(platform, id, btn){
-    if (btn){ btn.disabled = true; btn.textContent = '签到中…'; }
-    api('/api/accounts/sign', { method: 'POST', body: JSON.stringify({ platform: platform, id: id, force: true }) })
-      .then(function(d){
-        if (d.error) throw new Error(d.error);
-        var s = summarize(d);
-        toast(s.text, (s.failed || s.cooling) ? 'warn' : 'ok');
-        if (s.errors.length) showRunMsg(s.errors.join('；'));
-        else showRunMsg('');
-        return loadAll();
-      })
-      .catch(function(e){ toast(e.message || e, 'err'); })
-      .then(function(){
-        if (btn){ btn.disabled = false; btn.textContent = '签到'; }
-      });
-  }
-
-  function refreshOne(platform, id, btn){
-    if (btn){ btn.disabled = true; btn.textContent = '刷新中…'; }
-    api('/api/accounts/refresh', { method: 'POST', body: JSON.stringify({ platform: platform, id: id }) })
-      .then(function(d){
-        var acc = d.account || {};
-        toast('已刷新 ' + (acc.label || '') + (acc.credits != null ? '：积分 ' + fmtNum(acc.credits) : ''), 'ok');
-        return loadAll();
-      })
-      .catch(function(e){ toast(e.message || e, 'err'); })
-      .then(function(){
-        if (btn){ btn.disabled = false; btn.textContent = '刷新积分'; }
-      });
-  }
-
-  function startRename(btn, platform, id){
-    var row = btn.closest('tr') ? btn.closest('tr').previousElementSibling : null;
-    if (!row) return;
-    var nm = row.querySelector('.nm2');
-    if (!nm) return;
-    var current = btn.getAttribute('data-label') || nm.textContent || '';
-    nm.innerHTML = '<input class="inline-edit" maxlength="40" value="' + esc(current) + '">';
-    var input = nm.querySelector('input');
-    input.focus();
-    input.select();
-    var done = false;
-    function finish(save){
-      if (done) return;
-      done = true;
-      var v = input.value.trim();
-      if (!save || !v || v === current){ loadOverview(); return; }
-      api('/api/accounts/rename', { method: 'POST', body: JSON.stringify({ platform: platform, id: id, label: v }) })
-        .then(function(){ toast('备注已更新', 'ok'); return loadAll(); })
-        .catch(function(e){ toast(e.message || e, 'err'); loadOverview(); });
-    }
-    input.addEventListener('keydown', function(ev){
-      if (ev.key === 'Enter'){ ev.preventDefault(); finish(true); }
-      else if (ev.key === 'Escape'){ ev.preventDefault(); finish(false); }
-    });
-    input.addEventListener('blur', function(){ finish(true); });
-  }
-
-  function removeOne(platform, id){
-    if (!confirm('删除这个账号？删除后需要重新登录/重新粘贴凭证才能恢复。')) return;
-    api('/api/accounts/remove', { method: 'POST', body: JSON.stringify({ platform: platform, id: id }) })
-      .then(function(){ toast('账号已删除', 'ok'); return loadAll(); })
-      .catch(function(e){ toast(e.message || e, 'err'); });
-  }
-
-  function runAll(btn){
-    if (btn){ btn.disabled = true; btn.textContent = '签到中…'; }
-    showRunMsg('');
-    api('/api/run-all?force=1', { method: 'POST', body: '{}' })
-      .then(function(d){
-        var lines = [];
-        var checked = 0, failed = 0, already = 0, noact = 0, cooling = 0;
-        Object.keys(d).forEach(function(k){
-          if (k === 'at' || k === 'platform' || k === 'wb') return;
-          var r = d[k] || {};
-          if (r.error) { lines.push(platformLabel(k) + ': ' + r.error); failed++; return; }
-          checked += r.checked || 0;
-          failed += r.failed || 0;
-          already += r.already || 0;
-          noact += r.noActivity || 0;
-          cooling += r.cooling || 0;
-          (r.results || []).forEach(function(x){
-            if (x.state === 'error' || x.state === 'token_dead') lines.push((x.label || platformLabel(k)) + ': ' + (x.msg || x.state));
-          });
-        });
-        var parts = [];
-        if (checked) parts.push('新签 ' + checked);
-        if (already) parts.push('已完成 ' + already);
-        if (noact) parts.push('无活动 ' + noact);
-        if (cooling) parts.push('冷却 ' + cooling);
-        if (failed) parts.push('失败 ' + failed);
-        toast(parts.join(' · ') || '没有可执行的账号', (failed || cooling) ? 'warn' : 'ok');
-        showRunMsg(lines.join('；'));
-        return loadAll();
-      })
-      .catch(function(e){ toast(e.message || e, 'err'); })
-      .then(function(){ if (btn){ btn.disabled = false; btn.textContent = '全部签到'; } });
-  }
-
-  function refreshAll(btn){
-    if (btn){ btn.disabled = true; btn.textContent = '刷新中…'; }
-    showRunMsg('');
-    api('/api/refresh-all', { method: 'POST', body: '{}' })
-      .then(function(d){
-        var ok = 0, bad = [];
-        (d.results || []).forEach(function(r){
-          if (r.ok) ok++;
-          else bad.push((r.label || platformLabel(r.platform)) + ': ' + (r.error || '刷新失败'));
-        });
-        toast('已刷新 ' + ok + ' 个账号' + (bad.length ? '，' + bad.length + ' 个失败' : ''), bad.length ? 'warn' : 'ok');
-        showRunMsg(bad.join('；'));
-        return loadAll();
-      })
-      .catch(function(e){ toast(e.message || e, 'err'); })
-      .then(function(){ if (btn){ btn.disabled = false; btn.textContent = '刷新'; } });
-  }
-
-  /* ---------------- 运行历史 ---------------- */
-  function histState(state){
-    var map = {
-      checked: ['ok', '已签'],
-      already: ['idle', '今日已完成'],
-      skipped: ['idle', '今日已完成'],
-      no_activity: ['idle', '无活动'],
-      rate: ['warn', '限流'],
-      cooldown: ['warn', '冷却中'],
-      pending: ['warn', '待确认'],
-      error: ['err', '失败'],
-      token_dead: ['err', '令牌失效']
-    };
-    return map[state] || ['idle', state || '—'];
-  }
-  function renderHistory(){
-    var body = $('#histBody');
-    var total = HISTORY.length;
-    var pages = Math.max(1, Math.ceil(total / HIST_PER));
-    if (HIST_PAGE > pages) HIST_PAGE = pages;
-    var start = (HIST_PAGE - 1) * HIST_PER;
-    var rows = HISTORY.slice(start, start + HIST_PER);
-    if (!rows.length){
-      body.innerHTML = '<tr><td colspan="7" class="empty">还没有执行记录，每次签到或定时任务完成后会出现在这里。</td></tr>';
-    } else {
-      body.innerHTML = rows.map(function(h){
-        var st = histState(h.state);
-        var pm = metaOf(h.platform);
-        var credit = typeof h.credit === 'number' && h.credit > 0 ? '+' + fmtNum(h.credit) : '—';
-        return '<tr class="ar ' + accentClass(pm) + '">'
-          + '<td class="t-ts">' + esc(shortTime(h.at)) + '</td>'
-          + '<td class="t-name">' + esc(h.label || '—') + '</td>'
-          + '<td>' + esc(platformLabel(h.platform)) + '</td>'
-          + '<td class="hint">' + esc(h.action === 'cron' ? '定时' : (h.action === 'sign' ? '单个' : '手动')) + '</td>'
-          + '<td><span class="badge ' + st[0] + '">' + esc(st[1]) + '</span></td>'
-          + '<td class="num credit-cell' + (credit === '—' ? ' none' : '') + '">' + credit + '</td>'
-          + '<td class="t-msg" title="' + esc(h.msg || '') + '">' + esc(h.msg || '—') + '</td>'
-          + '</tr>';
-      }).join('');
-    }
-    $('#histRange').textContent = total ? ('第 ' + (start + 1) + '–' + Math.min(start + HIST_PER, total) + ' 个 · 共 ' + total + ' 个') : '共 0 个';
-    $('#histHint').textContent = '共 ' + total + ' 条';
-    $('#histPrev').disabled = HIST_PAGE <= 1;
-    $('#histNext').disabled = HIST_PAGE >= pages;
-  }
-  function histPage(delta){
-    var pages = Math.max(1, Math.ceil(HISTORY.length / HIST_PER));
-    HIST_PAGE = Math.min(pages, Math.max(1, HIST_PAGE + delta));
-    renderHistory();
-  }
-  function clearHistory(){
-    if (!confirm('清空全部运行历史？账号和凭证不受影响。')) return;
-    api('/api/history/clear', { method: 'POST', body: '{}' })
-      .then(function(){ toast('运行历史已清空', 'ok'); HISTORY = []; HIST_PAGE = 1; renderHistory(); renderStats(); })
-      .catch(function(e){ toast(e.message || e, 'err'); });
-  }
-
-  /* ---------------- 页签 ---------------- */
-  function switchTab(name, btn){
-    var tabs = document.querySelectorAll('.tab[data-tab]');
-    for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle('on', tabs[i] === btn);
-    var panels = ['accounts', 'history', 'about'];
-    panels.forEach(function(k){
-      var el = $('#panel-' + k);
-      if (el) el.classList.toggle('active', k === name);
-    });
-  }
-
-  /* ---------------- 添加账号 ---------------- */
+  /* ---------- helpers ---------- */
   function metaOf(key){
-    for (var i = 0; i < META.platforms.length; i++){
-      if (META.platforms[i].key === key) return META.platforms[i];
+    if(!S.meta || !S.meta.platforms) return null;
+    for(var i = 0; i < S.meta.platforms.length; i++){
+      if(S.meta.platforms[i].key === key) return S.meta.platforms[i];
     }
     return null;
   }
-  function openAdd(){
-    if (!META.platforms.length){
-      toast('平台信息还没加载完，请稍后再试', 'warn');
+  function platformLabel(key){
+    var m = metaOf(key);
+    return m ? m.label : (key || '');
+  }
+  function findAccount(pf, id){
+    var list = (S.data && S.data.accounts) || [];
+    for(var i = 0; i < list.length; i++){
+      if(list[i].platform === pf && list[i].id === id) return list[i];
+    }
+    return null;
+  }
+  function travelAccounts(){
+    var list = (S.data && S.data.accounts) || [];
+    var out = [];
+    for(var i = 0; i < list.length; i++){
+      if(list[i].platform === 'workbuddy') out.push(list[i]);
+    }
+    return out;
+  }
+
+  function statusOf(a){
+    if(a.enabled === false) return { t:'已停用', c:'off' };
+    if(a.signedToday) return { t:'已确认', c:'ok' };
+    if(a.lastState === 'error' || a.lastState === 'token_dead') return { t:'失败', c:'bad' };
+    if(a.lastState === 'unverified') return { t:'待确认', c:'warn' };
+    if(a.lastState === 'blocked') return { t:'受限', c:'warn' };
+    if(a.lastState === 'rate' || a.lastState === 'cooldown') return { t:'限流', c:'warn' };
+    if(a.lastState === 'no_activity') return { t:'无活动', c:'idle' };
+    return { t:'未完成', c:'idle' };
+  }
+  function travelText(label){
+    var map = {
+      traveling:'旅行中', arrived:'已到达', finished:'今日完成', untraveled:'未派发',
+      'no-buddy':'无 Buddy', 'no-location':'地点不可用', error:'同步失败', disabled:'已停用'
+    };
+    return map[label] || '未派发';
+  }
+  function travelClass(label){
+    if(label === 'traveling') return 's-traveling';
+    if(label === 'arrived' || label === 'finished') return 's-arrived';
+    if(label === 'error') return 's-error';
+    return 's-untraveled';
+  }
+  function stateText(state){
+    var map = {
+      checked:'已签到', already:'今日已签', skipped:'已跳过', unverified:'待确认',
+      error:'失败', token_dead:'凭证失效', blocked:'平台拦截', rate:'限流',
+      cooldown:'冷却中', pending:'等待中', no_activity:'无活动', disabled:'已停用'
+    };
+    return map[state] || state || '未知';
+  }
+
+  /* ---------- load ---------- */
+  function loadAll(){
+    el('acctGrid').innerHTML = '<div class="aCard"><p class="modalNote">正在读取账号矩阵…</p></div>';
+    el('missionGrid').innerHTML = '<div class="mission"><p class="modalNote">正在读取旅行任务…</p></div>';
+    return Promise.all([
+      api('/api/meta'),
+      api('/api/overview'),
+      api('/api/history?limit=60')
+    ]).then(function(r){
+      S.meta = r[0];
+      S.data = r[1];
+      S.history = (r[2] && r[2].entries) || [];
+      renderAll();
+    }).catch(function(e){
+      el('acctGrid').innerHTML = '<div class="aCard"><p class="modalNote">读取失败：' + esc(e.message) + '</p></div>';
+      if(token) toast(e.message, 'err');
+    });
+  }
+  function loadQuiet(){
+    Promise.all([
+      api('/api/overview'),
+      api('/api/history?limit=60')
+    ]).then(function(r){
+      S.data = r[0];
+      S.history = (r[1] && r[1].entries) || [];
+      renderAll();
+    }).catch(function(){});
+  }
+
+  function renderAll(){
+    if(!S.data || !S.meta) return;
+    renderHero();
+    renderPlatforms();
+    renderAccounts();
+    renderMissions();
+    renderActivity();
+    renderSystem();
+    renderAccountModal();
+  }
+
+  /* ---------- hero ---------- */
+  function renderHero(){
+    var st = S.data.stats || {};
+    var enabled = st.enabled || 0;
+    var verified = st.verified || 0;
+    var wb = travelAccounts();
+    var traveling = 0;
+    for(var i = 0; i < wb.length; i++){
+      if(wb[i].travel && wb[i].travel.label === 'traveling') traveling++;
+    }
+    el('todayStr').textContent = S.data.today || '—';
+    el('heroVerified').textContent = verified;
+    el('heroEnabled').textContent = '/ ' + enabled;
+    el('heroPending').textContent = st.unverified || 0;
+    el('heroFailed').textContent = (st.failed || 0) + (st.blocked || 0);
+    el('heroCredit').textContent = compact(st.todayCredit == null ? 0 : st.todayCredit);
+    el('heroTravel').textContent = traveling + ' / ' + wb.length;
+    el('mastSub').textContent = verified + ' / ' + enabled + ' 个账号已确认' +
+      ((st.unverified || 0) + (st.failed || 0) > 0 ? '，' + ((st.unverified || 0) + (st.failed || 0)) + ' 个需要处理' : '，全部就绪') +
+      '。自动旅行' + (traveling ? '有 ' + traveling + ' 只在途。' : '待命。');
+
+    var ring = el('ringFg');
+    if(ring){
+      var circumference = 2 * Math.PI * 78;
+      var pct = enabled > 0 ? Math.min(1, verified / enabled) : 0;
+      ring.setAttribute('stroke-dasharray', String(circumference));
+      ring.setAttribute('stroke-dashoffset', String(circumference * (1 - pct)));
+    }
+
+    var next = String(S.data.nextRun || '—');
+    var bits = next.split(' ');
+    el('nextRun').textContent = bits.length > 1 ? bits[bits.length - 1] : next;
+    el('nextDate').textContent = bits.length > 1 ? bits.slice(0, -1).join(' ') : '北京时间';
+
+    var crons = (S.data.crons && S.data.crons.length)
+      ? S.data.crons
+      : String(S.data.cron || '').split(' / ').filter(Boolean);
+    el('cronPills').innerHTML = crons.map(function(c){
+      return '<span>' + esc(c) + '</span>';
+    }).join('') || '<span>cron 未配置</span>';
+
+    renderTravelHero();
+  }
+
+  function renderTravelHero(){
+    var box = el('travelHero');
+    if(!box) return;
+    var wb = travelAccounts();
+    if(!wb.length){
+      box.innerHTML = '<p class="cardKicker">TRAVEL · 自动旅行</p>' +
+        '<div class="travelEmpty">还没有 WorkBuddy 账号。添加后，这里会自动派猫猫去旅行，并在到点后领取奖励。</div>' +
+        '<div class="travelFoot"><button type="button" data-act="add">＋ 添加 WorkBuddy</button></div>';
       return;
     }
-    stopWbTimer();
-    stopIntlTimer();
-    if (!ADD_PLATFORM){
-      for (var i = 0; i < META.platforms.length; i++){
-        if (META.platforms[i].available !== false){ ADD_PLATFORM = META.platforms[i].key; break; }
-      }
-      if (!ADD_PLATFORM) ADD_PLATFORM = META.platforms[0].key;
+    var a = wb[0];
+    for(var i = 0; i < wb.length; i++){
+      if(wb[i].travel && (wb[i].travel.label === 'arrived' || wb[i].travel.label === 'traveling')) { a = wb[i]; break; }
     }
-    $('#addErr').textContent = '';
-    $('#addModal').classList.add('show');
-    renderPlatPick();
-    renderAddBody();
+    var t = a.travel || { label:'untraveled', message:'今日尚未派发' };
+    box.innerHTML = '<p class="cardKicker">TRAVEL · 自动旅行</p>' +
+      '<div class="travelTop"><span class="travelWho">' + esc(a.label || a.id) + '</span>' +
+      '<span class="travelState ' + travelClass(t.label) + '">' + travelText(t.label) + '</span></div>' +
+      '<div class="travelRoute" aria-hidden="true"><span class="track"></span><span class="dot ' + (t.label === 'arrived' || t.label === 'finished' ? 'still' : '') + '"></span></div>' +
+      '<div class="travelMeta">' + esc(t.message || travelText(t.label)) +
+      (t.locationName ? ' · ' + esc(t.locationName) : '') + '</div>' +
+      '<div class="travelFoot">' +
+      (t.rewardCredit != null ? '<span class="reward">+' + esc(t.rewardCredit) + '</span>' : '<span class="travelMeta">' + (t.arriveAt ? '<span class="countdown" data-arrive="' + Number(t.arriveAt) + '"></span>' : '') + '</span>') +
+      (t.label === 'arrived' ? '<button type="button" data-act="travel-claim" data-id="' + esc(a.id) + '">领取奖励</button>' :
+        (t.label === 'untraveled' || t.label === 'error' || t.label === 'no-buddy' ? '<button type="button" data-act="travel-depart" data-id="' + esc(a.id) + '">派发</button>' :
+        '<button type="button" data-act="travel-sync" data-id="' + esc(a.id) + '">同步</button>')) +
+      '</div>';
+    tickCountdowns();
   }
-  function closeAdd(){
-    $('#addModal').classList.remove('show');
-    stopWbTimer();
-    stopIntlTimer();
-    $('#addErr').textContent = '';
-  }
-  function pickPlatform(key){
-    stopWbTimer();
-    stopIntlTimer();
-    ADD_PLATFORM = key;
-    $('#addErr').textContent = '';
-    renderPlatPick();
-    renderAddBody();
-  }
-  function renderPlatPick(){
-    var html = META.platforms.map(function(p){
-      var cls = accentClass(p);
-      var off = p.available === false;
-      return '<div class="plat-card ' + cls + (p.key === ADD_PLATFORM ? ' on' : '') + (off ? ' off' : '') + '" onclick="pickPlatform(\\'' + esc(p.key) + '\\')">'
-        + '<div class="ic">' + esc(firstChar(p.label)) + '</div>'
-        + '<div style="min-width:0"><div class="tt">' + esc(p.label) + '</div><div class="dd">'
-        + (off ? esc(p.unavailableReason || '未配置') : (p.verified ? '已实测' : '未验证')) + '</div></div></div>';
+
+  /* ---------- platforms ---------- */
+  function renderPlatforms(){
+    var accounts = (S.data && S.data.accounts) || [];
+    var meta = (S.meta && S.meta.platforms) || [];
+    el('platformGrid').innerHTML = meta.map(function(p){
+      var rows = accounts.filter(function(a){ return a.platform === p.key; });
+      var done = rows.filter(function(a){ return a.signedToday; }).length;
+      var pct = rows.length ? Math.round(done / rows.length * 100) : 0;
+      var dots = rows.slice(0, 6).map(function(a){
+        var st = statusOf(a);
+        return '<i class="' + (st.c === 'off' ? 'off' : st.c) + '" title="' + esc(a.label) + ' · ' + st.t + '"></i>';
+      }).join('');
+      return '<button type="button" class="pTile ' + (S.platform === p.key ? 'on' : '') + '" data-plat="' + esc(p.key) + '" style="' + orbStyle(p.accent) + '" aria-pressed="' + (S.platform === p.key ? 'true' : 'false') + '">' +
+        '<span class="pOrb" aria-hidden="true">' + esc(initial(p.label)) + '</span>' +
+        '<b>' + esc(p.label) + '</b>' +
+        '<small>' + rows.length + ' 个账号 · ' + done + ' 已确认</small>' +
+        '<span class="pBar" aria-hidden="true"><i style="width:' + pct + '%"></i></span>' +
+        '<span class="pDots" aria-hidden="true">' + (dots || '<i class="off"></i>') + '</span>' +
+        '</button>';
     }).join('');
-    $('#platPick').innerHTML = html;
   }
-  function fieldInput(f){
-    var id = 'f_' + f.name;
-    var ph = esc(f.placeholder || '');
-    var isText = f.secret || f.name === 'session' || f.name === 'access_token' || f.name === 'refresh_token';
-    if (isText){
-      return '<textarea id="' + id + '" class="field" rows="' + (f.name === 'session' ? 3 : 2) + '" placeholder="' + ph + '" spellcheck="false"></textarea>';
-    }
-    return '<input id="' + id + '" class="field" type="text" placeholder="' + ph + '">';
-  }
-  function fieldsHtml(meta){
-    var list = meta.fields || [];
-    var html = '<div class="fields">';
-    list.forEach(function(f){
-      html += '<div class="field-row"><label class="lb">' + esc(f.label) + (f.required ? '' : '<span class="hint">可选</span>') + '</label>' + fieldInput(f) + '</div>';
-    });
-    html += '<div class="field-row"><label class="lb">备注<span class="hint">可选</span></label><input id="f_label" class="field" type="text" maxlength="40" placeholder="留空则自动识别昵称"></div>';
-    html += '</div>';
-    return html;
-  }
-  function authBlock(title, desc, btnText, onclick){
-    return '<div class="rs-card"><div class="rs-h">' + esc(title) + '</div>'
-      + '<div class="hint mb-2.5">' + desc + '</div>'
-      + '<button class="btn-primary btn-sm" onclick="' + onclick + '">' + esc(btnText) + '</button>'
-      + '<div class="auth-status" id="addMsg"></div></div>';
-  }
-  function renderAddBody(){
-    var meta = metaOf(ADD_PLATFORM);
-    if (!meta) return;
-    var body = $('#addBody');
-    var confirm = $('#addConfirm');
-    var cancel = $('#addCancel');
-    $('#addTitle').textContent = '添加 · ' + meta.label;
-    $('#addHint').textContent = meta.hint || '';
-    $('#addErr').textContent = '';
-    confirm.style.display = '';
-    confirm.disabled = false;
-    cancel.textContent = '取消';
-    confirm.textContent = '确认添加';
 
-    if (meta.available === false){
-      body.innerHTML = '<div class="tip"><b>该平台当前不可用：</b>' + esc(meta.unavailableReason || '缺少配置') + '</div>';
-      confirm.style.display = 'none';
-      return;
-    }
-
-    if (meta.addMode === 'qr' && meta.key === 'trae'){
-      body.innerHTML = authBlock('Trae 抖音扫码', '点下面按钮打开官方授权页，用抖音扫码。登录完成后浏览器会停在一个打不开的 127.0.0.1 页面，把地址栏整段复制粘到下面。', '打开官方授权页', 'startTrae(this)')
-        + '<div id="traeClaim" hidden class="mt-2.5">'
-        + '<label class="lb">粘贴回调地址</label>'
-        + '<input id="traeUrl" class="field" placeholder="http://127.0.0.1:17388/authorize?authCodeInfo=...">'
-        + '<button class="btn-ghost btn-sm mt-2" onclick="claimTrae()">绑定账号</button>'
-        + '</div>';
-      confirm.style.display = 'none';
-      cancel.textContent = '关闭';
-      var urlInput = $('#traeUrl');
-      if (urlInput){
-        urlInput.addEventListener('paste', function(){ setTimeout(claimTrae, 0); });
+  /* ---------- accounts ---------- */
+  function visibleAccounts(){
+    var list = (S.data && S.data.accounts) || [];
+    var q = S.search.trim().toLowerCase();
+    var out = [];
+    for(var i = 0; i < list.length; i++){
+      var a = list[i];
+      if(S.platform && a.platform !== S.platform) continue;
+      if(S.filter === 'attention' && (a.enabled === false || a.signedToday)) continue;
+      if(S.filter === 'done' && !a.signedToday) continue;
+      if(S.filter === 'off' && a.enabled !== false) continue;
+      if(S.filter === 'verify' && a.lastState !== 'unverified') continue;
+      if(q){
+        var hay = ((a.label || '') + ' ' + (a.platformLabel || '') + ' ' + (a.id || '') + ' ' + (a.lastMsg || '')).toLowerCase();
+        if(hay.indexOf(q) < 0) continue;
       }
-      return;
+      out.push(a);
     }
-
-    if (meta.addMode === 'qr' && meta.key === 'workbuddy'){
-      body.innerHTML = authBlock('WorkBuddy 微信扫码', '点下面按钮打开官方登录页，用微信扫码并确认。账号会自动保存，登录窗口自动关闭。', '打开登录页', 'startWb(this)');
-      confirm.style.display = 'none';
-      cancel.textContent = '关闭';
-      return;
-    }
-
-    if (meta.addMode === 'device'){
-      body.innerHTML = authBlock('Qoder 官网授权', '选择版本后打开官方授权页，登录并确认授权。Worker 轮询到结果后自动入库，窗口自动关闭。', '打开国内版授权页', 'startQoder(this,\\'cn\\')')
-        + '<div class="divider">或</div>'
-        + '<button class="btn-ghost" onclick="startQoder(this,\\'intl\\')">打开国际版授权页</button>'
-        + '<div class="hint mt-2">国内版签到档期已结束；每日 credits 在国际版，每天 10:00 开窗，一窗一次。</div>';
-      confirm.style.display = 'none';
-      cancel.textContent = '关闭';
-      return;
-    }
-
-    if (meta.addMode === 'oauth'){
-      body.innerHTML = authBlock('一键网页授权', '打开官方授权页，用 Google / GitHub / X 登录。登录完成后这里会自动识别并入库。', '用 Google / GitHub 登录', 'startIntl(this)')
-        + '<div class="divider">或粘贴令牌</div>'
-        + fieldsHtml(meta);
-      confirm.onclick = submitAdd;
-      return;
-    }
-
-    if (meta.addMode === 'password'){
-      body.innerHTML = '<div class="tabs mb-3">'
-        + '<button class="tab on" id="astPwTab" onclick="astudioMode(\\'pw\\')">手机号密码</button>'
-        + '<button class="tab" id="astCkTab" onclick="astudioMode(\\'cookie\\')">粘贴 Cookie</button>'
-        + '</div>'
-        + '<div id="astPwBox">'
-        + '<div class="tip mb-2.5">用讯飞账号（passport.xfyun.cn）的手机号 + 密码换会话。密码只在本次请求内存里用一次，不保存。若提示需要滑块，请改用「粘贴 Cookie」。</div>'
-        + '<div class="fields">'
-        + '<div class="field-row"><label class="lb">手机号</label><input id="astPhone" class="field" type="tel" maxlength="11" placeholder="11 位手机号"></div>'
-        + '<div class="field-row"><label class="lb">密码</label><input id="astPass" class="field" type="password" placeholder="讯飞账号密码"></div>'
-        + '</div>'
-        + '<button class="btn-primary btn-sm mt-2.5" id="astLoginBtn" onclick="astudioPassword(this)">登录并添加</button>'
-        + '</div>'
-        + '<div id="astCkBox" hidden>' + fieldsHtml(meta) + '</div>';
-      confirm.style.display = 'none';
-      confirm.onclick = submitAdd;
-      return;
-    }
-
-    body.innerHTML = fieldsHtml(meta);
-    confirm.onclick = submitAdd;
+    return out;
   }
 
-  function collectCreds(meta){
-    var creds = {};
-    (meta.fields || []).forEach(function(f){
-      var el = $('#f_' + f.name);
-      if (el) creds[f.name] = el.value.trim();
+  function renderAccounts(){
+    var rows = visibleAccounts();
+    var all = (S.data && S.data.accounts) || [];
+    var grid = el('acctGrid');
+    if(!rows.length){
+      grid.innerHTML = all.length
+        ? '<div class="aCard"><p class="modalNote">没有符合条件的账号。换一个筛选或清空搜索。</p></div>'
+        : '<div class="aCard"><p class="modalNote">还没有账号。先把第一个平台接进来：扫码或粘贴一次凭证，之后由 Cron 自动签到。</p><div class="aActions"><button type="button" class="primary" data-act="add">＋ 添加第一个账号</button></div></div>';
+      el('accountFoot').textContent = '显示 0 个账号';
+      el('accountSub').textContent = '把每天要点的签到收进一块面板。';
+      return;
+    }
+    var accountGroups = rows.length + ' 个账号';
+    if(S.platform) accountGroups += ' · ' + platformLabel(S.platform);
+    el('accountSub').textContent = accountGroups + ' · 点卡片查看完整凭证状态与旅行控制。';
+    grid.innerHTML = rows.map(function(a, i){
+      var m = metaOf(a.platform) || { label:a.platformLabel || a.platform, accent:'gray' };
+      var st = statusOf(a);
+      var t = a.travel;
+      var travelRow = '';
+      if(a.platform === 'workbuddy' && t){
+        travelRow = '<div class="aTravel"><span class="tState ' + travelClass(t.label) + '">' + travelText(t.label) + '</span>' +
+          '<span class="tText">' + esc(t.message || travelText(t.label)) + (t.arriveAt ? ' · <span class="countdown" data-arrive="' + Number(t.arriveAt) + '"></span>' : '') + '</span></div>';
+      }
+      return '<article class="aCard ' + (a.enabled === false ? 'off' : '') + '" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '" style="' + orbStyle(m.accent) + ';--i:' + i + '" tabindex="0" role="button" aria-label="查看 ' + esc(a.label || a.id) + ' 详情">' +
+        '<div class="aTop">' +
+        '<span class="aOrb" aria-hidden="true">' + esc(initial(m.label)) + '</span>' +
+        '<span class="aNames"><b>' + esc(a.label || a.id) + '</b><small>' + esc(m.label) + (a.uid ? ' · UID ' + esc(a.uid) : '') + '</small></span>' +
+        '<span class="aStatus ' + st.c + '"><i aria-hidden="true"></i>' + st.t + '</span>' +
+        '</div>' +
+        '<p class="aMsg">' + esc(a.lastMsg || '暂无运行记录') + '</p>' +
+        '<div class="aStats">' +
+        '<div><b>' + esc(show(a.streak)) + '</b><span>连签</span></div>' +
+        '<div><b>' + esc(compact(a.credits != null ? a.credits : a.total)) + '</b><span>' + (a.credits != null ? '余额' : '累计') + '</span></div>' +
+        '<div><b>' + esc(a.lastRun ? a.lastRun.slice(11, 16) : '—') + '</b><span>最近运行</span></div>' +
+        '</div>' + travelRow +
+        '<div class="aActions">' +
+        '<button type="button" class="primary" data-act="sign" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">立即签到</button>' +
+        '<button type="button" data-act="detail" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">查看详情</button>' +
+        '</div></article>';
+    }).join('');
+    el('accountFoot').textContent = '显示 ' + rows.length + ' 个账号 · 数据更新于 ' + (S.data.at || '—');
+    tickCountdowns();
+  }
+
+  function openAccount(pf, id){
+    S.acct = { pf: pf, id: id };
+    el('acctVeil').hidden = false;
+    renderAccountModal();
+  }
+  function closeAccount(){
+    S.acct = null;
+    el('acctVeil').hidden = true;
+  }
+  function renderAccountModal(){
+    if(!S.acct) return;
+    var a = findAccount(S.acct.pf, S.acct.id);
+    if(!a){ closeAccount(); return; }
+    var m = metaOf(a.platform) || { label: a.platformLabel || a.platform, accent:'gray', note:'', hint:'', verified:false };
+    var st = statusOf(a);
+    var t = a.travel;
+    el('acctKicker').textContent = 'ACCOUNT · ' + a.platform.toUpperCase();
+    el('acctTitle').textContent = a.label || a.id;
+    el('acctSub').textContent = m.label + ' · ' + (a.uid ? 'UID ' + a.uid : a.id);
+    var travelBlock = '';
+    if(a.platform === 'workbuddy'){
+      var tt = t || { label:'untraveled', message:'今日尚未派发' };
+      travelBlock = '<div class="modalTravel">' +
+        '<div class="modalBlockHead"><b>成长中心 · 派猫猫旅行</b>' +
+        '<span class="travelState ' + travelClass(tt.label) + '">' + travelText(tt.label) + '</span></div>' +
+        '<div class="missionRoute" aria-hidden="true"><span class="track"></span><span class="node start"></span><span class="node end"></span>' +
+        '<span class="dot ' + (tt.label === 'arrived' || tt.label === 'finished' ? 'arrived' : (tt.label === 'untraveled' ? 'idle' : '')) + '"></span></div>' +
+        '<p class="modalNote">' + esc(tt.message || travelText(tt.label)) +
+        (tt.locationName ? ' · ' + esc(tt.locationName) : '') +
+        (tt.arriveAt ? ' · <span class="countdown" data-arrive="' + Number(tt.arriveAt) + '"></span>' : '') +
+        (tt.rewardCredit != null ? ' · 奖励 +' + esc(tt.rewardCredit) : '') + '</p>' +
+        '<div class="missionActions">' +
+        '<button type="button" data-act="travel-sync" data-id="' + esc(a.id) + '">同步</button>' +
+        (tt.label === 'arrived' ? '<button type="button" class="primary" data-act="travel-claim" data-id="' + esc(a.id) + '">领取奖励</button>' : '') +
+        (tt.label === 'untraveled' || tt.label === 'error' || tt.label === 'no-buddy' ? '<button type="button" data-act="travel-depart" data-id="' + esc(a.id) + '">派发</button>' : '') +
+        '<label class="switch"><input type="checkbox" data-act="travel-auto" data-id="' + esc(a.id) + '"' + (a.autoTravel !== false ? ' checked' : '') + '><span class="track" aria-hidden="true"></span><i>自动旅行</i></label>' +
+        '</div></div>';
+    }
+    el('acctBody').innerHTML =
+      '<div class="acctModalTop" style="' + orbStyle(m.accent) + '">' +
+      '<span class="acctModalOrb" aria-hidden="true">' + esc(initial(m.label)) + '</span>' +
+      '<span class="acctModalMeta"><b>' + esc(a.lastMsg || '暂无运行记录') + '</b><small>' + esc(m.label) + ' · ' + (a.verifiedDate || a.lastOkDate || '尚未确认') + '</small></span>' +
+      '<span class="aStatus modalStatus ' + st.c + '"><i aria-hidden="true"></i>' + st.t + '</span>' +
+      '</div>' +
+      '<p class="modalMsg">' + esc(a.lastMsg || '暂无运行记录') + '</p>' +
+      '<div class="modalGrid">' +
+      '<div><small>最近运行</small><b>' + esc(a.lastRun || '—') + '</b></div>' +
+      '<div><small>最近确认</small><b>' + esc(a.lastOkDate || '—') + '</b></div>' +
+      '<div><small>连续签到</small><b>' + esc(show(a.streak)) + ' 天</b></div>' +
+      '<div><small>累计签到</small><b>' + esc(show(a.totalSigned)) + ' 次</b></div>' +
+      '<div><small>本期累计</small><b>' + esc(show(a.total)) + '</b></div>' +
+      '<div><small>真实余额</small><b>' + esc(show(a.credits)) + '</b></div>' +
+      '<div><small>今日获得</small><b>' + esc(a.lastCredit == null ? '—' : '+' + a.lastCredit) + '</b></div>' +
+      '<div><small>凭证类型</small><b>' + esc(a.credKind === 'refresh' ? 'refresh token' : 'access token') + '</b></div>' +
+      '</div>' + travelBlock +
+      '<div class="modalBlock"><div class="modalBlockHead"><b>平台说明</b></div>' +
+      '<p class="modalNote">' + esc(m.note || m.hint || '暂无说明') + '</p>' +
+      '<p class="modalNote" style="margin-top:6px;color:' + (m.verified ? 'var(--ok)' : 'var(--warn)') + '">' + (m.verified ? '该平台已在部署中跑通' : (m.verifiedNote || '尚未用真实账号复核')) + '</p></div>' +
+      '<div class="modalActions">' +
+      '<button type="button" class="primary" data-act="sign" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">立即签到</button>' +
+      '<button type="button" data-act="refresh" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">刷新状态</button>' +
+      '<button type="button" data-act="rename" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">改名</button>' +
+      '<button type="button" data-act="toggle" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">' + (a.enabled === false ? '启用' : '停用') + '</button>' +
+      '<button type="button" class="danger" data-act="del" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">删除</button>' +
+      '</div>';
+    tickCountdowns();
+  }
+
+  /* ---------- travel missions ---------- */
+  function renderMissions(){
+    var wb = travelAccounts();
+    var box = el('missionGrid');
+    if(!wb.length){
+      box.innerHTML = '<div class="mission"><p class="modalNote">还没有 WorkBuddy 账号。添加后这里会出现旅行任务卡。</p><div class="missionActions"><button type="button" data-act="add">＋ 添加账号</button></div></div>';
+      return;
+    }
+    box.innerHTML = wb.map(function(a){
+      var t = a.travel || { label:'untraveled', message:'今日尚未派发' };
+      var dotCls = t.label === 'traveling' ? '' : (t.label === 'arrived' || t.label === 'finished' ? 'arrived' : 'idle');
+      var actions = '<button type="button" data-act="travel-sync" data-id="' + esc(a.id) + '">同步</button>';
+      if(t.label === 'arrived') actions += '<button type="button" class="primary" data-act="travel-claim" data-id="' + esc(a.id) + '">领取</button>';
+      if(t.label === 'untraveled' || t.label === 'error' || t.label === 'no-buddy') actions += '<button type="button" data-act="travel-depart" data-id="' + esc(a.id) + '">派发</button>';
+      return '<article class="mission">' +
+        '<div class="missionTop"><b>' + esc(a.label || a.id) + '</b>' +
+        '<span class="travelState ' + travelClass(t.label) + '">' + travelText(t.label) + '</span></div>' +
+        '<div class="missionRoute" aria-hidden="true"><span class="track"></span><span class="node start"></span><span class="node end"></span><span class="dot ' + dotCls + '"></span></div>' +
+        '<div class="missionMeta">' + esc(t.message || travelText(t.label)) +
+        (t.locationName ? '<br>' + esc(t.locationName) : '') +
+        (t.arriveAt ? '<br><span class="countdown" data-arrive="' + Number(t.arriveAt) + '"></span>' : '') +
+        (t.rewardCredit != null ? '<br>奖励 +' + esc(t.rewardCredit) : '') + '</div>' +
+        '<div class="missionActions">' + actions +
+        '<label class="switch"><input type="checkbox" data-act="travel-auto" data-id="' + esc(a.id) + '"' + (a.autoTravel !== false ? ' checked' : '') + '><span class="track" aria-hidden="true"></span><i>自动</i></label>' +
+        '</div></article>';
+    }).join('');
+    tickCountdowns();
+  }
+
+  /* ---------- activity / system ---------- */
+  function logRow(h){
+    var state = h.state || '';
+    var cls = (state === 'checked' || state === 'already') ? 'ok' :
+      ((state === 'error' || state === 'token_dead') ? 'bad' :
+      (state === 'unverified' ? 'warn' : 'idle'));
+    var time = (h.at || '').slice(11, 16) || '--:--';
+    return '<div class="actRow"><time>' + esc(time) + '</time>' +
+      '<span class="dot ' + cls + '" aria-hidden="true"></span>' +
+      '<p><b>' + esc(h.label || h.id || '') + '</b> · ' + esc(platformLabel(h.platform)) +
+      '<br>' + esc(h.msg || stateText(state)) + '</p></div>';
+  }
+  function renderActivity(){
+    var items = (S.history || []).slice(0, 8);
+    el('activityList').innerHTML = items.length
+      ? items.map(logRow).join('')
+      : '<p class="modalNote">还没有运行记录。点「运行全部」或等下一班 Cron。</p>';
+  }
+  function renderSystem(){
+    var st = S.data.stats || {};
+    el('sysCron').textContent = S.data.cron || '—';
+    el('sysNext').textContent = S.data.nextRun || '—';
+    el('sysAccounts').textContent = (st.total || 0) + ' 个';
+    el('sysPlatforms').textContent = ((S.data.platforms || []).length || 0) + ' 个';
+  }
+
+  /* ---------- clock ---------- */
+  function tickCountdowns(){
+    var nodes = document.querySelectorAll('[data-arrive]');
+    for(var i = 0; i < nodes.length; i++){
+      var node = nodes[i];
+      var at = Number(node.getAttribute('data-arrive')) || 0;
+      if(!at){ node.textContent = ''; continue; }
+      var left = at - Date.now();
+      if(left <= 0){ node.textContent = '已到点，等待同步'; continue; }
+      var m = Math.floor(left / 60000);
+      var s = Math.floor((left % 60000) / 1000);
+      node.textContent = m + ' 分 ' + pad(s) + ' 秒后到达';
+    }
+  }
+  function tickClock(){
+    el('barClock').textContent = fmtClock(true);
+    tickCountdowns();
+  }
+
+  /* ---------- theme ---------- */
+  function setTheme(t){
+    document.documentElement.setAttribute('data-theme', t);
+    try { localStorage.setItem(THEME_KEY, t); } catch(e) {}
+    el('themeBtn').setAttribute('aria-label', t === 'day' ? '切换到夜间模式' : '切换到日间模式');
+  }
+
+  /* ---------- veil / ask ---------- */
+  function closeVeil(id){
+    var v = el(id);
+    if(v) v.hidden = true;
+    if(id === 'addVeil') stopAddTimer();
+    if(id === 'acctVeil') S.acct = null;
+  }
+  function anyVeilOpen(){
+    var ids = ['acctVeil','addVeil','setVeil','histVeil','askVeil'];
+    for(var i = 0; i < ids.length; i++){
+      var v = el(ids[i]);
+      if(v && !v.hidden) return true;
+    }
+    return false;
+  }
+  function openVeil(id){
+    var v = el(id);
+    if(v) v.hidden = false;
+  }
+  function askValue(title, desc, label, value){
+    return new Promise(function(resolve){
+      askResolve = resolve;
+      el('askKicker').textContent = 'INPUT';
+      el('askTitle').textContent = title;
+      el('askDesc').textContent = desc || '';
+      el('askField').hidden = false;
+      el('askLabel').textContent = label || '值';
+      el('askInput').value = value || '';
+      el('askErr').textContent = '';
+      openVeil('askVeil');
+      setTimeout(function(){ el('askInput').focus(); el('askInput').select(); }, 30);
     });
-    return creds;
   }
-  function submitAdd(){
-    var meta = metaOf(ADD_PLATFORM);
-    if (!meta) return;
-    var creds = collectCreds(meta);
-    var has = Object.keys(creds).some(function(k){ return String(creds[k] || '').trim(); });
-    if (!has){ $('#addErr').textContent = '请至少填写一项凭证'; return; }
-    var labelEl = $('#f_label');
-    var label = labelEl ? labelEl.value.trim() : '';
-    var btn = $('#addConfirm');
-    btn.disabled = true; btn.textContent = '添加中…';
-    $('#addErr').textContent = '';
-    api('/api/accounts/add', { method: 'POST', body: JSON.stringify({ platform: meta.key, label: label, creds: creds }) })
-      .then(function(d){
-        toast((d.updated ? '账号凭证已更新：' : '账号已添加：') + ((d.account && d.account.label) || ''), 'ok');
-        closeAdd();
-        return loadAll();
-      })
-      .catch(function(e){ $('#addErr').textContent = e.message || String(e); })
-      .then(function(){ btn.disabled = false; btn.textContent = '确认添加'; });
+  function askConfirm(title, desc){
+    return new Promise(function(resolve){
+      askResolve = resolve;
+      el('askKicker').textContent = 'CONFIRM';
+      el('askTitle').textContent = title;
+      el('askDesc').textContent = desc || '';
+      el('askField').hidden = true;
+      el('askErr').textContent = '';
+      openVeil('askVeil');
+      setTimeout(function(){ el('askOk').focus(); }, 30);
+    });
+  }
+  function resolveAsk(v){
+    var r = askResolve;
+    askResolve = null;
+    closeVeil('askVeil');
+    if(r) r(v);
   }
 
-  function showAddMsg(msg, type){
-    var el = $('#addMsg');
-    if (!el){
-      var err = $('#addErr');
-      if (err) err.textContent = msg || '';
-      return;
+  /* ---------- actions ---------- */
+  function setBusy(btn, text){
+    if(!btn) return function(){};
+    var old = btn.innerHTML;
+    btn.disabled = true;
+    if(text) btn.innerHTML = text;
+    return function(){ btn.disabled = false; btn.innerHTML = old; };
+  }
+  function summaryLine(res){
+    var checked = 0, already = 0, failed = 0, travel = 0;
+    if(res){
+      Object.keys(res).forEach(function(k){
+        var v = res[k];
+        if(!v || !v.results) return;
+        checked += v.checked || 0;
+        already += v.already || 0;
+        failed += v.failed || 0;
+        if(v.travelSummary) travel += v.travelSummary.finished || 0;
+      });
     }
-    el.innerHTML = msg ? '<span style="color:' + (type === 'err' ? 'var(--c-failed)' : 'var(--c-signed)') + '">' + esc(msg) + '</span>' : '';
+    var parts = ['新签 ' + checked, '已签 ' + already, '失败 ' + failed];
+    if(travel) parts.push('旅行 ' + travel);
+    return parts.join(' · ');
   }
-  function showAddLink(url){
-    var el = $('#addMsg');
-    var html = '新窗口被拦截，请手动打开：<a href="' + esc(url) + '" target="_blank" rel="noopener">打开登录页</a>';
-    if (el) el.innerHTML = html;
-    else {
-      var err = $('#addErr');
-      if (err) err.textContent = '新窗口被拦截，请手动打开：' + url;
-    }
+  function runAll(){
+    var btn = el('runAllBtn');
+    var done = setBusy(btn, '<span class="spark spin"></span>运行中');
+    api('/api/run-all?force=1', { method:'POST', body:'{}' })
+      .then(function(res){ return loadAll().then(function(){ toast('本轮完成：' + summaryLine(res), 'ok'); }); })
+      .catch(function(e){ toast(e.message, 'err'); })
+      .then(done);
   }
-
-  function startTrae(btn){
-    if (btn){ btn.disabled = true; }
-    api('/trae/api/login/start', { method: 'POST', body: '{}' })
-      .then(function(d){
-        var win = window.open(d.authUrl, 'trae-login', 'width=520,height=820');
-        var wrap = $('#traeClaim');
-        if (wrap) wrap.hidden = false;
-        var urlInput = $('#traeUrl');
-        if (urlInput){ urlInput.focus(); }
-        if (!win){
-          showAddLink(d.authUrl);
-        } else {
-          showAddMsg('已打开授权页。扫码并确认后，把打不开的 127.0.0.1 地址复制粘到下面。');
-        }
+  function runPlatform(pf){
+    var btn = document.querySelector('button[data-act="runpf"][data-pf="' + pf + '"]');
+    var done = setBusy(btn, '运行中…');
+    api('/api/platforms/run', { method:'POST', body: JSON.stringify({ platform: pf }) })
+      .then(function(res){ return loadAll().then(function(){ toast(platformLabel(pf) + '：' + summaryLine(res), 'ok'); }); })
+      .catch(function(e){ toast(e.message, 'err'); })
+      .then(done);
+  }
+  function signOne(pf, id){
+    toast('正在签到…', 'warn');
+    api('/api/accounts/sign', { method:'POST', body: JSON.stringify({ platform: pf, id: id, force: true }) })
+      .then(function(res){
+        var hit = null;
+        (res.results || []).forEach(function(r){ if(r.id === id) hit = r; });
+        return loadAll().then(function(){
+          toast(hit ? (hit.msg || stateText(hit.state)) : '已运行', hit && (hit.verified || hit.state === 'already') ? 'ok' : 'warn');
+        });
       })
-      .catch(function(e){ showAddMsg(e.message || e, 'err'); })
-      .then(function(){ if (btn) btn.disabled = false; });
+      .catch(function(e){ toast(e.message, 'err'); });
   }
-
-  function claimTrae(){
-    var input = $('#traeUrl');
-    if (!input) return;
-    var url = input.value.trim();
-    if (!url){ showAddMsg('请先粘贴回调地址', 'err'); return; }
-    showAddMsg('正在用授权码换取令牌…');
-    api('/trae/api/login/claim', { method: 'POST', body: JSON.stringify({ url: url }) })
-      .then(function(d){
-        toast('登录成功：' + (d.label || ''), 'ok');
-        closeAdd();
+  function refreshOne(pf, id){
+    api('/api/accounts/refresh', { method:'POST', body: JSON.stringify({ platform: pf, id: id }) })
+      .then(function(){ return loadAll().then(function(){ toast('状态已刷新', 'ok'); }); })
+      .catch(function(e){ toast(e.message, 'err'); });
+  }
+  function toggleAccount(pf, id){
+    var a = findAccount(pf, id);
+    if(!a) return;
+    api('/api/accounts/enable', { method:'POST', body: JSON.stringify({ platform: pf, id: id, enabled: a.enabled === false }) })
+      .then(function(){ return loadAll().then(function(){ toast(a.enabled === false ? '账号已启用' : '账号已停用', 'ok'); }); })
+      .catch(function(e){ toast(e.message, 'err'); });
+  }
+  function renameAccount(pf, id){
+    var a = findAccount(pf, id);
+    if(!a) return;
+    askValue('改名', '备注只影响控制台显示，不影响凭证。', '新的备注名', a.label || '').then(function(v){
+      if(v == null) return;
+      var name = String(v).trim();
+      if(!name){ toast('备注不能为空', 'err'); return; }
+      api('/api/accounts/rename', { method:'POST', body: JSON.stringify({ platform: pf, id: id, label: name }) })
+        .then(function(){ return loadAll().then(function(){ toast('已改名：' + name, 'ok'); }); })
+        .catch(function(e){ toast(e.message, 'err'); });
+    });
+  }
+  function removeAccount(pf, id){
+    var a = findAccount(pf, id);
+    if(!a) return;
+    askConfirm('删除账号', '「' + (a.label || a.id) + '」的加密凭证会一并删除，无法恢复。').then(function(v){
+      if(!v) return;
+      api('/api/accounts/remove', { method:'POST', body: JSON.stringify({ platform: pf, id: id }) })
+        .then(function(){ return loadAll().then(function(){ toast('账号已删除', 'ok'); }); })
+        .catch(function(e){ toast(e.message, 'err'); });
+    });
+  }
+  function travelAction(id, action, btn){
+    var done = setBusy(btn, '…');
+    api('/api/accounts/travel', { method:'POST', body: JSON.stringify({ platform:'workbuddy', id: id || '', action: action }) })
+      .then(function(res){
+        if(action === 'auto-on') toast('已开启自动旅行', 'ok');
+        else if(action === 'auto-off') toast('已关闭自动旅行', 'ok');
+        else if(res.result && res.result.msg) toast(res.result.msg, res.ok ? 'ok' : 'warn');
+        else if(res.msg) toast(res.msg, res.ok ? 'ok' : 'warn');
+        else if(action === 'run') toast('旅行同步完成：在途 ' + (res.traveling || 0) + ' · 完成 ' + (res.finished || 0), 'ok');
+        else toast('旅行状态已同步', 'ok');
         return loadAll();
       })
-      .catch(function(e){ showAddMsg(e.message || e, 'err'); });
+      .catch(function(e){ toast(e.message, 'err'); })
+      .then(done);
+  }
+  function refreshAll(){
+    toast('正在刷新全部账号…', 'warn');
+    api('/api/refresh-all', { method:'POST', body:'{}' })
+      .then(function(res){
+        var n = (res.results || []).filter(function(x){ return x.ok; }).length;
+        return loadAll().then(function(){ toast('已刷新 ' + n + ' 个账号', 'ok'); });
+      })
+      .catch(function(e){ toast(e.message, 'err'); });
+  }
+  function openHistory(){
+    openVeil('histVeil');
+    el('histBody').innerHTML = (S.history || []).length
+      ? (S.history || []).map(logRow).join('')
+      : '<p class="modalNote">还没有运行记录。</p>';
   }
 
-  function stopWbTimer(){ if (WB_TIMER){ clearInterval(WB_TIMER); WB_TIMER = null; } }
-  function startWb(btn){
-    stopWbTimer();
-    if (btn){ btn.disabled = true; }
-    var win = window.open('about:blank', 'wb-login', 'width=640,height=880');
-    api('/wb/api/login/start', { method: 'POST', body: '{}' })
-      .then(function(d){
-        var opened = false;
-        if (win && !win.closed){
-          try { win.location.href = d.authUrl; opened = true; } catch (e) { opened = false; }
-        }
-        if (!opened){
-          showAddLink(d.authUrl);
-        } else {
-          showAddMsg('已打开登录页，用微信扫码并确认，本页会自动保存账号。');
-        }
-        var n = 0;
-        WB_TIMER = setInterval(function(){
-          if (n++ > 150){
-            stopWbTimer();
-            showAddMsg('二维码已过期，请关闭弹窗后重试', 'err');
-            return;
-          }
-          api('/wb/api/login/poll?state=' + encodeURIComponent(d.state))
-            .then(function(r){
-              if (r.status === 'ok'){
-                stopWbTimer();
-                if (win && !win.closed){ try { win.close(); } catch (e) {} }
-                toast('登录成功：' + (r.label || ''), 'ok');
-                closeAdd();
-                loadAll();
-              } else if (r.status === 'expired' || r.status === 'error'){
-                stopWbTimer();
-                showAddMsg(r.error || '登录会话已过期，请重试', 'err');
-              }
-            })
-            .catch(function(e){
-              stopWbTimer();
-              showAddMsg(e.message || e, 'err');
-            });
-        }, 2500);
-      })
-      .catch(function(e){
-        if (win && !win.closed){ try { win.close(); } catch (err) {} }
-        showAddMsg(e.message || e, 'err');
-      })
-      .then(function(){ if (btn) btn.disabled = false; });
-  }
-
-  function stopQoderTimer(){ if (QODER_TIMER){ clearInterval(QODER_TIMER); QODER_TIMER = null; } }
-  function startQoder(btn, region){
-    stopQoderTimer();
-    if (btn){ btn.disabled = true; }
-    var win = window.open('about:blank', 'qoder-login', 'width=680,height=900');
-    api('/qoder/api/login/start', { method: 'POST', body: JSON.stringify({ region: region || 'cn' }) })
-      .then(function(d){
-        var opened = false;
-        if (win && !win.closed){
-          try { win.location.href = d.authUrl; opened = true; } catch (e) { opened = false; }
-        }
-        if (opened){
-          showAddMsg('已打开授权页，登录后回到这里会自动保存账号。');
-        } else {
-          showAddLink(d.authUrl);
-        }
-        var n = 0;
-        QODER_TIMER = setInterval(function(){
-          if (n++ > 150){
-            stopQoderTimer();
-            showAddMsg('授权已超时，请关闭弹窗后重试', 'err');
-            return;
-          }
-          api('/qoder/api/login/poll?nonce=' + encodeURIComponent(d.nonce))
-            .then(function(r){
-              if (r.ok){
-                stopQoderTimer();
-                if (win && !win.closed){ try { win.close(); } catch (e) {} }
-                toast('登录成功：' + ((r.account && r.account.label) || ''), 'ok');
-                closeAdd();
-                loadAll();
-              } else if (!r.pending){
-                stopQoderTimer();
-                showAddMsg(r.error || '授权会话已过期，请重试', 'err');
-              }
-            })
-            .catch(function(e){
-              stopQoderTimer();
-              showAddMsg(e.message || e, 'err');
-            });
-        }, 2500);
-      })
-      .catch(function(e){
-        if (win && !win.closed){ try { win.close(); } catch (err) {} }
-        showAddMsg(e.message || e, 'err');
-      })
-      .then(function(){ if (btn) btn.disabled = false; });
-  }
-
-  function stopIntlTimer(){ if (INTL_TIMER){ clearInterval(INTL_TIMER); INTL_TIMER = null; } }
-  function startIntl(btn){
-    stopIntlTimer();
-    if (btn){ btn.disabled = true; }
-    var win = window.open('about:blank', 'wbi-login', 'width=680,height=880');
-    api('/wbi/api/login/start', { method: 'POST', body: '{}' })
-      .then(function(d){
-        var opened = false;
-        if (win && !win.closed){
-          try { win.location.href = d.authUrl; opened = true; } catch (e) { opened = false; }
-        }
-        if (!opened){
-          showAddLink(d.authUrl);
-        } else {
-          showAddMsg('已打开授权页，用 Google / GitHub / X 登录，本页会自动保存账号。');
-        }
-        var n = 0;
-        INTL_TIMER = setInterval(function(){
-          if (n++ > 150){
-            stopIntlTimer();
-            showAddMsg('授权超时，请关闭弹窗后重试', 'err');
-            return;
-          }
-          api('/wbi/api/login/poll?state=' + encodeURIComponent(d.state))
-            .then(function(r){
-              if (r.status === 'ok'){
-                stopIntlTimer();
-                if (win && !win.closed){ try { win.close(); } catch (e) {} }
-                toast('登录成功：' + (r.label || ''), 'ok');
-                closeAdd();
-                loadAll();
-              } else if (r.status === 'expired' || r.status === 'error'){
-                stopIntlTimer();
-                showAddMsg(r.error || '授权会话已过期，请重试', 'err');
-              }
-            })
-            .catch(function(e){
-              stopIntlTimer();
-              showAddMsg(e.message || e, 'err');
-            });
-        }, 2500);
-      })
-      .catch(function(e){
-        if (win && !win.closed){ try { win.close(); } catch (err) {} }
-        showAddMsg(e.message || e, 'err');
-      })
-      .then(function(){ if (btn) btn.disabled = false; });
-  }
-
-  function astudioMode(mode){
-    var pw = $('#astPwBox'), ck = $('#astCkBox');
-    var pt = $('#astPwTab'), ct = $('#astCkTab');
-    if (!pw || !ck) return;
-    pw.hidden = mode !== 'pw';
-    ck.hidden = mode !== 'cookie';
-    if (pt) pt.classList.toggle('on', mode === 'pw');
-    if (ct) ct.classList.toggle('on', mode === 'cookie');
-    var confirm = $('#addConfirm');
-    if (confirm) confirm.style.display = mode === 'cookie' ? '' : 'none';
-  }
-  function astudioPassword(btn){
-    var phone = ($('#astPhone') && $('#astPhone').value.trim()) || '';
-    var password = ($('#astPass') && $('#astPass').value) || '';
-    if (!phone || !password){ $('#addErr').textContent = '请填写手机号和密码'; return; }
-    btn.disabled = true; btn.textContent = '登录中…';
-    $('#addErr').textContent = '';
-    api('/astudio/api/login/password', { method: 'POST', body: JSON.stringify({ phone: phone, password: password }) })
-      .then(function(d){
-        toast('登录成功：' + ((d.account && d.account.label) || ''), 'ok');
-        closeAdd();
-        return loadAll();
-      })
-      .catch(function(e){ $('#addErr').textContent = e.message || String(e); })
-      .then(function(){ btn.disabled = false; btn.textContent = '登录并添加'; });
-  }
-
-  /* ---------------- 教程 ---------------- */
-  /* ---------------- 通知设置 ---------------- */
-  function openNotify(){
-    $('#notifyModal').classList.add('show');
-    $('#notifyErr').textContent = '';
-    var origin = location.origin;
-    var tail = 'openid-helper.mjs <AppID> <AppSecret>';
-    $('#oidCmdWin').textContent = 'curl.exe -O ' + origin + '/qq/' + tail;
-    $('#oidCmdNix').textContent = 'curl -O ' + origin + '/qq/' + tail;
+  /* ---------- settings ---------- */
+  function openSettings(){
+    openVeil('setVeil');
+    el('setErr').textContent = '';
+    renderSetSys();
+    el('oidCmd').textContent = 'curl -O ' + location.origin + '/qq/openid-helper.mjs' +
+      String.fromCharCode(10) + 'node openid-helper.mjs <AppID> <AppSecret>';
     api('/api/notify').then(function(d){
       var c = d.config || {};
       var tg = c.telegram || {};
       var qq = c.qq || {};
-      $('#tgToken').value = tg.token || '';
-      $('#tgChat').value = tg.chatId || '';
-      $('#qqAppId').value = qq.appId || '';
-      $('#qqSecret').value = qq.appSecret || '';
-      $('#qqOpenid').value = qq.openid || '';
-      $('#qqSandbox').checked = !!qq.sandbox;
-    }).catch(function(e){
-      $('#notifyErr').textContent = e.message || String(e);
-    });
+      el('tgToken').value = tg.token || '';
+      el('tgChat').value = tg.chatId || '';
+      el('qqAppId').value = qq.appId || '';
+      el('qqSecret').value = qq.appSecret || '';
+      el('qqOpenid').value = qq.openid || '';
+      el('qqSandbox').checked = !!qq.sandbox;
+    }).catch(function(e){ el('setErr').textContent = e.message; });
   }
-  function closeNotify(){ $('#notifyModal').classList.remove('show'); }
+  function renderSetSys(){
+    var d = S.data || {};
+    var st = d.stats || {};
+    el('setSys').innerHTML =
+      '<div class="sysItem"><small>当前触发</small><b>' + esc(d.cron || '—') + '</b></div>' +
+      '<div class="sysItem"><small>下次运行</small><b>' + esc(d.nextRun || '—') + '</b></div>' +
+      '<div class="sysItem"><small>账号 / 平台</small><b>' + esc((st.total || 0) + ' / ' + ((d.platforms || []).length || 0)) + '</b></div>' +
+      '<div class="sysItem"><small>今日积分</small><b>' + esc(st.todayCredit == null ? 0 : st.todayCredit) + '</b></div>';
+    el('cronTip').textContent = '建议配置 3 条 Cron：08:10 / 12:10 / 20:10（UTC 00:10 / 04:10 / 12:10）。已验证账号自动跳过，失败与待确认账号会在后续班次继续重试；旅行在 12:10 那班通常正好到点可领。';
+  }
   function notifyPayload(){
     return {
-      telegram: {
-        token: $('#tgToken').value.trim(),
-        chatId: $('#tgChat').value.trim()
-      },
+      telegram: { token: el('tgToken').value.trim(), chatId: el('tgChat').value.trim() },
       qq: {
-        appId: $('#qqAppId').value.trim(),
-        appSecret: $('#qqSecret').value.trim(),
-        openid: $('#qqOpenid').value.trim(),
-        sandbox: $('#qqSandbox').checked
+        appId: el('qqAppId').value.trim(),
+        appSecret: el('qqSecret').value.trim(),
+        openid: el('qqOpenid').value.trim(),
+        sandbox: el('qqSandbox').checked
       }
     };
   }
-  function saveNotify(btn){
-    if (btn) btn.disabled = true;
-    $('#notifyErr').textContent = '';
-    api('/api/notify', { method: 'POST', body: JSON.stringify(notifyPayload()) })
-      .then(function(){
-        toast('通知配置已保存', 'ok');
-      })
-      .catch(function(e){
-        $('#notifyErr').textContent = e.message || String(e);
-      })
-      .then(function(){ if (btn) btn.disabled = false; });
+  function saveNotify(){
+    var btn = el('notifySave');
+    btn.disabled = true;
+    el('setErr').textContent = '';
+    api('/api/notify', { method:'POST', body: JSON.stringify(notifyPayload()) })
+      .then(function(){ toast('通知配置已保存', 'ok'); })
+      .catch(function(e){ el('setErr').textContent = e.message; })
+      .then(function(){ btn.disabled = false; });
   }
-  function testNotify(btn){
-    if (btn) btn.disabled = true;
-    $('#notifyErr').textContent = '';
-    api('/api/notify/test', { method: 'POST', body: '{}' })
+  function testNotify(){
+    var btn = el('notifyTest');
+    btn.disabled = true;
+    el('setErr').textContent = '';
+    api('/api/notify/test', { method:'POST', body:'{}' })
       .then(function(d){
         var r = d.result || {};
-        toast('Telegram：' + (r.telegram || '—') + ' · QQ：' + (r.qq || '—'), 'ok');
+        var parts = [];
+        if(r.telegram) parts.push('Telegram: ' + r.telegram);
+        if(r.qq) parts.push('QQ: ' + r.qq);
+        toast(parts.join(' · ') || '没有可用的通知通道', 'warn');
       })
-      .catch(function(e){
-        $('#notifyErr').textContent = e.message || String(e);
-      })
-      .then(function(){ if (btn) btn.disabled = false; });
+      .catch(function(e){ el('setErr').textContent = e.message; })
+      .then(function(){ btn.disabled = false; });
   }
 
-  function openGuide(){
-    $('#guideModal').classList.add('show');
-    switchGuide('start', document.querySelector('#guideTabs .tab'));
+  /* ---------- add account ---------- */
+  function stopAddTimer(){
+    if(ADD.timer){ clearInterval(ADD.timer); ADD.timer = null; }
   }
-  function closeGuide(){ $('#guideModal').classList.remove('show'); }
-  function switchGuide(key, btn){
-    var tabs = document.querySelectorAll('#guideTabs .tab');
-    for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle('on', tabs[i] === btn);
-    var panels = ['start', 'trae', 'more', 'safe'];
-    panels.forEach(function(k){
-      var el = $('#guide-' + k);
-      if (el) el.classList.toggle('active', k === key);
-    });
+  function closeWin(win){
+    if(win && !win.closed){ try { win.close(); } catch(e) {} }
   }
+  function addMsg(msg, type){
+    var m = el('addAuthMsg');
+    if(m){
+      m.textContent = msg || '';
+      m.className = 'authMsg' + (type ? ' ' + type : '');
+    } else {
+      el('addErr').textContent = msg || '';
+    }
+  }
+  function addLink(url){
+    var m = el('addAuthMsg');
+    var html = '新窗口被拦截，请手动打开：<a href="' + esc(url) + '" target="_blank" rel="noopener">打开登录页</a>';
+    if(m){ m.className = 'authMsg'; m.innerHTML = html; }
+    else { el('addErr').textContent = '新窗口被拦截，请手动打开：' + url; }
+  }
+  function firstAvailable(){
+    var list = (S.meta && S.meta.platforms) || [];
+    for(var i = 0; i < list.length; i++){
+      if(list[i].available !== false) return list[i].key;
+    }
+    return list.length ? list[0].key : '';
+  }
+  function openAdd(pf){
+    if(!S.meta || !S.meta.platforms){ toast('平台信息还没加载完', 'warn'); return; }
+    stopAddTimer();
+    ADD.pf = pf || firstAvailable();
+    openVeil('addVeil');
+    el('addErr').textContent = '';
+    renderPlatChips();
+    renderAddBody();
+  }
+  function renderPlatChips(){
+    el('platChips').innerHTML = (S.meta.platforms || []).map(function(p){
+      return '<button type="button" data-plat="' + esc(p.key) + '" class="' + (p.key === ADD.pf ? 'on' : '') + '"' +
+        (p.available === false ? ' disabled' : '') + '>' + esc(p.label) + '</button>';
+    }).join('');
+  }
+  function renderAddBody(){
+    var m = metaOf(ADD.pf);
+    if(!m) return;
+    el('addTitle').textContent = '添加 · ' + m.label;
+    el('addHint').textContent = m.hint || '';
+    el('addErr').textContent = '';
+    var body = el('addBody');
+    var confirm = el('addConfirm');
+    confirm.hidden = false;
+    confirm.disabled = false;
+    confirm.textContent = '确认添加';
 
-  /* ---------------- 事件绑定 ---------------- */
-  $('#loginBtn').onclick = function(){ login($('#pwd').value, false); };
-  $('#pwd').onkeydown = function(e){ if (e.key === 'Enter') login($('#pwd').value, false); };
-  document.addEventListener('keydown', function(e){
-    if (e.key === 'Escape'){
-      if ($('#addModal').classList.contains('show')) closeAdd();
-      else if ($('#guideModal').classList.contains('show')) closeGuide();
+    if(m.available === false){
+      body.innerHTML = '<p class="modalNote">该平台当前不可用：' + esc(m.unavailableReason || '缺少配置') + '</p>';
+      confirm.hidden = true;
       return;
     }
-    var app = $('#appView');
-    if (!app || app.hidden) return;
-    if ($('#addModal').classList.contains('show') || $('#guideModal').classList.contains('show')) return;
-    var tag = (e.target && e.target.tagName || '').toLowerCase();
-    if (tag === 'input' || tag === 'textarea' || tag === 'select' || e.ctrlKey || e.metaKey || e.altKey) return;
-    var keys = { '1': 'accounts', '2': 'history', '3': 'about' };
-    var name = keys[e.key];
-    if (!name) return;
-    var btn = document.querySelector('.tab[data-tab="' + name + '"]');
-    if (btn) switchTab(name, btn);
-  });
-  document.querySelectorAll('.modal-mask').forEach(function(mask){
-    mask.addEventListener('click', function(e){
-      if (e.target !== mask) return;
-      if (mask.id === 'addModal') closeAdd();
-      if (mask.id === 'guideModal') closeGuide();
-      if (mask.id === 'notifyModal') closeNotify();
+    if(m.key === 'trae'){
+      body.innerHTML = '<div class="authBox"><h3>抖音扫码</h3>' +
+        '<p>打开官方授权页扫码。完成后浏览器会停在一个打不开的 127.0.0.1 页面，把地址栏整段复制回来。</p>' +
+        '<button class="btn sm primary" type="button" data-add="trae-start">打开授权页</button>' +
+        '<div class="field" style="margin-top:14px"><label for="traeUrl">回调地址</label>' +
+        '<input id="traeUrl" autocomplete="off" placeholder="http://127.0.0.1:17388/authorize?authCodeInfo=..."></div>' +
+        '<button class="btn sm" type="button" data-add="trae-claim">绑定账号</button>' +
+        '<p class="authMsg" id="addAuthMsg"></p></div>';
+      confirm.hidden = true;
+      return;
+    }
+    if(m.key === 'workbuddy'){
+      body.innerHTML = '<div class="authBox"><h3>微信扫码</h3>' +
+        '<p>打开官方登录页扫码并确认。Worker 轮询到结果后自动保存账号，登录窗口会自动关闭。</p>' +
+        '<button class="btn sm primary" type="button" data-add="wb-start">打开登录页</button>' +
+        '<p class="authMsg" id="addAuthMsg"></p></div>';
+      confirm.hidden = true;
+      return;
+    }
+    if(m.key === 'qoder'){
+      body.innerHTML = '<div class="authBox"><h3>官网设备授权</h3>' +
+        '<p>优先用设备授权：登录并确认后，Worker 轮询到结果自动入库。</p>' +
+        '<div class="rowBtns"><button class="btn sm primary" type="button" data-add="qoder-start" data-region="cn">国内版授权</button>' +
+        '<button class="btn sm" type="button" data-add="qoder-start" data-region="intl">国际版授权</button></div>' +
+        '<p class="authMsg" id="addAuthMsg"></p></div>' +
+        '<div class="divider">或粘贴 PAT</div>' +
+        '<div class="two"><div class="field"><label for="qoderPat">Personal Access Token</label>' +
+        '<textarea id="qoderPat" rows="2" placeholder="pt-..."></textarea></div>' +
+        '<div class="field"><label for="qoderRegion">区域</label><select id="qoderRegion">' +
+        '<option value="cn">国内版</option><option value="intl">国际版</option></select></div></div>' +
+        '<div class="field"><label for="f_label">备注<span class="opt">可选</span></label>' +
+        '<input id="f_label" maxlength="40" placeholder="留空自动命名"></div>';
+      confirm.hidden = false;
+      return;
+    }
+    if(m.key === 'workbuddy_intl'){
+      body.innerHTML = '<div class="authBox"><h3>网页授权</h3>' +
+        '<p>打开官方授权页，用 Google / GitHub / X 登录，完成后自动入库。</p>' +
+        '<button class="btn sm primary" type="button" data-add="intl-start">打开授权页</button>' +
+        '<p class="authMsg" id="addAuthMsg"></p></div>' +
+        '<div class="divider">或粘贴令牌</div>' + fieldsHtml(m);
+      confirm.hidden = false;
+      return;
+    }
+    if(m.key === 'astudio'){
+      body.innerHTML = '<div class="modeTabs"><button type="button" class="on" data-add="ast-pw">手机号密码</button>' +
+        '<button type="button" data-add="ast-cookie">粘贴 Cookie</button></div>' +
+        '<div id="astPw"><p class="hint">密码只在本次请求的内存里用一次，不保存。</p>' +
+        '<div class="two"><div class="field"><label for="astPhone">手机号</label>' +
+        '<input id="astPhone" type="tel" inputmode="numeric" maxlength="11" placeholder="11 位手机号"></div>' +
+        '<div class="field"><label for="astPass">密码</label><input id="astPass" type="password" placeholder="讯飞账号密码"></div></div>' +
+        '<button class="btn primary sm" type="button" data-add="ast-login">登录并添加</button></div>' +
+        '<div id="astCk" hidden>' + fieldsHtml(m) + '</div>';
+      confirm.hidden = true;
+      return;
+    }
+    body.innerHTML = fieldsHtml(m);
+    confirm.hidden = false;
+  }
+  function fieldsHtml(m){
+    var html = '<div class="two">';
+    (m.fields || []).forEach(function(f){
+      var id = 'f_' + f.name;
+      var input;
+      if(f.multiline || f.secret || f.name === 'session' || f.name === 'access_token' || f.name === 'refresh_token' || f.name === 'cookie'){
+        input = '<textarea id="' + id + '" rows="' + (f.name === 'cookie' ? 3 : 2) + '" placeholder="' + esc(f.placeholder || '') + '" spellcheck="false"></textarea>';
+      } else {
+        input = '<input id="' + id + '" type="text" placeholder="' + esc(f.placeholder || '') + '" autocomplete="off" spellcheck="false">';
+      }
+      html += '<div class="field"><label for="' + id + '">' + esc(f.label || f.name) +
+        (f.required ? '' : '<span class="opt">可选</span>') + '</label>' + input + '</div>';
     });
-  });
+    html += '<div class="field"><label for="f_label">备注<span class="opt">可选</span></label>' +
+      '<input id="f_label" maxlength="40" placeholder="留空则自动识别昵称"></div></div>';
+    return html;
+  }
+  function collectCreds(m){
+    var creds = {};
+    (m.fields || []).forEach(function(f){
+      var node = el('f_' + f.name);
+      if(node) creds[f.name] = node.value.trim();
+    });
+    return creds;
+  }
+  function submitAdd(){
+    var m = metaOf(ADD.pf);
+    if(!m) return;
+    var creds = collectCreds(m);
+    if(m.key === 'qoder'){
+      var pat = el('qoderPat');
+      var region = el('qoderRegion');
+      if(pat && pat.value.trim()) creds.personal_token = pat.value.trim();
+      if(region) creds.region = region.value;
+    }
+    var has = Object.keys(creds).some(function(k){ return String(creds[k] || '').trim(); });
+    if(!has){ el('addErr').textContent = '请至少填写一项凭证'; return; }
+    var labelEl = el('f_label');
+    var label = labelEl ? labelEl.value.trim() : '';
+    var btn = el('addConfirm');
+    btn.disabled = true;
+    btn.textContent = '添加中…';
+    el('addErr').textContent = '';
+    api('/api/accounts/add', { method:'POST', body: JSON.stringify({ platform: m.key, label: label, creds: creds }) })
+      .then(function(d){
+        toast((d.updated ? '凭证已更新：' : '账号已添加：') + ((d.account && d.account.label) || ''), 'ok');
+        closeVeil('addVeil');
+        return loadAll();
+      })
+      .catch(function(e){ el('addErr').textContent = e.message; })
+      .then(function(){ btn.disabled = false; btn.textContent = '确认添加'; });
+  }
+  function startTraeFlow(){
+    var btn = document.querySelector('button[data-add="trae-start"]');
+    var done = setBusy(btn, '打开中…');
+    api('/trae/api/login/start', { method:'POST', body:'{}' })
+      .then(function(d){
+        var win = window.open(d.authUrl, 'trae-login', 'width=520,height=820');
+        if(!win) addLink(d.authUrl);
+        else addMsg('已打开授权页。扫码确认后，把打不开的 127.0.0.1 地址复制到下面。');
+        var input = el('traeUrl');
+        if(input) input.focus();
+      })
+      .catch(function(e){ addMsg(e.message, 'err'); })
+      .then(done);
+  }
+  function claimTrae(){
+    var input = el('traeUrl');
+    if(!input) return;
+    var url = input.value.trim();
+    if(!url){ addMsg('请先粘贴回调地址', 'err'); return; }
+    addMsg('正在用授权码换取令牌…');
+    api('/trae/api/login/claim', { method:'POST', body: JSON.stringify({ url: url }) })
+      .then(function(d){
+        toast('登录成功：' + (d.label || ''), 'ok');
+        closeVeil('addVeil');
+        return loadAll();
+      })
+      .catch(function(e){ addMsg(e.message, 'err'); });
+  }
+  function startWbFlow(){
+    stopAddTimer();
+    var btn = document.querySelector('button[data-add="wb-start"]');
+    var win = window.open('about:blank', 'wb-login', 'width=640,height=880');
+    if(btn) btn.disabled = true;
+    api('/wb/api/login/start', { method:'POST', body:'{}' })
+      .then(function(d){
+        var opened = false;
+        if(win && !win.closed){ try { win.location.href = d.authUrl; opened = true; } catch(e) {} }
+        if(!opened) addLink(d.authUrl);
+        else addMsg('已打开登录页，用微信扫码并确认。');
+        var n = 0;
+        ADD.timer = setInterval(function(){
+          if(n++ > 150){ stopAddTimer(); addMsg('登录会话已过期，请重试', 'err'); return; }
+          api('/wb/api/login/poll?state=' + encodeURIComponent(d.state)).then(function(r){
+            if(r.status === 'ok'){
+              stopAddTimer();
+              closeWin(win);
+              toast('登录成功：' + (r.label || ''), 'ok');
+              closeVeil('addVeil');
+              loadAll();
+            } else if(r.status === 'expired' || r.status === 'error'){
+              stopAddTimer();
+              addMsg(r.error || '登录会话已过期', 'err');
+            }
+          }).catch(function(e){ stopAddTimer(); addMsg(e.message, 'err'); });
+        }, 2500);
+      })
+      .catch(function(e){ closeWin(win); addMsg(e.message, 'err'); })
+      .then(function(){ if(btn) btn.disabled = false; });
+  }
+  function startQoderFlow(region){
+    stopAddTimer();
+    var btn = document.querySelector('button[data-add="qoder-start"]');
+    var win = window.open('about:blank', 'qoder-login', 'width=680,height=900');
+    if(btn) btn.disabled = true;
+    api('/qoder/api/login/start', { method:'POST', body: JSON.stringify({ region: region || 'cn' }) })
+      .then(function(d){
+        var opened = false;
+        if(win && !win.closed){ try { win.location.href = d.authUrl; opened = true; } catch(e) {} }
+        if(!opened) addLink(d.authUrl);
+        else addMsg('已打开授权页，登录并确认后自动入库。');
+        var n = 0;
+        ADD.timer = setInterval(function(){
+          if(n++ > 150){ stopAddTimer(); addMsg('授权超时，请重试', 'err'); return; }
+          api('/qoder/api/login/poll?nonce=' + encodeURIComponent(d.nonce)).then(function(r){
+            if(r.ok){
+              stopAddTimer();
+              closeWin(win);
+              toast('登录成功：' + ((r.account && r.account.label) || ''), 'ok');
+              closeVeil('addVeil');
+              loadAll();
+            } else if(!r.pending){
+              stopAddTimer();
+              addMsg(r.error || '授权会话已过期', 'err');
+            }
+          }).catch(function(e){ stopAddTimer(); addMsg(e.message, 'err'); });
+        }, 2500);
+      })
+      .catch(function(e){ closeWin(win); addMsg(e.message, 'err'); })
+      .then(function(){ if(btn) btn.disabled = false; });
+  }
+  function startIntlFlow(){
+    stopAddTimer();
+    var btn = document.querySelector('button[data-add="intl-start"]');
+    var win = window.open('about:blank', 'wbi-login', 'width=680,height=880');
+    if(btn) btn.disabled = true;
+    api('/wbi/api/login/start', { method:'POST', body:'{}' })
+      .then(function(d){
+        var opened = false;
+        if(win && !win.closed){ try { win.location.href = d.authUrl; opened = true; } catch(e) {} }
+        if(!opened) addLink(d.authUrl);
+        else addMsg('已打开授权页，用 Google / GitHub / X 登录。');
+        var n = 0;
+        ADD.timer = setInterval(function(){
+          if(n++ > 150){ stopAddTimer(); addMsg('授权超时，请重试', 'err'); return; }
+          api('/wbi/api/login/poll?state=' + encodeURIComponent(d.state)).then(function(r){
+            if(r.status === 'ok'){
+              stopAddTimer();
+              closeWin(win);
+              toast('登录成功：' + (r.label || ''), 'ok');
+              closeVeil('addVeil');
+              loadAll();
+            } else if(r.status === 'expired' || r.status === 'error'){
+              stopAddTimer();
+              addMsg(r.error || '授权会话已过期', 'err');
+            }
+          }).catch(function(e){ stopAddTimer(); addMsg(e.message, 'err'); });
+        }, 2500);
+      })
+      .catch(function(e){ closeWin(win); addMsg(e.message, 'err'); })
+      .then(function(){ if(btn) btn.disabled = false; });
+  }
+  function astMode(pw, btn){
+    var pwBox = el('astPw');
+    var ckBox = el('astCk');
+    if(!pwBox || !ckBox) return;
+    pwBox.hidden = !pw;
+    ckBox.hidden = pw;
+    var tabs = document.querySelectorAll('.modeTabs button');
+    for(var i = 0; i < tabs.length; i++) tabs[i].classList.remove('on');
+    if(btn) btn.classList.add('on');
+    el('addConfirm').hidden = pw;
+  }
+  function astLogin(){
+    var phone = el('astPhone') ? el('astPhone').value.trim() : '';
+    var pass = el('astPass') ? el('astPass').value : '';
+    if(!phone || !pass){ el('addErr').textContent = '请填写手机号和密码'; return; }
+    var btn = document.querySelector('button[data-add="ast-login"]');
+    var done = setBusy(btn, '登录中…');
+    el('addErr').textContent = '';
+    api('/astudio/api/login/password', { method:'POST', body: JSON.stringify({ phone: phone, password: pass }) })
+      .then(function(d){
+        toast('登录成功：' + ((d.account && d.account.label) || ''), 'ok');
+        closeVeil('addVeil');
+        return loadAll();
+      })
+      .catch(function(e){ el('addErr').textContent = e.message; })
+      .then(done);
+  }
 
-  /* 页面里大量使用内联 onclick，必须把入口函数挂到 window 上 */
-  window.openGuide = openGuide;
-  window.closeGuide = closeGuide;
-  window.openNotify = openNotify;
-  window.closeNotify = closeNotify;
-  window.saveNotify = saveNotify;
-  window.testNotify = testNotify;
-  window.switchGuide = switchGuide;
-  window.switchTab = switchTab;
-  window.toggleTheme = toggleTheme;
-  window.openAdd = openAdd;
-  window.closeAdd = closeAdd;
-  window.pickPlatform = pickPlatform;
-  window.startTrae = startTrae;
-  window.claimTrae = claimTrae;
-  window.startWb = startWb;
-  window.startIntl = startIntl;
-  window.startQoder = startQoder;
-  window.astudioMode = astudioMode;
-  window.astudioPassword = astudioPassword;
-  window.submitAdd = submitAdd;
-  window.toggleDetail = toggleDetail;
-  window.toggleEnable = toggleEnable;
-  window.signOne = signOne;
-  window.refreshOne = refreshOne;
-  window.startRename = startRename;
-  window.removeOne = removeOne;
-  window.logout = logout;
-  window.refreshAll = refreshAll;
-  window.runAll = runAll;
-  window.histPage = histPage;
-  window.clearHistory = clearHistory;
+  /* ---------- global wiring ---------- */
+  function handleAct(btn){
+    var act = btn.getAttribute('data-act');
+    var pf = btn.getAttribute('data-pf') || '';
+    var id = btn.getAttribute('data-id') || '';
+    if(act === 'add') openAdd('');
+    else if(act === 'detail') openAccount(pf, id);
+    else if(act === 'sign') signOne(pf, id);
+    else if(act === 'refresh') refreshOne(pf, id);
+    else if(act === 'rename') renameAccount(pf, id);
+    else if(act === 'toggle') toggleAccount(pf, id);
+    else if(act === 'del') removeAccount(pf, id);
+    else if(act === 'travel-sync') travelAction(id, 'sync', btn);
+    else if(act === 'travel-depart') travelAction(id, 'depart', btn);
+    else if(act === 'travel-claim') travelAction(id, 'claim', btn);
+    else if(act === 'travel-run') travelAction('', 'run', btn);
+    else if(act === 'settings') openSettings();
+    else if(act === 'history') openHistory();
+    else if(act === 'refresh-all') refreshAll();
+  }
 
-  var saved = localStorage.getItem(TOKEN_KEY);
-  if (saved) login(saved, true);
+  function bind(){
+    el('loginBtn').addEventListener('click', tryLogin);
+    el('loginToken').addEventListener('keydown', function(e){ if(e.key === 'Enter') tryLogin(); });
+    el('themeBtn').addEventListener('click', function(){
+      setTheme(document.documentElement.getAttribute('data-theme') === 'day' ? 'night' : 'day');
+    });
+    el('settingsBtn').addEventListener('click', openSettings);
+    el('runAllBtn').addEventListener('click', runAll);
+    el('refreshBtn').addEventListener('click', function(){ loadAll(); });
+
+    document.querySelectorAll('[data-jump]').forEach(function(b){
+      b.addEventListener('click', function(){
+        var id = b.getAttribute('data-jump');
+        var target = el(id);
+        if(target) target.scrollIntoView({ behavior:'smooth', block:'start' });
+        document.querySelectorAll('[data-jump]').forEach(function(x){ x.classList.toggle('on', x === b); });
+      });
+    });
+
+    el('filters').addEventListener('click', function(e){
+      var b = e.target.closest('button[data-filter]');
+      if(!b) return;
+      S.filter = b.getAttribute('data-filter');
+      var all = el('filters').querySelectorAll('button');
+      for(var i = 0; i < all.length; i++) all[i].classList.toggle('on', all[i] === b);
+      renderAccounts();
+    });
+    el('search').addEventListener('input', function(e){
+      S.search = e.target.value || '';
+      renderAccounts();
+    });
+
+    document.addEventListener('click', function(e){
+      var close = e.target.closest('[data-close]');
+      if(close){ closeVeil(close.getAttribute('data-close')); return; }
+      var jump = e.target.closest('[data-jump]');
+      if(jump) return;
+      var btn = e.target.closest('button[data-act]');
+      if(btn){ e.preventDefault(); handleAct(btn); return; }
+      var tile = e.target.closest('#platformGrid .pTile');
+      if(tile){
+        var key = tile.getAttribute('data-plat');
+        S.platform = S.platform === key ? '' : key;
+        renderPlatforms();
+        renderAccounts();
+        var target = el('accounts');
+        if(target) target.scrollIntoView({ behavior:'smooth', block:'start' });
+        return;
+      }
+      var card = e.target.closest('#acctGrid .aCard');
+      if(card){
+        var pf = card.getAttribute('data-pf');
+        var id = card.getAttribute('data-id');
+        if(pf && id) openAccount(pf, id);
+      }
+    });
+
+    document.addEventListener('change', function(e){
+      var input = e.target;
+      if(input && input.getAttribute && input.getAttribute('data-act') === 'travel-auto'){
+        travelAction(input.getAttribute('data-id'), input.checked ? 'auto-on' : 'auto-off', input);
+      }
+    });
+
+    document.addEventListener('keydown', function(e){
+      if(e.key === 'Escape'){
+        if(!el('askVeil').hidden) resolveAsk(null);
+        else if(!el('acctVeil').hidden) closeAccount();
+        else if(!el('addVeil').hidden) closeVeil('addVeil');
+        else if(!el('setVeil').hidden) closeVeil('setVeil');
+        else if(!el('histVeil').hidden) closeVeil('histVeil');
+      }
+      if(e.key === 'Enter' || e.key === ' '){
+        var card = e.target.closest ? e.target.closest('#acctGrid .aCard') : null;
+        if(card && !e.target.closest('button') && !e.target.closest('input')){
+          e.preventDefault();
+          openAccount(card.getAttribute('data-pf'), card.getAttribute('data-id'));
+        }
+      }
+    });
+
+    el('platChips').addEventListener('click', function(e){
+      var b = e.target.closest('button[data-plat]');
+      if(!b) return;
+      stopAddTimer();
+      ADD.pf = b.getAttribute('data-plat');
+      renderPlatChips();
+      renderAddBody();
+    });
+    el('addBody').addEventListener('click', function(e){
+      var b = e.target.closest('button[data-add]');
+      if(!b) return;
+      var act = b.getAttribute('data-add');
+      if(act === 'trae-start') startTraeFlow();
+      else if(act === 'trae-claim') claimTrae();
+      else if(act === 'wb-start') startWbFlow();
+      else if(act === 'qoder-start') startQoderFlow(b.getAttribute('data-region') || 'cn');
+      else if(act === 'intl-start') startIntlFlow();
+      else if(act === 'ast-pw') astMode(true, b);
+      else if(act === 'ast-cookie') astMode(false, b);
+      else if(act === 'ast-login') astLogin();
+    });
+    el('addBody').addEventListener('paste', function(e){
+      if(e.target && e.target.id === 'traeUrl') setTimeout(claimTrae, 0);
+    });
+    el('addConfirm').addEventListener('click', submitAdd);
+
+    el('notifySave').addEventListener('click', saveNotify);
+    el('notifyTest').addEventListener('click', testNotify);
+    el('refreshAllBtn').addEventListener('click', refreshAll);
+    el('clearHistBtn').addEventListener('click', function(){
+      askConfirm('清空运行记录', '只删除日志，不影响账号和凭证。').then(function(v){
+        if(!v) return;
+        api('/api/history/clear', { method:'POST', body:'{}' })
+          .then(function(){ S.history = []; renderActivity(); return loadAll(); })
+          .then(function(){ toast('运行记录已清空', 'ok'); })
+          .catch(function(e){ toast(e.message, 'err'); });
+      });
+    });
+    el('forgetBtn').addEventListener('click', function(){
+      askConfirm('更换口令', '会退出当前控制台，下次需要重新输入 ADMIN_TOKEN。').then(function(v){
+        if(!v) return;
+        try { localStorage.removeItem(TOKEN_KEY); } catch(e) {}
+        token = '';
+        location.reload();
+      });
+    });
+
+    el('askOk').addEventListener('click', function(){
+      if(!el('askField').hidden){
+        var v = el('askInput').value.trim();
+        if(!v){ el('askErr').textContent = '不能为空'; return; }
+        resolveAsk(v);
+      } else {
+        resolveAsk(true);
+      }
+    });
+    el('askCancel').addEventListener('click', function(){ resolveAsk(null); });
+    el('askInput').addEventListener('keydown', function(e){ if(e.key === 'Enter') el('askOk').click(); });
+
+    setInterval(tickClock, 1000);
+    setInterval(function(){
+      if(!token) return;
+      if(document.visibilityState !== 'visible') return;
+      if(anyVeilOpen()) return;
+      loadQuiet();
+    }, 120000);
+
+    tickClock();
+  }
+
+  /* ---------- boot ---------- */
+  try { token = localStorage.getItem(TOKEN_KEY) || ''; } catch(e) { token = ''; }
+  try {
+    var theme = localStorage.getItem(THEME_KEY) || '';
+    setTheme(theme === 'night' ? 'night' : 'day');
+  } catch(e) { setTheme('day'); }
+
+  bind();
+
+  if(token){
+    api('/api/ping').then(function(){ loadAll(); }).catch(function(){ showLogin(''); });
+  } else {
+    showLogin('');
+  }
 })();
 </script>
 </body>
-</html>`;
+</html>
+`;
 /* ================================================================== */
 /* 导出                                                                */
 /* ================================================================== */
