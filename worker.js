@@ -7783,11 +7783,12 @@ const PAGE = `<!DOCTYPE html>
   --surface:#ffffff; --surface-2:#f2f2f7; --surface-3:#e8e8ed;
   --line:rgba(60,60,67,.10); --line-2:rgba(60,60,67,.18);
   --text:#1d1d1f; --text-2:#3c3c43; --muted:#6e6e73; --dim:#8e8e93;
-  --accent:#007aff; --accent-2:#0a84ff; --accent-soft:rgba(0,122,255,.10); --accent-line:rgba(0,122,255,.26);
+  --accent:#007aff; --accent-2:#0a84ff;
+  --accent-soft:rgba(0,122,255,.10); --accent-line:rgba(0,122,255,.26);
   --ok:#34c759; --warn:#ff9f0a; --bad:#ff3b30;
-  --ok-soft:rgba(52,199,89,.12); --warn-soft:rgba(255,159,10,.13); --bad-soft:rgba(255,59,48,.11);
+  --ok-soft:rgba(52,199,89,.12); --warn-soft:rgba(255,159,10,.14); --bad-soft:rgba(255,59,48,.12);
   --on-accent:#ffffff;
-  --radius:24px;
+  --radius:20px;
   --shadow-xs:0 1px 2px rgba(0,0,0,.04);
   --shadow-sm:0 1px 2px rgba(0,0,0,.04),0 2px 8px -2px rgba(0,0,0,.06);
   --shadow-md:0 2px 6px rgba(0,0,0,.04),0 12px 28px -12px rgba(0,0,0,.12);
@@ -7805,7 +7806,8 @@ const PAGE = `<!DOCTYPE html>
   --surface:#1c1c1e; --surface-2:#2c2c2e; --surface-3:#3a3a3c;
   --line:rgba(255,255,255,.09); --line-2:rgba(255,255,255,.18);
   --text:#f5f5f7; --text-2:#e5e5ea; --muted:#a1a1a6; --dim:#8e8e93;
-  --accent:#0a84ff; --accent-2:#409cff; --accent-soft:rgba(10,132,255,.16); --accent-line:rgba(10,132,255,.4);
+  --accent:#0a84ff; --accent-2:#409cff;
+  --accent-soft:rgba(10,132,255,.16); --accent-line:rgba(10,132,255,.4);
   --ok:#30d158; --warn:#ffd60a; --bad:#ff453a;
   --ok-soft:rgba(48,209,88,.15); --warn-soft:rgba(255,214,10,.14); --bad-soft:rgba(255,69,58,.15);
   --shadow-xs:0 1px 2px rgba(0,0,0,.4);
@@ -7824,9 +7826,9 @@ body{
 }
 body::before{
   content:"";position:fixed;inset:0;z-index:0;pointer-events:none;
-  background:radial-gradient(1100px 560px at 50% -12%,rgba(0,122,255,.07),transparent 70%);
+  background:radial-gradient(1100px 520px at 50% -12%,rgba(0,122,255,.06),transparent 70%);
 }
-[data-theme="night"] body::before{background:radial-gradient(1100px 560px at 50% -12%,rgba(10,132,255,.13),transparent 70%)}
+[data-theme="night"] body::before{background:radial-gradient(1100px 520px at 50% -12%,rgba(10,132,255,.12),transparent 70%)}
 a{color:inherit;text-decoration:none}
 button,input,select,textarea{font:inherit;color:inherit}
 button{cursor:pointer;background:none;border:0;padding:0}
@@ -7835,30 +7837,30 @@ button[disabled]{cursor:not-allowed;opacity:.45}
 ::selection{background:var(--accent-soft);color:var(--text)}
 .skip{position:absolute;left:-9999px;top:0}
 .skip:focus{left:16px;top:14px;z-index:120;background:var(--surface);border:1px solid var(--accent);padding:10px 14px;border-radius:12px;box-shadow:var(--shadow-md)}
-.shell{width:min(1240px,calc(100% - 48px));margin:0 auto;position:relative;z-index:1}
+.shell{width:min(1200px,calc(100% - 48px));margin:0 auto;position:relative;z-index:1}
 
 /* ---------- top bar ---------- */
 .topbar{position:sticky;top:0;z-index:40;border-bottom:1px solid var(--line);background:var(--topbar);backdrop-filter:saturate(180%) blur(20px);-webkit-backdrop-filter:saturate(180%) blur(20px)}
-.topbarIn{display:flex;align-items:center;gap:22px;height:64px}
-.brand{display:flex;align-items:center;gap:10px;flex:none}
+.topbarIn{display:flex;align-items:center;gap:20px;height:56px}
+.brand{display:flex;align-items:center;gap:9px;flex:none}
 .brandOrb{
-  width:30px;height:30px;border-radius:9px;display:grid;place-items:center;
+  width:28px;height:28px;border-radius:8px;display:grid;place-items:center;
   background:linear-gradient(160deg,#2e9bff,#0064d6);
-  box-shadow:0 4px 12px -4px rgba(0,122,255,.55),inset 0 1px 0 rgba(255,255,255,.35);
+  box-shadow:0 4px 10px -4px rgba(0,122,255,.55),inset 0 1px 0 rgba(255,255,255,.35);
 }
-.brandOrb svg{width:16px;height:16px;fill:none;stroke:#fff;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
-.brandText b{display:block;font-size:14.5px;font-weight:650;letter-spacing:-.01em;line-height:1.2;white-space:nowrap}
-.brandText em{display:block;font:500 9px/1.5 var(--mono);font-style:normal;letter-spacing:.16em;color:var(--muted)}
+.brandOrb svg{width:15px;height:15px;fill:none;stroke:#fff;stroke-width:2.4;stroke-linecap:round;stroke-linejoin:round}
+.brandText b{display:block;font-size:14px;font-weight:650;letter-spacing:-.01em;line-height:1.2;white-space:nowrap}
+.brandText em{display:block;font:500 8.5px/1.5 var(--mono);font-style:normal;letter-spacing:.15em;color:var(--muted)}
 .topTabs{display:flex;gap:2px;padding:3px;border-radius:999px;background:var(--surface-2)}
-.topTabs button{padding:7px 14px;border-radius:999px;font-size:12px;font-weight:500;color:var(--muted);transition:color .18s,background .18s,box-shadow .18s}
+.topTabs button{padding:6px 13px;border-radius:999px;font-size:12px;font-weight:500;color:var(--muted);transition:color .18s,background .18s,box-shadow .18s}
 .topTabs button:hover{color:var(--text)}
 .topTabs button.on{background:var(--surface);color:var(--text);box-shadow:var(--shadow-xs),0 0 0 .5px var(--line)}
-.topRight{margin-left:auto;display:flex;align-items:center;gap:6px;flex:none}
-.livePill{display:inline-flex;align-items:center;gap:7px;padding:7px 10px;font:11px var(--mono);color:var(--muted);white-space:nowrap}
+.topRight{margin-left:auto;display:flex;align-items:center;gap:4px;flex:none}
+.livePill{display:inline-flex;align-items:center;gap:7px;padding:7px 9px;font:11px var(--mono);color:var(--muted);white-space:nowrap}
 .livePill i{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 3.5px var(--ok-soft);animation:pulse 2.4s infinite}
-.iconBtn{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;color:var(--muted);transition:color .18s,background .18s}
+.iconBtn{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;color:var(--muted);transition:color .18s,background .18s}
 .iconBtn:hover{color:var(--text);background:var(--surface-2)}
-.iconBtn svg{width:17px;height:17px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.iconBtn svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
 .iMoon{display:none}
 [data-theme="night"] .iSun{display:none}
 [data-theme="night"] .iMoon{display:block}
@@ -7868,169 +7870,176 @@ button[disabled]{cursor:not-allowed;opacity:.45}
   box-shadow:0 1px 2px rgba(0,122,255,.28),0 6px 16px -8px rgba(0,122,255,.5);
   transition:transform .18s,filter .18s,box-shadow .18s;white-space:nowrap;
 }
-.primaryBtn:hover{filter:brightness(1.06);box-shadow:0 1px 2px rgba(0,122,255,.3),0 10px 22px -10px rgba(0,122,255,.55)}
+.primaryBtn:hover{filter:brightness(1.06)}
 .primaryBtn:active{transform:scale(.98)}
 .primaryBtn .spark{width:6px;height:6px;border-radius:50%;background:currentColor;animation:pulse 2s infinite}
 .primaryBtn .spark.spin{animation:spin 1s linear infinite}
-
-/* ---------- hero ---------- */
-.hero{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.08fr);gap:56px;padding:66px 0 12px;align-items:center}
-.heroLead{display:flex;flex-direction:column;justify-content:center;min-width:0}
-.eyebrow{display:inline-flex;align-items:center;gap:9px;font:11.5px var(--mono);letter-spacing:.03em;color:var(--muted);margin:0}
-.eyebrow i{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft);animation:pulse 2.4s infinite}
-.hero h1{font:650 clamp(40px,4.9vw,62px)/1.06 var(--display);letter-spacing:-.035em;margin:18px 0 0;color:var(--text)}
-.hero h1 .grad{background:linear-gradient(96deg,#0071e3 8%,#32ade6 92%);-webkit-background-clip:text;background-clip:text;color:transparent}
-.heroSub{margin:20px 0 0;max-width:46ch;color:var(--muted);font-size:15px;line-height:1.75}
-.heroActions{display:flex;gap:10px;margin-top:30px;flex-wrap:wrap}
 .ghostBtn{
-  display:inline-flex;align-items:center;gap:7px;padding:9px 16px;border-radius:999px;
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:9px 15px;border-radius:999px;
   background:var(--surface);border:1px solid var(--line);color:var(--text-2);font-size:12.5px;font-weight:500;
-  box-shadow:var(--shadow-xs);transition:background .18s,border-color .18s,transform .18s;
+  box-shadow:var(--shadow-xs);transition:background .18s,border-color .18s,transform .18s;white-space:nowrap;
 }
 .ghostBtn:hover{background:var(--surface-2);border-color:var(--line-2)}
 .ghostBtn:active{transform:scale(.98)}
-.heroGrid{display:grid;grid-template-columns:1.2fr .92fr;grid-template-rows:auto auto;gap:16px;min-width:0}
-.glass{position:relative;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface);box-shadow:var(--shadow-sm);overflow:hidden}
-.statusCard{grid-row:1/3;padding:24px;display:flex;flex-direction:column;align-items:center;justify-content:space-between;gap:20px;min-width:0}
-.statusHead{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%}
-.statusBadge{display:inline-flex;align-items:center;gap:5px;font:10.5px var(--mono);color:var(--ok);background:var(--ok-soft);padding:3px 8px;border-radius:999px}
-.statusBadge::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor}
-.ringWrap{position:relative;width:178px;height:178px;flex:none}
-.ringWrap svg{width:100%;height:100%;transform:rotate(-90deg)}
+
+/* ---------- page head ---------- */
+.pageHead{display:flex;align-items:flex-end;justify-content:space-between;gap:28px;padding:44px 0 24px;flex-wrap:wrap;scroll-margin-top:72px}
+.pageHeadMain{min-width:0}
+.eyebrow{display:inline-flex;align-items:center;gap:8px;font:11.5px var(--mono);letter-spacing:.02em;color:var(--muted);margin:0}
+.eyebrow i{width:6px;height:6px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft);animation:pulse 2.4s infinite}
+.pageHead h1{font-size:clamp(32px,3.6vw,42px);font-weight:650;line-height:1.08;letter-spacing:-.032em;margin:10px 0 0}
+.pageSub{margin:10px 0 0;max-width:54ch;color:var(--muted);font-size:14px;line-height:1.6}
+.pageHeadActions{display:flex;gap:8px;flex-wrap:wrap;padding-bottom:3px}
+
+/* ---------- overview ---------- */
+.overview{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(0,.85fr);gap:16px;align-items:stretch}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:24px;box-shadow:var(--shadow-sm);min-width:0}
+.summaryPanel{padding:24px;display:flex;flex-direction:column;gap:18px}
+.summaryTop{display:flex;align-items:center;gap:22px;min-width:0}
+.summaryRing{position:relative;width:108px;height:108px;flex:none}
+.summaryRing svg{width:100%;height:100%;transform:rotate(-90deg)}
 .ringTrack{stroke:var(--ring-track)}
 .ringFg{transition:stroke-dashoffset .9s cubic-bezier(.2,.7,.2,1)}
 .ringCenter{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center}
-.ringCenter b{font:650 46px/1 var(--display);letter-spacing:-.05em;font-variant-numeric:tabular-nums}
-.ringCenter small{font:12px var(--mono);color:var(--muted);margin-top:3px}
-.ringCenter em{font:500 9.5px var(--sans);font-style:normal;letter-spacing:.14em;color:var(--dim);margin-top:8px}
-.statusMeta{display:grid;grid-template-columns:1fr 1fr;gap:8px;width:100%}
-.statusMeta div{padding:11px 13px;border-radius:14px;background:var(--surface-2);min-width:0}
-.statusMeta b{display:block;font-size:20px;font-weight:600;line-height:1.2;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
-.statusMeta span{display:block;font-size:10.5px;color:var(--muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.nextCard{padding:22px 24px;display:flex;flex-direction:column;justify-content:center;min-width:0}
-.cardKicker{margin:0 0 9px;font:500 10px var(--mono);letter-spacing:.1em;color:var(--dim)}
-.nextTime{font:600 36px/1 var(--display);letter-spacing:-.035em;font-variant-numeric:tabular-nums}
-.nextDate{font:11px var(--mono);color:var(--muted);margin-top:6px}
-.nextNote{font-size:11.5px;color:var(--muted);margin:8px 0 13px;line-height:1.55}
-.cronPills{display:flex;gap:5px;flex-wrap:wrap}
+.ringCenter b{font-size:30px;font-weight:650;line-height:1;letter-spacing:-.04em;font-variant-numeric:tabular-nums}
+.ringCenter small{font:11px var(--mono);color:var(--muted);margin-top:2px}
+.summaryText{min-width:0}
+.summaryText h2{font-size:21px;font-weight:650;letter-spacing:-.022em;margin:3px 0 0}
+.summaryText p{font-size:12.5px;line-height:1.6;color:var(--muted);margin:6px 0 0;max-width:44ch}
+.summaryBar{height:6px;border-radius:999px;background:var(--surface-2);overflow:hidden;margin-top:12px}
+.summaryBar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,#007aff,#32ade6);transition:width .7s}
+.summaryStats{display:grid;grid-template-columns:repeat(4,1fr);border-top:1px solid var(--line);border-bottom:1px solid var(--line);padding:14px 0}
+.summaryStats div{padding:0 16px;border-left:1px solid var(--line);min-width:0}
+.summaryStats div:first-child{border-left:0;padding-left:0}
+.summaryStats b{display:block;font-size:22px;font-weight:600;line-height:1.2;letter-spacing:-.02em;font-variant-numeric:tabular-nums}
+.summaryStats span{display:block;font-size:11.5px;color:var(--muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.attention{background:var(--surface-2);border-radius:16px;padding:12px 14px;min-width:0}
+.attentionHead{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:4px}
+.attentionHead b{font-size:12.5px;font-weight:600}
+.attentionHead button{font-size:11.5px;font-weight:500;color:var(--accent)}
+.attentionHead button:hover{opacity:.7}
+.attList{display:flex;flex-direction:column}
+.attRow{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line);min-width:0}
+.attRow:first-child{border-top:0}
+.attDot{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:none}
+.attDot.ok{background:var(--ok)}
+.attDot.warn{background:var(--warn)}
+.attDot.bad{background:var(--bad)}
+.attMain{min-width:0;flex:1}
+.attMain b{display:block;font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.attMain span{display:block;font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
+.attRow button{font-size:11.5px;font-weight:600;color:var(--accent);padding:5px 9px;border-radius:8px;background:var(--surface);flex:none}
+.attRow button:hover{background:var(--accent-soft)}
+.attEmpty{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted);padding:3px 0}
+.sideStack{display:flex;flex-direction:column;gap:16px;min-width:0}
+.nextCard{padding:20px 22px;display:flex;flex-direction:column;justify-content:center}
+.cardKicker{margin:0 0 8px;font:500 10px var(--mono);letter-spacing:.1em;color:var(--dim)}
+.nextTime{font-size:32px;font-weight:600;line-height:1;letter-spacing:-.035em;font-variant-numeric:tabular-nums}
+.nextDate{font:11px var(--mono);color:var(--muted);margin-top:5px}
+.cronPills{display:flex;gap:5px;flex-wrap:wrap;margin-top:10px}
 .cronPills span{font:10.5px var(--mono);padding:3px 8px;border-radius:7px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
-.travelCard{padding:22px 24px;display:flex;flex-direction:column;justify-content:space-between;min-width:0}
+.travelCard{padding:18px 22px;display:flex;flex-direction:column;justify-content:space-between;flex:1;min-width:0}
 .travelTop{display:flex;align-items:center;justify-content:space-between;gap:8px}
-.travelState{font:500 10px var(--sans);letter-spacing:.01em;padding:4px 8px;border-radius:999px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
+.travelState{font-size:10px;font-weight:500;padding:4px 8px;border-radius:999px;background:var(--surface-2);color:var(--muted);white-space:nowrap}
 .travelState.s-traveling{color:var(--accent);background:var(--accent-soft)}
 .travelState.s-arrived,.travelState.s-finished{color:var(--ok);background:var(--ok-soft)}
 .travelState.s-error{color:var(--bad);background:var(--bad-soft)}
-.travelWho{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:8px}
-.travelMeta{font:11px/1.65 var(--mono);color:var(--muted);margin-top:3px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.travelRoute{position:relative;height:24px;margin:8px 0 6px}
+.travelWho{font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:7px}
+.travelMeta{font:11px/1.65 var(--mono);color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.travelRoute{position:relative;height:22px;margin:8px 0 5px}
 .travelRoute .track{position:absolute;left:4px;right:4px;top:50%;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--accent-line),var(--accent))}
-.travelRoute .dot{position:absolute;top:50%;left:6%;width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft);transform:translate(-50%,-50%);animation:route 5.5s ease-in-out infinite}
+.travelRoute .dot{position:absolute;top:50%;left:6%;width:9px;height:9px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft);transform:translate(-50%,-50%);animation:route 5.5s ease-in-out infinite}
 .travelRoute .dot.still{animation:none;left:92%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
-.travelFoot{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.travelFoot .reward{font:600 15px/1 var(--display);color:var(--accent);font-variant-numeric:tabular-nums}
+.travelFoot{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:4px}
+.travelFoot .reward{font-size:14px;font-weight:600;color:var(--accent);font-variant-numeric:tabular-nums}
 .travelFoot button{margin-left:auto;font-size:11.5px;font-weight:500;padding:5px 2px;color:var(--accent)}
 .travelFoot button:hover{opacity:.7}
-.travelEmpty{font-size:12px;line-height:1.7;color:var(--muted);padding:6px 0}
+.travelEmpty{font-size:11.5px;line-height:1.65;color:var(--muted);padding:5px 0}
 
 /* ---------- sections ---------- */
-.section{padding:60px 0 0}
-section[id],#activity{scroll-margin-top:84px}
-.sectionHead{display:flex;align-items:flex-end;justify-content:space-between;gap:22px;margin-bottom:22px;flex-wrap:wrap}
-.sectionHead h2{font-size:clamp(24px,2.4vw,30px);font-weight:650;line-height:1.15;letter-spacing:-.025em;margin:0}
-.sectionHead p{margin:6px 0 0;font-size:13px;color:var(--muted)}
-.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted)}
-.legend span{display:inline-flex;align-items:center;gap:6px}
-.legend i{width:6px;height:6px;border-radius:50%;background:currentColor}
-.legend .ok{color:var(--ok)} .legend .warn{color:var(--warn)} .legend .bad{color:var(--bad)} .legend .idle{color:var(--dim)}
-
-/* ---------- platform matrix ---------- */
-.platformGrid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:12px;min-width:0}
-.platformGrid>*{min-width:0}
-.pTile{
-  position:relative;padding:16px;border-radius:20px;border:1px solid var(--line);
-  background:var(--surface);cursor:pointer;text-align:left;overflow:hidden;box-shadow:var(--shadow-xs);min-width:0;
-  transition:transform .2s,border-color .2s,box-shadow .2s;
-}
-.pTile:hover{transform:translateY(-2px);border-color:var(--line-2);box-shadow:var(--shadow-md)}
-.pTile.on{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft),var(--shadow-sm)}
-.pOrb{width:34px;height:34px;border-radius:10px;display:grid;place-items:center;font-size:13px;font-weight:650;color:#fff;background:linear-gradient(160deg,var(--c1),var(--c2));margin-bottom:12px;box-shadow:0 4px 10px -4px rgba(0,0,0,.3);text-shadow:0 1px 2px rgba(0,0,0,.18)}
-.pTile b{display:block;font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.pTile small{display:block;font-size:11px;color:var(--muted);margin-top:3px}
-.pBar{display:block;height:4px;border-radius:999px;background:var(--surface-2);margin-top:14px;overflow:hidden}
-.pBar i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--c1),var(--c2));transition:width .6s}
-.pDots{display:flex;gap:3px;margin-top:8px;height:6px}
-.pDots i{width:6px;height:6px;border-radius:50%;background:var(--surface-3)}
-.pDots i.ok{background:var(--ok)}
-.pDots i.bad{background:var(--bad)}
-.pDots i.warn{background:var(--warn)}
-.pDots i.off{background:transparent;border:1px solid var(--line-2)}
-
-/* ---------- account matrix ---------- */
+.section{padding:44px 0 0}
+section[id],#activity{scroll-margin-top:72px}
+.sectionHead{display:flex;align-items:flex-end;justify-content:space-between;gap:20px;margin-bottom:16px;flex-wrap:wrap}
+.sectionHead h2{font-size:23px;font-weight:650;line-height:1.15;letter-spacing:-.025em;margin:0}
+.sectionHead p{margin:5px 0 0;font-size:12.5px;color:var(--muted)}
 .accountTools{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
-.filterRow{display:flex;gap:4px;flex-wrap:wrap;padding:3px;border-radius:999px;background:var(--surface-2)}
-.pill{padding:6px 13px;border-radius:999px;font-size:11.5px;font-weight:500;color:var(--muted);transition:color .18s,background .18s,box-shadow .18s}
+.filterRow{display:flex;gap:2px;flex-wrap:wrap;padding:3px;border-radius:999px;background:var(--surface-2)}
+.pill{padding:6px 12px;border-radius:999px;font-size:11.5px;font-weight:500;color:var(--muted);transition:color .18s,background .18s,box-shadow .18s}
 .pill:hover{color:var(--text)}
 .pill.on{background:var(--surface);color:var(--text);box-shadow:var(--shadow-xs),0 0 0 .5px var(--line)}
-.searchBox{display:flex;align-items:center;gap:7px;padding:8px 13px;border-radius:999px;background:var(--surface-2);border:1px solid transparent;transition:background .18s,border-color .18s,box-shadow .18s}
+.searchBox{display:flex;align-items:center;gap:7px;padding:8px 12px;border-radius:999px;background:var(--surface-2);border:1px solid transparent;transition:background .18s,border-color .18s,box-shadow .18s}
 .searchBox:focus-within{background:var(--surface);border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
 .searchBox svg{width:14px;height:14px;fill:none;stroke:var(--dim);stroke-width:1.8;stroke-linecap:round}
-.searchBox input{width:132px;border:0;background:transparent;outline:0;font-size:12px;color:var(--text)}
+.searchBox input{width:130px;border:0;background:transparent;outline:0;font-size:12px;color:var(--text)}
 .searchBox input::placeholder{color:var(--dim)}
-.acctGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(326px,1fr));gap:14px;min-width:0}
-.acctGrid>*{min-width:0}
-.aCard{
-  position:relative;padding:20px;border-radius:22px;border:1px solid var(--line);
-  background:var(--surface);cursor:pointer;overflow:hidden;box-shadow:var(--shadow-xs);
-  transition:transform .22s,border-color .22s,box-shadow .22s;
-  animation:rise .5s both;animation-delay:calc(var(--i,0)*20ms);
+
+/* ---------- platform filter ---------- */
+.platFilter{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px;min-width:0}
+.pChip{
+  display:inline-flex;align-items:center;gap:8px;padding:6px 10px 6px 7px;border-radius:999px;
+  border:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow-xs);
+  font-size:12px;font-weight:500;color:var(--text-2);min-width:0;transition:background .18s,border-color .18s,box-shadow .18s;
 }
-.aCard:hover{transform:translateY(-2px);border-color:var(--line-2);box-shadow:var(--shadow-md)}
-.aCard.off{opacity:.56}
-.aTop{display:flex;align-items:center;gap:10px;min-width:0}
-.aOrb{width:32px;height:32px;border-radius:9px;display:grid;place-items:center;font-size:12px;font-weight:650;color:#fff;background:linear-gradient(160deg,var(--c1),var(--c2));flex:none;text-shadow:0 1px 2px rgba(0,0,0,.18)}
-.aNames{min-width:0}
-.aNames b{display:block;font-size:13.5px;font-weight:600;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.aNames small{display:block;font:10.5px var(--mono);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}
-.aStatus{margin-left:auto;display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border-radius:999px;background:var(--surface-2);font-size:10.5px;font-weight:500;color:var(--muted);white-space:nowrap;flex:none}
-.aStatus i{width:5px;height:5px;border-radius:50%;background:currentColor}
-.aStatus.ok{color:var(--ok);background:var(--ok-soft)}
-.aStatus.warn{color:var(--warn);background:var(--warn-soft)}
-.aStatus.bad{color:var(--bad);background:var(--bad-soft)}
-.aStatus.off,.aStatus.idle{color:var(--muted);background:var(--surface-2)}
-.aMsg{margin:14px 0 0;font-size:12px;line-height:1.62;color:var(--muted);min-height:39px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.aStats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:16px;padding-top:15px;border-top:1px solid var(--line)}
-.aStats b{display:block;font-size:20px;font-weight:600;line-height:1.2;letter-spacing:-.02em;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.aStats span{display:block;font-size:10.5px;color:var(--muted);margin-top:3px}
-.aTravel{margin-top:13px;padding:9px 11px;border-radius:12px;background:var(--surface-2);display:flex;align-items:center;gap:8px;font-size:11px;color:var(--muted);min-width:0}
-.aTravel .tState{font-size:9.5px;font-weight:500;padding:3px 7px;border-radius:999px;background:var(--surface);color:var(--muted);white-space:nowrap;flex:none}
-.aTravel .tState.s-traveling{color:var(--accent);background:var(--accent-soft)}
-.aTravel .tState.s-arrived,.aTravel .tState.s-finished{color:var(--ok);background:var(--ok-soft)}
-.aTravel .tState.s-error{color:var(--bad);background:var(--bad-soft)}
-.aTravel .tText{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.aActions{display:flex;gap:7px;margin-top:14px}
-.aActions button{flex:1;padding:9px;border-radius:10px;background:var(--surface-2);font-size:11.5px;font-weight:500;color:var(--text-2);transition:background .18s,color .18s,filter .18s}
-.aActions button:hover{background:var(--surface-3);color:var(--text)}
-.aActions button.primary{background:var(--accent);color:var(--on-accent)}
-.aActions button.primary:hover{filter:brightness(1.06)}
-.footNote{margin:16px 0 0;font:10.5px var(--mono);color:var(--dim)}
+.pChip:hover{background:var(--surface-2);border-color:var(--line-2)}
+.pChip.on{border-color:var(--accent);background:var(--surface);box-shadow:0 0 0 2.5px var(--accent-soft)}
+.pIcon{width:24px;height:24px;border-radius:7px;display:grid;place-items:center;font-size:10px;font-weight:650;color:#fff;background:linear-gradient(160deg,var(--c1),var(--c2));text-shadow:0 1px 2px rgba(0,0,0,.18);flex:none}
+.pName{white-space:nowrap}
+.pCount{font:10.5px var(--mono);color:var(--muted);background:var(--surface-2);padding:1px 6px;border-radius:999px}
+.pDot{width:6px;height:6px;border-radius:50%;background:var(--dim);flex:none}
+.pDot.ok{background:var(--ok)}
+.pDot.warn{background:var(--warn)}
+.pDot.bad{background:var(--bad)}
+.pChip.all .pIcon{background:var(--surface-2);color:var(--muted);text-shadow:none}
+
+/* ---------- account list ---------- */
+.acctList{background:var(--surface);border:1px solid var(--line);border-radius:20px;box-shadow:var(--shadow-sm);overflow:hidden;min-width:0}
+.acctRow{
+  display:grid;grid-template-columns:24px minmax(0,1fr) auto auto 10px;gap:14px;align-items:center;
+  padding:13px 16px;border-top:1px solid var(--line);cursor:pointer;transition:background .16s;min-width:0;
+}
+.acctRow:first-child{border-top:0}
+.acctRow:hover{background:var(--surface-2)}
+.acctRow.off{opacity:.55}
+.rowIcon{width:24px;height:24px;border-radius:7px;display:grid;place-items:center;font-size:10px;font-weight:650;color:#fff;background:linear-gradient(160deg,var(--c1),var(--c2));text-shadow:0 1px 2px rgba(0,0,0,.18);flex:none}
+.rowMain{min-width:0}
+.rowMain b{display:block;font-size:13px;font-weight:600;letter-spacing:-.005em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rowMain>span{display:block;font-size:12px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:2px}
+.rowTag{display:inline-flex;align-items:center;gap:3px;font-size:10.5px;color:var(--accent);background:var(--accent-soft);padding:1px 6px;border-radius:999px;margin-top:5px;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rowNums{display:flex;gap:18px}
+.rowNums span{display:flex;flex-direction:column;align-items:flex-end;min-width:46px}
+.rowNums b{font-size:12.5px;font-weight:600;line-height:1.3;font-variant-numeric:tabular-nums}
+.rowNums em{font-style:normal;font-size:10px;color:var(--dim);margin-top:1px}
+.rowEnd{display:flex;flex-direction:column;align-items:flex-end;gap:6px}
+.rowState{font-size:11px;font-weight:500;padding:3px 8px;border-radius:999px;white-space:nowrap;background:var(--surface-2);color:var(--muted)}
+.rowState.ok{color:var(--ok);background:var(--ok-soft)}
+.rowState.warn{color:var(--warn);background:var(--warn-soft)}
+.rowState.bad{color:var(--bad);background:var(--bad-soft)}
+.rowState.off,.rowState.idle{color:var(--muted);background:var(--surface-2)}
+.rowAction{font-size:12px;font-weight:600;color:var(--accent);padding:4px 9px;border-radius:8px;background:var(--accent-soft);white-space:nowrap}
+.rowAction:hover{filter:brightness(.97)}
+.rowAction.solid{background:var(--accent);color:var(--on-accent)}
+.rowChevron{color:var(--dim);font-size:18px;line-height:1;text-align:center}
+.acctEmpty{padding:28px 20px;text-align:center;color:var(--muted);font-size:12.5px;line-height:1.7}
+.acctEmpty button{margin-top:10px;font-size:12px;font-weight:600;color:var(--accent);padding:6px 12px;border-radius:999px;background:var(--accent-soft)}
+.footNote{margin:12px 0 0;font:10.5px var(--mono);color:var(--dim)}
 
 /* ---------- travel missions ---------- */
-.missionGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(330px,1fr));gap:14px;min-width:0}
+.missionGrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:14px;min-width:0}
 .missionGrid>*{min-width:0}
-.mission{padding:20px 22px;border-radius:22px;border:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow-xs);position:relative;overflow:hidden;min-width:0}
+.mission{padding:18px 20px;border-radius:20px;border:1px solid var(--line);background:var(--surface);box-shadow:var(--shadow-xs);position:relative;overflow:hidden;min-width:0}
 .missionTop{display:flex;align-items:center;gap:8px;min-width:0}
-.missionTop b{font-size:13.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.missionTop b{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .missionTop .travelState{margin-left:auto;flex:none}
-.missionRoute{position:relative;height:46px;margin:12px 0 4px}
+.missionRoute{position:relative;height:40px;margin:10px 0 4px}
 .missionRoute .track{position:absolute;left:6%;right:6%;top:50%;height:2px;border-radius:2px;background:linear-gradient(90deg,var(--accent-line),var(--accent))}
 .missionRoute .node{position:absolute;top:50%;width:7px;height:7px;border-radius:50%;border:1px solid var(--line-2);background:var(--surface);transform:translate(-50%,-50%)}
 .missionRoute .node.start{left:6%}
 .missionRoute .node.end{left:94%}
-.missionRoute .dot{position:absolute;top:50%;width:11px;height:11px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft);transform:translate(-50%,-50%);animation:route 5.8s ease-in-out infinite}
+.missionRoute .dot{position:absolute;top:50%;width:10px;height:10px;border-radius:50%;background:var(--accent);box-shadow:0 0 0 4px var(--accent-soft);transform:translate(-50%,-50%);animation:route 5.8s ease-in-out infinite}
 .missionRoute .dot.arrived{animation:none;left:92%;background:var(--ok);box-shadow:0 0 0 4px var(--ok-soft)}
 .missionRoute .dot.idle{animation:none;left:6%;background:var(--dim);box-shadow:0 0 0 4px var(--surface-2)}
-.missionMeta{font:11px/1.7 var(--mono);color:var(--muted);min-height:36px}
-.missionActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:13px}
+.missionMeta{font:11px/1.7 var(--mono);color:var(--muted);min-height:32px}
+.missionActions{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:11px}
 .missionActions button{font-size:11.5px;font-weight:500;padding:5px 2px;color:var(--accent)}
 .missionActions button:hover{opacity:.7}
 .missionActions button.primary{background:var(--accent-soft);color:var(--accent);padding:5px 11px;border-radius:999px}
@@ -8047,16 +8056,16 @@ section[id],#activity{scroll-margin-top:84px}
 .switch input:focus-visible+.track{outline:2px solid var(--accent);outline-offset:2px}
 
 /* ---------- bottom ---------- */
-.bottomGrid{display:grid;grid-template-columns:1.3fr .9fr;gap:16px;padding-top:60px}
-.activityCard,.systemCard{padding:24px 26px}
+.bottomGrid{display:grid;grid-template-columns:1.3fr .9fr;gap:16px;padding-top:44px}
+.activityCard,.systemCard{padding:22px 24px}
 .systemCard{display:flex;flex-direction:column}
 .systemCard .sysActions{margin-top:auto}
 .bottomHead{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:6px}
-.bottomHead h2{font-size:20px;font-weight:650;letter-spacing:-.02em;margin:0}
+.bottomHead h2{font-size:19px;font-weight:650;letter-spacing:-.02em;margin:0}
 .linkBtn{font-size:12px;font-weight:500;color:var(--accent);padding:5px 0;background:none;border:0}
 .linkBtn:hover{opacity:.7}
 .activityList{display:flex;flex-direction:column}
-.actRow{display:grid;grid-template-columns:44px 7px minmax(0,1fr);gap:10px;align-items:start;padding:11px 0;border-bottom:1px solid var(--line)}
+.actRow{display:grid;grid-template-columns:44px 7px minmax(0,1fr);gap:10px;align-items:start;padding:10px 0;border-bottom:1px solid var(--line)}
 .actRow:last-child{border-bottom:0}
 .actRow time{font:10.5px/1.7 var(--mono);color:var(--dim)}
 .actRow .dot{width:6px;height:6px;border-radius:50%;background:var(--dim);margin-top:6px}
@@ -8067,14 +8076,14 @@ section[id],#activity{scroll-margin-top:84px}
 .actRow b{font-weight:600;color:var(--text)}
 .sysGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:10px 0 0}
 dl.sysGrid{margin:10px 0 0}
-.sysItem{padding:11px 13px;border-radius:14px;background:var(--surface-2);min-width:0}
+.sysItem{padding:10px 12px;border-radius:13px;background:var(--surface-2);min-width:0}
 .sysItem small{display:block;font-size:10.5px;color:var(--muted);margin-bottom:3px}
 .sysItem b{display:block;font-size:12.5px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.sysActions{display:flex;gap:4px;flex-wrap:wrap;margin-top:13px}
+.sysActions{display:flex;gap:4px;flex-wrap:wrap;margin-top:12px}
+.sysNote{margin:12px 0 0;font-size:11px;line-height:1.6;color:var(--dim)}
 .sysActions button{font-size:11.5px;font-weight:500;padding:6px 10px;border-radius:8px;color:var(--accent);background:transparent}
 .sysActions button:hover{background:var(--accent-soft)}
-
-.footer{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:32px 0 36px;margin-top:48px;border-top:1px solid var(--line);font-size:11px;color:var(--dim)}
+.footer{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;padding:30px 0 34px;margin-top:40px;border-top:1px solid var(--line);font-size:11px;color:var(--dim)}
 
 /* ---------- dialogs ---------- */
 .veil{position:fixed;inset:0;z-index:80;display:grid;place-items:center;padding:20px;background:rgba(0,0,0,.32);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);animation:fade .2s ease both}
@@ -8139,6 +8148,12 @@ dl.sysGrid{margin:10px 0 0}
 .code{margin:0;padding:12px 13px;border-radius:12px;background:var(--surface-2);font:11px/1.7 var(--mono);color:var(--muted);overflow:auto;white-space:pre-wrap;word-break:break-all}
 
 /* ---------- account modal ---------- */
+.aStatus{display:inline-flex;align-items:center;gap:5px;padding:4px 9px;border-radius:999px;background:var(--surface-2);font-size:10.5px;font-weight:500;color:var(--muted);white-space:nowrap}
+.aStatus i{width:5px;height:5px;border-radius:50%;background:currentColor}
+.aStatus.ok{color:var(--ok);background:var(--ok-soft)}
+.aStatus.warn{color:var(--warn);background:var(--warn-soft)}
+.aStatus.bad{color:var(--bad);background:var(--bad-soft)}
+.aStatus.off,.aStatus.idle{color:var(--muted);background:var(--surface-2)}
 .acctModalTop{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
 .acctModalOrb{width:46px;height:46px;border-radius:12px;display:grid;place-items:center;font-size:17px;font-weight:650;color:#fff;background:linear-gradient(160deg,var(--c1),var(--c2));flex:none;text-shadow:0 1px 2px rgba(0,0,0,.18)}
 .acctModalMeta{min-width:0}
@@ -8160,8 +8175,7 @@ dl.sysGrid{margin:10px 0 0}
 .modalActions button.primary{background:var(--accent);color:var(--on-accent)}
 .modalActions button.danger{background:var(--bad-soft);color:var(--bad)}
 .modalTravel{margin-top:18px;padding:15px;border-radius:16px;background:var(--surface-2)}
-.modalTravel .missionRoute{margin:10px 0 8px;height:38px}
-.modalTravel .modalNote{color:var(--muted)}
+.modalTravel .missionRoute{margin:8px 0 6px;height:34px}
 
 /* ---------- toasts ---------- */
 .toasts{position:fixed;right:22px;bottom:22px;z-index:100;display:flex;flex-direction:column;gap:7px;max-width:min(380px,calc(100vw - 44px));pointer-events:none}
@@ -8171,7 +8185,7 @@ dl.sysGrid{margin:10px 0 0}
 .toast.warn{border-left-color:var(--warn)}
 
 /* ---------- motion ---------- */
-@keyframes rise{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
 @keyframes fade{from{opacity:0}to{opacity:1}}
 @keyframes pop{from{opacity:0;transform:translateY(12px) scale(.985)}to{opacity:1;transform:none}}
 @keyframes toast{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
@@ -8181,14 +8195,13 @@ dl.sysGrid{margin:10px 0 0}
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}html{scroll-behavior:auto}}
 
 /* ---------- responsive ---------- */
-@media (max-width:1120px){
-  .platformGrid{grid-template-columns:repeat(3,minmax(0,1fr))}
-  .hero{grid-template-columns:1fr;gap:30px}
-  .heroGrid{grid-template-columns:1.1fr .9fr}
-  .hero h1{font-size:clamp(40px,6.4vw,58px)}
+@media (max-width:1024px){
+  .overview{grid-template-columns:1fr}
+  .sideStack{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  .travelCard{min-height:170px}
 }
 @media (max-width:860px){
-  .topbarIn{height:auto;padding:10px 0;flex-wrap:wrap;gap:9px}
+  .topbarIn{height:auto;padding:9px 0;flex-wrap:wrap;gap:8px}
   .topTabs{order:3;width:100%;justify-content:space-between;overflow:auto}
   .topRight{margin-left:auto}
   .livePill{display:none}
@@ -8196,23 +8209,40 @@ dl.sysGrid{margin:10px 0 0}
 }
 @media (max-width:720px){
   .shell{width:calc(100% - 32px)}
-  .hero{padding-top:38px}
-  .heroGrid{grid-template-columns:1fr;grid-template-rows:auto}
-  .statusCard{grid-row:auto;flex-direction:row;flex-wrap:wrap;justify-content:center;gap:16px;padding:20px}
-  .ringWrap{width:150px;height:150px}
-  .ringCenter b{font-size:38px}
-  .statusHead{width:100%}
-  .statusMeta{width:100%}
-  .section{padding-top:46px}
-  section[id],#activity{scroll-margin-top:112px}
+  .pageHead{padding-top:32px;gap:18px}
+  .pageHead h1{font-size:32px}
+  .pageHeadActions{width:100%}
+  .pageHeadActions .primaryBtn,.pageHeadActions .ghostBtn{flex:1}
+  .overview{gap:12px}
+  .summaryPanel{padding:18px}
+  .summaryTop{gap:16px}
+  .summaryRing{width:88px;height:88px}
+  .ringCenter b{font-size:26px}
+  .summaryText h2{font-size:18px}
+  .summaryText p{font-size:11.5px}
+  .summaryStats{grid-template-columns:1fr 1fr;gap:12px 0;padding:12px 0}
+  .summaryStats div{padding:0 12px}
+  .summaryStats div:nth-child(3){border-left:0;padding-left:0}
+  .summaryStats b{font-size:20px}
+  .sideStack{grid-template-columns:1fr}
+  .section{padding-top:36px}
   .sectionHead{align-items:flex-start}
-  .sectionHead h2{font-size:24px}
+  .sectionHead h2{font-size:21px}
   .accountTools{width:100%}
-  .searchBox{flex:1}
+  .filterRow{width:100%;justify-content:space-between}
+  .pill{flex:1;text-align:center;padding:6px 4px}
+  .searchBox{width:100%}
   .searchBox input{width:100%}
-  .platformGrid{grid-template-columns:repeat(2,minmax(0,1fr))}
-  .topTabs button{flex:1;text-align:center;padding:7px 4px}
-  .acctGrid{grid-template-columns:1fr}
+  .platFilter{flex-wrap:nowrap;overflow-x:auto;padding-bottom:4px;scrollbar-width:none}
+  .platFilter::-webkit-scrollbar{display:none}
+  .pChip{flex:none}
+  .acctRow{grid-template-columns:24px minmax(0,1fr) auto;gap:10px;padding:12px 14px}
+  .rowNums{display:none}
+  .rowChevron{display:none}
+  .rowMain>span{font-size:11px}
+  .rowEnd{gap:4px}
+  .rowState{font-size:10px;padding:2px 7px}
+  .rowAction{font-size:11px;padding:4px 8px}
   .missionGrid{grid-template-columns:1fr}
   .two{grid-template-columns:1fr}
   .modalGrid{grid-template-columns:1fr}
@@ -8236,12 +8266,15 @@ dl.sysGrid{margin:10px 0 0}
     </a>
     <nav class="topTabs" aria-label="页面导航">
       <button type="button" data-jump="overview" class="on">总览</button>
-      <button type="button" data-jump="platforms">平台</button>
       <button type="button" data-jump="accounts">账号</button>
       <button type="button" data-jump="travel">旅行</button>
+      <button type="button" data-jump="activity">活动</button>
     </nav>
     <div class="topRight">
       <span class="livePill"><i aria-hidden="true"></i><span id="barClock">--:--:--</span> 北京</span>
+      <button class="iconBtn" id="refreshBtn" type="button" aria-label="刷新状态">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2.35 5.65"/><path d="M20 4v7h-7"/></svg>
+      </button>
       <button class="iconBtn" id="themeBtn" type="button" aria-label="切换日间/夜间模式">
         <svg class="iSun" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v2M12 19v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M3 12h2M19 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/><circle cx="12" cy="12" r="4"/></svg>
         <svg class="iMoon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
@@ -8249,30 +8282,28 @@ dl.sysGrid{margin:10px 0 0}
       <button class="iconBtn" id="settingsBtn" type="button" aria-label="设置">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.6V21h-4v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9A1.7 1.7 0 0 0 3 14H3v-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3A1.7 1.7 0 0 0 10 3V3h4v.1a1.7 1.7 0 0 0 1 1.6 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.6 1h.1v4H21a1.7 1.7 0 0 0-1.6 1z"/></svg>
       </button>
-      <button class="primaryBtn" id="runAllBtn" type="button"><span class="spark" aria-hidden="true"></span>运行全部</button>
     </div>
   </div>
 </header>
 
 <main class="shell">
-  <section class="hero" id="overview">
-    <div class="heroLead">
-      <p class="eyebrow"><i aria-hidden="true"></i> 实时状态 · 北京时间 <span id="todayStr">—</span></p>
-      <h1>今日签到<br><span class="grad">一目了然。</span></h1>
-      <p class="heroSub" id="mastSub">正在读取今日状态…</p>
-      <div class="heroActions">
-        <button class="primaryBtn" type="button" data-act="add">＋ 添加账号</button>
-        <button class="ghostBtn" type="button" id="refreshBtn">刷新状态</button>
-      </div>
+  <section class="pageHead" id="overview">
+    <div class="pageHeadMain">
+      <p class="eyebrow"><i aria-hidden="true"></i> 北京时间 · <span id="todayStr">—</span></p>
+      <h1>今日签到</h1>
+      <p class="pageSub" id="mastSub">正在读取今日状态…</p>
     </div>
-    <div class="heroGrid">
-      <article class="glass statusCard" aria-label="今日完成度">
-        <div class="statusHead">
-          <p class="cardKicker" style="margin:0">TODAY · 今日完成</p>
-          <span class="statusBadge">实时</span>
-        </div>
-        <div class="ringWrap">
-          <svg width="178" height="178" viewBox="0 0 186 186" aria-hidden="true">
+    <div class="pageHeadActions">
+      <button class="ghostBtn" type="button" data-act="add">＋ 添加账号</button>
+      <button class="primaryBtn" id="runAllBtn" type="button"><span class="spark" aria-hidden="true"></span>运行全部</button>
+    </div>
+  </section>
+
+  <section class="overview" aria-label="今日概览">
+    <article class="panel summaryPanel">
+      <div class="summaryTop">
+        <div class="summaryRing">
+          <svg width="108" height="108" viewBox="0 0 186 186" aria-hidden="true">
             <defs>
               <linearGradient id="ringGrad" x1="0" y1="0" x2="1" y2="1">
                 <stop offset="0%" stop-color="#007aff"/>
@@ -8286,46 +8317,37 @@ dl.sysGrid{margin:10px 0 0}
           <div class="ringCenter">
             <b id="heroVerified">—</b>
             <small id="heroEnabled">/ —</small>
-            <em>已确认</em>
           </div>
         </div>
-        <div class="statusMeta">
-          <div><b id="heroPending">—</b><span>待确认</span></div>
-          <div><b id="heroFailed">—</b><span>失败 / 受限</span></div>
-          <div><b id="heroCredit">—</b><span>今日积分</span></div>
-          <div><b id="heroTravel">—</b><span>旅行在途</span></div>
+        <div class="summaryText">
+          <p class="cardKicker">TODAY</p>
+          <h2>今日完成度</h2>
+          <p>已确认的账号会自动跳过；失败与待确认会在下一班继续重试。</p>
+          <div class="summaryBar" aria-hidden="true"><i id="heroBar" style="width:0%"></i></div>
         </div>
-      </article>
+      </div>
+      <div class="summaryStats">
+        <div><b id="heroPending">—</b><span>待确认</span></div>
+        <div><b id="heroFailed">—</b><span>失败 / 受限</span></div>
+        <div><b id="heroCredit">—</b><span>今日积分</span></div>
+        <div><b id="heroTravel">—</b><span>旅行在途</span></div>
+      </div>
+      <div class="attention" id="attentionBox"><div class="attEmpty"><span class="attDot"></span>正在读取…</div></div>
+    </article>
 
-      <article class="glass nextCard" aria-label="下次自动签到">
+    <div class="sideStack">
+      <article class="panel nextCard" aria-label="下次自动签到">
         <p class="cardKicker">NEXT RUN · 下次自动签到</p>
         <b class="nextTime" id="nextRun">—</b>
         <p class="nextDate" id="nextDate">—</p>
-        <p class="nextNote">Cloudflare Cron · 自动签到、复核与旅行</p>
         <div class="cronPills" id="cronPills"></div>
       </article>
 
-      <article class="glass travelCard" id="travelHero" aria-label="旅行任务">
+      <article class="panel travelCard" id="travelHero" aria-label="旅行任务">
         <p class="cardKicker">TRAVEL · 自动旅行</p>
         <div class="travelEmpty">正在读取旅行状态…</div>
       </article>
     </div>
-  </section>
-
-  <section class="section" id="platforms">
-    <div class="sectionHead">
-      <div>
-        <h2>平台</h2>
-        <p>点选一个平台，只看它的账号；再点一次取消。</p>
-      </div>
-      <div class="legend" aria-label="状态图例">
-        <span class="ok"><i aria-hidden="true"></i>已确认</span>
-        <span class="warn"><i aria-hidden="true"></i>待确认</span>
-        <span class="bad"><i aria-hidden="true"></i>失败</span>
-        <span class="idle"><i aria-hidden="true"></i>未完成</span>
-      </div>
-    </div>
-    <div class="platformGrid" id="platformGrid"></div>
   </section>
 
   <section class="section" id="accounts">
@@ -8338,8 +8360,8 @@ dl.sysGrid{margin:10px 0 0}
         <div class="filterRow" id="filters" role="group" aria-label="筛选账号">
           <button type="button" class="pill on" data-filter="all">全部</button>
           <button type="button" class="pill" data-filter="attention">需关注</button>
+          <button type="button" class="pill" data-filter="pending">未完成</button>
           <button type="button" class="pill" data-filter="done">已确认</button>
-          <button type="button" class="pill" data-filter="verify">待确认</button>
           <button type="button" class="pill" data-filter="off">已停用</button>
         </div>
         <label class="searchBox">
@@ -8348,8 +8370,9 @@ dl.sysGrid{margin:10px 0 0}
         </label>
       </div>
     </div>
-    <div class="acctGrid" id="acctGrid">
-      <div class="aCard"><p class="modalNote">正在读取账号矩阵…</p></div>
+    <div class="platFilter" id="platformGrid" role="group" aria-label="按平台筛选"></div>
+    <div class="acctList" id="acctGrid">
+      <div class="acctEmpty">正在读取账号…</div>
     </div>
     <p class="footNote" id="accountFoot"></p>
   </section>
@@ -8366,7 +8389,7 @@ dl.sysGrid{margin:10px 0 0}
   </section>
 
   <section class="bottomGrid" id="activity">
-    <article class="glass activityCard">
+    <article class="panel activityCard">
       <div class="bottomHead">
         <h2>最近活动</h2>
         <button class="linkBtn" type="button" data-act="history">全部记录 →</button>
@@ -8374,7 +8397,7 @@ dl.sysGrid{margin:10px 0 0}
       <div class="activityList" id="activityList"></div>
     </article>
 
-    <article class="glass systemCard">
+    <article class="panel systemCard">
       <div class="bottomHead">
         <h2>状态</h2>
         <span class="cardKicker" style="margin:0">SYSTEM</span>
@@ -8385,6 +8408,7 @@ dl.sysGrid{margin:10px 0 0}
         <div class="sysItem"><small>账号</small><b id="sysAccounts">—</b></div>
         <div class="sysItem"><small>平台</small><b id="sysPlatforms">—</b></div>
       </div>
+      <p class="sysNote">页面每 2 分钟自动刷新一次；仅在标签页可见时拉取。</p>
       <div class="sysActions">
         <button type="button" data-act="settings">通知设置</button>
         <button type="button" data-act="refresh-all">刷新全部</button>
@@ -8736,7 +8760,7 @@ dl.sysGrid{margin:10px 0 0}
 
   /* ---------- load ---------- */
   function loadAll(){
-    el('acctGrid').innerHTML = '<div class="aCard"><p class="modalNote">正在读取账号矩阵…</p></div>';
+    el('acctGrid').innerHTML = '<div class="acctEmpty">正在读取账号…</div>';
     el('missionGrid').innerHTML = '<div class="mission"><p class="modalNote">正在读取旅行任务…</p></div>';
     return Promise.all([
       api('/api/meta'),
@@ -8748,7 +8772,7 @@ dl.sysGrid{margin:10px 0 0}
       S.history = (r[2] && r[2].entries) || [];
       renderAll();
     }).catch(function(e){
-      el('acctGrid').innerHTML = '<div class="aCard"><p class="modalNote">读取失败：' + esc(e.message) + '</p></div>';
+      el('acctGrid').innerHTML = '<div class="acctEmpty">读取失败：' + esc(e.message) + '</div>';
       if(token) toast(e.message, 'err');
     });
   }
@@ -8766,6 +8790,7 @@ dl.sysGrid{margin:10px 0 0}
   function renderAll(){
     if(!S.data || !S.meta) return;
     renderHero();
+    renderAttention();
     renderPlatforms();
     renderAccounts();
     renderMissions();
@@ -8791,17 +8816,24 @@ dl.sysGrid{margin:10px 0 0}
     el('heroFailed').textContent = (st.failed || 0) + (st.blocked || 0);
     el('heroCredit').textContent = compact(st.todayCredit == null ? 0 : st.todayCredit);
     el('heroTravel').textContent = traveling + ' / ' + wb.length;
+    var needs = 0;
+    var list = (S.data && S.data.accounts) || [];
+    for(var j = 0; j < list.length; j++){
+      var stt = statusOf(list[j]);
+      if(list[j].enabled !== false && !list[j].signedToday && (stt.c === 'bad' || stt.c === 'warn')) needs++;
+    }
     el('mastSub').textContent = verified + ' / ' + enabled + ' 个账号已确认' +
-      ((st.unverified || 0) + (st.failed || 0) > 0 ? '，' + ((st.unverified || 0) + (st.failed || 0)) + ' 个需要处理' : '，全部就绪') +
-      '。自动旅行' + (traveling ? '有 ' + traveling + ' 只在途。' : '待命。');
+      (needs > 0 ? '，' + needs + ' 个需要处理。' : '，今天全部就绪。');
 
     var ring = el('ringFg');
+    var pct = enabled > 0 ? Math.min(1, verified / enabled) : 0;
     if(ring){
       var circumference = 2 * Math.PI * 78;
-      var pct = enabled > 0 ? Math.min(1, verified / enabled) : 0;
       ring.setAttribute('stroke-dasharray', String(circumference));
       ring.setAttribute('stroke-dashoffset', String(circumference * (1 - pct)));
     }
+    var bar = el('heroBar');
+    if(bar) bar.style.width = (pct * 100).toFixed(1) + '%';
 
     var next = String(S.data.nextRun || '—');
     var bits = next.split(' ');
@@ -8816,6 +8848,37 @@ dl.sysGrid{margin:10px 0 0}
     }).join('') || '<span>cron 未配置</span>';
 
     renderTravelHero();
+  }
+
+  function renderAttention(){
+    var box = el('attentionBox');
+    if(!box) return;
+    var list = (S.data && S.data.accounts) || [];
+    if(!list.length){
+      box.innerHTML = '<div class="attEmpty"><span class="attDot"></span>还没有账号，先添加一个开始托管。</div>';
+      return;
+    }
+    var att = list.filter(function(a){
+      var st = statusOf(a);
+      return a.enabled !== false && !a.signedToday && (st.c === 'bad' || st.c === 'warn');
+    });
+    if(!att.length){
+      box.innerHTML = '<div class="attEmpty"><span class="attDot ok"></span>所有账号都已确认，今天不用再处理。</div>';
+      return;
+    }
+    att.sort(function(a, b){
+      var pa = statusOf(a).c === 'bad' ? 0 : 1;
+      var pb = statusOf(b).c === 'bad' ? 0 : 1;
+      return pa - pb;
+    });
+    box.innerHTML = '<div class="attentionHead"><b>需要处理 · ' + att.length + '</b>' +
+      '<button type="button" data-act="attention">查看全部</button></div>' +
+      '<div class="attList">' + att.slice(0, 3).map(function(a){
+        var st = statusOf(a);
+        return '<div class="attRow"><span class="attDot ' + (st.c === 'bad' ? 'bad' : 'warn') + '"></span>' +
+          '<span class="attMain"><b>' + esc(a.label || a.id) + '</b><span>' + esc(platformLabel(a.platform)) + ' · ' + esc(a.lastMsg || st.t) + '</span></span>' +
+          '<button type="button" data-act="sign" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">签到</button></div>';
+      }).join('') + '</div>';
   }
 
   function renderTravelHero(){
@@ -8852,22 +8915,32 @@ dl.sysGrid{margin:10px 0 0}
   function renderPlatforms(){
     var accounts = (S.data && S.data.accounts) || [];
     var meta = (S.meta && S.meta.platforms) || [];
-    el('platformGrid').innerHTML = meta.map(function(p){
+    var allAtt = accounts.filter(function(a){
+      var st = statusOf(a);
+      return a.enabled !== false && !a.signedToday && (st.c === 'bad' || st.c === 'warn');
+    }).length;
+    var html = '<button type="button" class="pChip all ' + (!S.platform ? 'on' : '') + '" data-plat="" aria-pressed="' + (!S.platform ? 'true' : 'false') + '">' +
+      '<span class="pIcon" aria-hidden="true">全</span>' +
+      '<span class="pName">全部平台</span>' +
+      '<span class="pCount">' + accounts.length + '</span>' +
+      '<i class="pDot ' + (!accounts.length ? '' : (allAtt ? 'warn' : 'ok')) + '"></i>' +
+      '</button>';
+    html += meta.map(function(p){
       var rows = accounts.filter(function(a){ return a.platform === p.key; });
       var done = rows.filter(function(a){ return a.signedToday; }).length;
-      var pct = rows.length ? Math.round(done / rows.length * 100) : 0;
-      var dots = rows.slice(0, 6).map(function(a){
+      var att = rows.filter(function(a){
         var st = statusOf(a);
-        return '<i class="' + (st.c === 'off' ? 'off' : st.c) + '" title="' + esc(a.label) + ' · ' + st.t + '"></i>';
-      }).join('');
-      return '<button type="button" class="pTile ' + (S.platform === p.key ? 'on' : '') + '" data-plat="' + esc(p.key) + '" style="' + orbStyle(p.accent) + '" aria-pressed="' + (S.platform === p.key ? 'true' : 'false') + '">' +
-        '<span class="pOrb" aria-hidden="true">' + esc(initial(p.label)) + '</span>' +
-        '<b>' + esc(p.label) + '</b>' +
-        '<small>' + rows.length + ' 个账号 · ' + done + ' 已确认</small>' +
-        '<span class="pBar" aria-hidden="true"><i style="width:' + pct + '%"></i></span>' +
-        '<span class="pDots" aria-hidden="true">' + (dots || '<i class="off"></i>') + '</span>' +
+        return a.enabled !== false && !a.signedToday && (st.c === 'bad' || st.c === 'warn');
+      }).length;
+      var dot = !rows.length ? '' : (att ? 'warn' : (done === rows.length ? 'ok' : ''));
+      return '<button type="button" class="pChip ' + (S.platform === p.key ? 'on' : '') + '" data-plat="' + esc(p.key) + '" style="' + orbStyle(p.accent) + '" aria-pressed="' + (S.platform === p.key ? 'true' : 'false') + '">' +
+        '<span class="pIcon" aria-hidden="true">' + esc(initial(p.label)) + '</span>' +
+        '<span class="pName">' + esc(p.label) + '</span>' +
+        '<span class="pCount">' + rows.length + '</span>' +
+        '<i class="pDot ' + dot + '"></i>' +
         '</button>';
     }).join('');
+    el('platformGrid').innerHTML = html;
   }
 
   /* ---------- accounts ---------- */
@@ -8878,10 +8951,13 @@ dl.sysGrid{margin:10px 0 0}
     for(var i = 0; i < list.length; i++){
       var a = list[i];
       if(S.platform && a.platform !== S.platform) continue;
-      if(S.filter === 'attention' && (a.enabled === false || a.signedToday)) continue;
+      if(S.filter === 'attention'){
+        var stt = statusOf(a);
+        if(a.enabled === false || a.signedToday || (stt.c !== 'bad' && stt.c !== 'warn')) continue;
+      }
+      if(S.filter === 'pending' && (a.enabled === false || a.signedToday)) continue;
       if(S.filter === 'done' && !a.signedToday) continue;
       if(S.filter === 'off' && a.enabled !== false) continue;
-      if(S.filter === 'verify' && a.lastState !== 'unverified') continue;
       if(q){
         var hay = ((a.label || '') + ' ' + (a.platformLabel || '') + ' ' + (a.id || '') + ' ' + (a.lastMsg || '')).toLowerCase();
         if(hay.indexOf(q) < 0) continue;
@@ -8896,43 +8972,58 @@ dl.sysGrid{margin:10px 0 0}
     var all = (S.data && S.data.accounts) || [];
     var grid = el('acctGrid');
     if(!rows.length){
-      grid.innerHTML = all.length
-        ? '<div class="aCard"><p class="modalNote">没有符合条件的账号。换一个筛选或清空搜索。</p></div>'
-        : '<div class="aCard"><p class="modalNote">还没有账号。先把第一个平台接进来：扫码或粘贴一次凭证，之后由 Cron 自动签到。</p><div class="aActions"><button type="button" class="primary" data-act="add">＋ 添加第一个账号</button></div></div>';
+      grid.innerHTML = '<div class="acctEmpty">' +
+        (all.length
+          ? '没有符合条件的账号。换一个筛选或清空搜索。'
+          : '还没有账号。先把第一个平台接进来：扫码或粘贴一次凭证，之后由 Cron 自动签到。<br><button type="button" data-act="add">＋ 添加第一个账号</button>') +
+        '</div>';
       el('accountFoot').textContent = '显示 0 个账号';
-      el('accountSub').textContent = '把每天要点的签到收进一块面板。';
+      el('accountSub').textContent = '把每天要点的签到收进一个列表。';
       return;
     }
-    var accountGroups = rows.length + ' 个账号';
-    if(S.platform) accountGroups += ' · ' + platformLabel(S.platform);
-    el('accountSub').textContent = accountGroups + ' · 点卡片查看完整凭证状态与旅行控制。';
-    grid.innerHTML = rows.map(function(a, i){
-      var m = metaOf(a.platform) || { label:a.platformLabel || a.platform, accent:'gray' };
+    var pri = { bad:0, warn:1, idle:2, off:3, ok:4 };
+    rows.sort(function(a, b){
+      var pa = pri[statusOf(a).c], pb = pri[statusOf(b).c];
+      if(pa !== pb) return pa - pb;
+      return String(a.platform || '').localeCompare(String(b.platform || '')) ||
+        String(a.label || '').localeCompare(String(b.label || ''));
+    });
+    grid.innerHTML = rows.map(function(a){
+      var m = metaOf(a.platform) || { label: a.platformLabel || a.platform, accent:'gray' };
       var st = statusOf(a);
       var t = a.travel;
-      var travelRow = '';
+      var tag = '';
       if(a.platform === 'workbuddy' && t){
-        travelRow = '<div class="aTravel"><span class="tState ' + travelClass(t.label) + '">' + travelText(t.label) + '</span>' +
-          '<span class="tText">' + esc(t.message || travelText(t.label)) + (t.arriveAt ? ' · <span class="countdown" data-arrive="' + Number(t.arriveAt) + '"></span>' : '') + '</span></div>';
+        tag = '<span class="rowTag">' + esc(travelText(t.label)) +
+          (t.arriveAt ? ' · <span class="countdown" data-arrive="' + Number(t.arriveAt) + '"></span>' : '') + '</span>';
       }
-      return '<article class="aCard ' + (a.enabled === false ? 'off' : '') + '" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '" style="' + orbStyle(m.accent) + ';--i:' + i + '" tabindex="0" role="button" aria-label="查看 ' + esc(a.label || a.id) + ' 详情">' +
-        '<div class="aTop">' +
-        '<span class="aOrb" aria-hidden="true">' + esc(initial(m.label)) + '</span>' +
-        '<span class="aNames"><b>' + esc(a.label || a.id) + '</b><small>' + esc(m.label) + (a.uid ? ' · UID ' + esc(a.uid) : '') + '</small></span>' +
-        '<span class="aStatus ' + st.c + '"><i aria-hidden="true"></i>' + st.t + '</span>' +
+      var action = '';
+      if(a.enabled !== false && !a.signedToday){
+        action = '<button type="button" class="rowAction ' + (st.c === 'bad' || st.c === 'warn' ? 'solid' : '') + '" data-act="sign" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">签到</button>';
+      }
+      return '<div class="acctRow ' + (a.enabled === false ? 'off' : '') + '" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '" tabindex="0" role="button" aria-label="查看 ' + esc(a.label || a.id) + ' 详情">' +
+        '<span class="rowIcon" aria-hidden="true" style="' + orbStyle(m.accent) + '">' + esc(initial(m.label)) + '</span>' +
+        '<div class="rowMain"><b>' + esc(a.label || a.id) + '</b>' +
+          '<span>' + esc(a.lastMsg || '暂无运行记录') + ' · ' + esc(m.label) + (a.uid ? ' · UID ' + esc(a.uid) : '') + '</span>' + tag +
         '</div>' +
-        '<p class="aMsg">' + esc(a.lastMsg || '暂无运行记录') + '</p>' +
-        '<div class="aStats">' +
-        '<div><b>' + esc(show(a.streak)) + '</b><span>连签</span></div>' +
-        '<div><b>' + esc(compact(a.credits != null ? a.credits : a.total)) + '</b><span>' + (a.credits != null ? '余额' : '累计') + '</span></div>' +
-        '<div><b>' + esc(a.lastRun ? a.lastRun.slice(11, 16) : '—') + '</b><span>最近运行</span></div>' +
-        '</div>' + travelRow +
-        '<div class="aActions">' +
-        '<button type="button" class="primary" data-act="sign" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">立即签到</button>' +
-        '<button type="button" data-act="detail" data-pf="' + esc(a.platform) + '" data-id="' + esc(a.id) + '">查看详情</button>' +
-        '</div></article>';
+        '<div class="rowNums">' +
+          '<span><b>' + esc(show(a.streak)) + '</b><em>连签</em></span>' +
+          '<span><b>' + esc(compact(a.credits != null ? a.credits : a.total)) + '</b><em>' + (a.credits != null ? '余额' : '累计') + '</em></span>' +
+          '<span><b>' + esc(a.lastRun ? a.lastRun.slice(5, 16) : '—') + '</b><em>最近</em></span>' +
+        '</div>' +
+        '<div class="rowEnd"><span class="rowState ' + st.c + '">' + st.t + '</span>' + action + '</div>' +
+        '<span class="rowChevron" aria-hidden="true">›</span>' +
+      '</div>';
     }).join('');
-    el('accountFoot').textContent = '显示 ' + rows.length + ' 个账号 · 数据更新于 ' + (S.data.at || '—');
+    var done = rows.filter(function(a){ return a.signedToday; }).length;
+    var att = rows.filter(function(a){
+      var st = statusOf(a);
+      return a.enabled !== false && !a.signedToday && (st.c === 'bad' || st.c === 'warn');
+    }).length;
+    el('accountSub').textContent = rows.length + ' 个账号 · ' + done + ' 已确认' +
+      (att ? ' · ' + att + ' 需处理' : (rows.length ? ' · 全部就绪' : '')) +
+      (S.platform ? ' · ' + platformLabel(S.platform) : '');
+    el('accountFoot').textContent = '数据更新于 ' + (S.data.at || '—') + ' · 需处理的账号排在前面';
     tickCountdowns();
   }
 
@@ -9656,6 +9747,16 @@ dl.sysGrid{margin:10px 0 0}
     else if(act === 'travel-depart') travelAction(id, 'depart', btn);
     else if(act === 'travel-claim') travelAction(id, 'claim', btn);
     else if(act === 'travel-run') travelAction('', 'run', btn);
+    else if(act === 'attention'){
+      S.filter = 'attention';
+      var fbtns = el('filters').querySelectorAll('button');
+      for(var i = 0; i < fbtns.length; i++){
+        fbtns[i].classList.toggle('on', fbtns[i].getAttribute('data-filter') === 'attention');
+      }
+      renderAccounts();
+      var acc = el('accounts');
+      if(acc) acc.scrollIntoView({ behavior:'smooth', block:'start' });
+    }
     else if(act === 'settings') openSettings();
     else if(act === 'history') openHistory();
     else if(act === 'refresh-all') refreshAll();
@@ -9700,7 +9801,7 @@ dl.sysGrid{margin:10px 0 0}
       if(jump) return;
       var btn = e.target.closest('button[data-act]');
       if(btn){ e.preventDefault(); handleAct(btn); return; }
-      var tile = e.target.closest('#platformGrid .pTile');
+      var tile = e.target.closest('#platformGrid .pChip');
       if(tile){
         var key = tile.getAttribute('data-plat');
         S.platform = S.platform === key ? '' : key;
@@ -9710,7 +9811,7 @@ dl.sysGrid{margin:10px 0 0}
         if(target) target.scrollIntoView({ behavior:'smooth', block:'start' });
         return;
       }
-      var card = e.target.closest('#acctGrid .aCard');
+      var card = e.target.closest('#acctGrid .acctRow');
       if(card){
         var pf = card.getAttribute('data-pf');
         var id = card.getAttribute('data-id');
@@ -9734,7 +9835,7 @@ dl.sysGrid{margin:10px 0 0}
         else if(!el('histVeil').hidden) closeVeil('histVeil');
       }
       if(e.key === 'Enter' || e.key === ' '){
-        var card = e.target.closest ? e.target.closest('#acctGrid .aCard') : null;
+        var card = e.target.closest ? e.target.closest('#acctGrid .acctRow') : null;
         if(card && !e.target.closest('button') && !e.target.closest('input')){
           e.preventDefault();
           openAccount(card.getAttribute('data-pf'), card.getAttribute('data-id'));
