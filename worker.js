@@ -3895,6 +3895,27 @@ async function claimCampaign(acct, campaignId) {
   });
 }
 
+/** 一次性诊断：无视本地状态直接发领取请求（幂等，已领会返回 ALREADY） */
+async function claimTest(env, id) {
+  const acct = await getAccount(env, id);
+  if (!acct) throw new Error('账号不存在');
+  const at = await ensureToken(acct);
+  const list = await qFetch(regionOf(acct), `${EP.campaigns}?forceRefresh=true`, { headers: authHeaders(at, acct) });
+  const rows = campaignRows(list.json);
+  const target = rows.find((x) => actionOf(x).toUpperCase() === 'CLAIM_BENEFIT') || rows.find((x) => idOf(x));
+  if (!target) return { ok: false, msg: '活动列表里没有目标', rows: rows.length };
+  const res = await claimCampaign(acct, idOf(target));
+  return {
+    ok: true,
+    campaignId: idOf(target),
+    beforeStatus: statusOf(target),
+    httpStatus: res.status,
+    code: res.json?.code ?? null,
+    result: res.json?.result ?? res.json?.status ?? null,
+    body: JSON.stringify(res.json ?? null).slice(0, 1200),
+  };
+}
+
 /* ---------------- 旧版每日签到（活动平台之外的第二条通道） ---------------- */
 
 function todayBj() {
@@ -4567,6 +4588,15 @@ const __mod = {
         const id = String(url.searchParams.get('id') || '').trim();
         try {
           return json(await inspectCampaigns(env, id));
+        } catch (e) {
+          return json({ error: e.message }, 502);
+        }
+      }
+      if (path === '/api/claim-test' && method === 'GET') {
+        const id = String(url.searchParams.get('id') || '').trim();
+        if (!id) return json({ error: '缺少 id' }, 400);
+        try {
+          return json(await claimTest(env, id));
         } catch (e) {
           return json({ error: e.message }, 502);
         }
